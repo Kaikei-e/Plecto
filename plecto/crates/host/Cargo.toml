@@ -11,6 +11,7 @@ anyhow = { workspace = true }
 redb = { workspace = true }
 parking_lot = { workspace = true }
 tracing = { workspace = true }
+sigstore = { workspace = true }
 
 # build.rs builds the filter-hello guest (wasm32-unknown-unknown) and wraps the
 # core module into a Component Model component, hermetically (no external CLI).

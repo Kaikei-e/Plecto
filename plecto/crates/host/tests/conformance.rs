@@ -1,51 +1,97 @@
-//! WIT-conformance (tdd-workflow Phase 1): assert a filter component satisfies the
-//! `plecto:filter@0.1.0` world and that the host honours the contract it lends.
+//! WIT-conformance (tdd-workflow Phase 1) + the ADR 000006 provenance gate.
 //!
-//! Loading the component type-checks it against the world (InstancePre resolves every
-//! import/export); a non-conforming component fails at `load`. This is Plecto's
-//! consumer-driven contract test. ADR 000004 widened the lent host-API (host-counter /
-//! host-ratelimit) and added the trusted/untrusted lifecycle — both are pinned here.
-//!
-//! Deny-by-default (ADR 000006) is enforced structurally: `Host::load` adds ONLY the
-//! plecto host-API to the `Linker` (no WASI / network / filesystem / sockets), and the
-//! guest is built without WASI imports, so a filter can reach nothing it was not lent.
+//! Loading a component type-checks it against the `plecto:filter@0.1.0` world (`InstancePre`
+//! resolves every import/export) — Plecto's consumer-driven contract test. ADR 000006 now
+//! ALSO requires, before instantiation, a verified keyed cosign signature over the component
+//! plus a signed SBOM: `Host::load` is fail-closed. These tests pin both the contract and the
+//! provenance gate. Deny-by-default (the `Linker` lends only the plecto host-API, no WASI /
+//! network / filesystem / sockets) remains structural — a filter can reach nothing it was not
+//! lent, and now cannot even load unless a trusted key signed it.
 
-use plecto_host::{Host, HttpResponse, LoadOptions, ResponseDecision};
+use plecto_host::test_support::TestSigner;
+use plecto_host::{
+    Host, HttpResponse, Isolation, LoadOptions, ResponseDecision, SignedArtifact, TrustPolicy,
+};
+
+/// A minimal SBOM fixture. v0.1 requires a *signed* SBOM to be present; its content is opaque
+/// (ADR 000006 — content policy deferred), so any non-empty document does.
+const SBOM: &[u8] = br#"{"bomFormat":"CycloneDX","specVersion":"1.5","components":[]}"#;
 
 fn component_bytes() -> Vec<u8> {
     std::fs::read(env!("FILTER_HELLO_COMPONENT")).expect("read filter-hello component")
 }
 
+/// A freshly-signed filter-hello: the ephemeral signer (whose key a matching `TrustPolicy`
+/// trusts), the component bytes, and DER signatures over the component and the SBOM.
+struct Fixture {
+    signer: TestSigner,
+    bytes: Vec<u8>,
+    component_signature: Vec<u8>,
+    sbom_signature: Vec<u8>,
+}
+
+fn fixture() -> Fixture {
+    let bytes = component_bytes();
+    let signer = TestSigner::new().unwrap();
+    let component_signature = signer.sign(&bytes).unwrap();
+    let sbom_signature = signer.sign(SBOM).unwrap();
+    Fixture {
+        signer,
+        bytes,
+        component_signature,
+        sbom_signature,
+    }
+}
+
+impl Fixture {
+    fn artifact(&self) -> SignedArtifact<'_> {
+        SignedArtifact {
+            component_bytes: &self.bytes,
+            component_signature: &self.component_signature,
+            sbom: SBOM,
+            sbom_signature: &self.sbom_signature,
+        }
+    }
+
+    /// A host that trusts exactly this fixture's signing key.
+    fn host(&self) -> Host {
+        Host::new(self.signer.trust_policy().unwrap()).unwrap()
+    }
+}
+
 #[test]
 fn component_satisfies_plecto_filter_world() {
-    // Resolving imports proves the host provides the full lent surface — including the
-    // ADR 000004 additions host-counter / host-ratelimit (provider-tightening pin).
-    let host = Host::new().unwrap();
-    host.load("filter-hello", &component_bytes(), LoadOptions::untrusted())
-        .expect("filter-hello must satisfy plecto:filter@0.1.0 (imports/exports resolve)");
+    // Resolving imports proves the host provides the full lent surface (incl. the ADR 000004
+    // host-counter / host-ratelimit). Loading also exercises the ADR 000006 provenance gate.
+    let fx = fixture();
+    fx.host()
+        .load("filter-hello", &fx.artifact(), LoadOptions::untrusted())
+        .expect("filter-hello must satisfy plecto:filter@0.1.0 and pass the provenance gate");
 }
 
 #[test]
 fn component_loads_under_both_isolation_modes() {
     // Both engines (pooling for trusted, on-demand for untrusted) must instantiate the
-    // contract. Trusted load also runs init once at load time.
-    let host = Host::new().unwrap();
+    // contract. Isolation is the caller's explicit choice — a valid signature does not pick it.
+    let fx = fixture();
+    let host = fx.host();
     let trusted = host
-        .load("filter-hello", &component_bytes(), LoadOptions::trusted())
+        .load("filter-hello", &fx.artifact(), LoadOptions::trusted())
         .expect("pooling (trusted) engine must instantiate the component");
-    assert_eq!(trusted.isolation(), plecto_host::Isolation::Trusted);
+    assert_eq!(trusted.isolation(), Isolation::Trusted);
 
     let untrusted = host
-        .load("filter-hello", &component_bytes(), LoadOptions::untrusted())
+        .load("filter-hello", &fx.artifact(), LoadOptions::untrusted())
         .expect("on-demand (untrusted) engine must instantiate the component");
-    assert_eq!(untrusted.isolation(), plecto_host::Isolation::Untrusted);
+    assert_eq!(untrusted.isolation(), Isolation::Untrusted);
 }
 
 #[test]
 fn response_hook_is_honoured() {
-    let host = Host::new().unwrap();
-    let filter = host
-        .load("filter-hello", &component_bytes(), LoadOptions::untrusted())
+    let fx = fixture();
+    let filter = fx
+        .host()
+        .load("filter-hello", &fx.artifact(), LoadOptions::untrusted())
         .unwrap();
 
     let resp = HttpResponse {
@@ -55,4 +101,101 @@ fn response_hook_is_honoured() {
     };
     let (decision, _logs) = filter.on_response(&resp).unwrap();
     assert!(matches!(decision, ResponseDecision::Continue));
+}
+
+// --- ADR 000006 provenance gate: load is fail-closed on a bad/missing signature or SBOM ---
+// (`LoadedFilter` is not `Debug`, so rejections assert via `is_err()` / `match`, not expect_err.)
+
+#[test]
+fn load_rejects_signature_from_untrusted_key() {
+    // Signed by a real key, but the host trusts a DIFFERENT key → no trusted key verifies →
+    // reject. A valid signature from a third party is not enough; the signer must be trusted.
+    let fx = fixture();
+    let other_key = TestSigner::new().unwrap();
+    let host = Host::new(other_key.trust_policy().unwrap()).unwrap();
+    match host.load("filter-hello", &fx.artifact(), LoadOptions::untrusted()) {
+        Ok(_) => panic!("a signature from an untrusted key must be rejected (fail-closed)"),
+        Err(e) => assert!(
+            e.to_string().contains("component signature"),
+            "rejection reason should name the component signature, got: {e}"
+        ),
+    }
+}
+
+#[test]
+fn load_rejects_tampered_component() {
+    // The signature is valid over the ORIGINAL bytes; flipping one byte invalidates it, so the
+    // host must reject BEFORE handing the bytes to wasmtime.
+    let fx = fixture();
+    let host = fx.host();
+    let mut tampered = fx.bytes.clone();
+    *tampered.last_mut().unwrap() ^= 0xff;
+    let artifact = SignedArtifact {
+        component_bytes: &tampered,
+        component_signature: &fx.component_signature,
+        sbom: SBOM,
+        sbom_signature: &fx.sbom_signature,
+    };
+    assert!(
+        host.load("filter-hello", &artifact, LoadOptions::untrusted())
+            .is_err(),
+        "tampered component bytes must fail signature verification (fail-closed)"
+    );
+}
+
+#[test]
+fn load_rejects_missing_sbom() {
+    // ADR 000006 requires a signed SBOM to be present. An empty SBOM is rejected outright —
+    // even with an otherwise-valid (over-empty) signature.
+    let fx = fixture();
+    let host = fx.host();
+    let empty_sbom_sig = fx.signer.sign(b"").unwrap();
+    let artifact = SignedArtifact {
+        component_bytes: &fx.bytes,
+        component_signature: &fx.component_signature,
+        sbom: b"",
+        sbom_signature: &empty_sbom_sig,
+    };
+    match host.load("filter-hello", &artifact, LoadOptions::untrusted()) {
+        Ok(_) => panic!("a missing SBOM must be rejected (fail-closed)"),
+        Err(e) => assert!(
+            e.to_string().contains("SBOM"),
+            "rejection reason should name the SBOM, got: {e}"
+        ),
+    }
+}
+
+#[test]
+fn load_rejects_bad_sbom_signature() {
+    // The component signature is fine, but the SBOM signature is from the wrong key → reject.
+    let fx = fixture();
+    let other = TestSigner::new().unwrap();
+    let bad_sbom_sig = other.sign(SBOM).unwrap();
+    let host = fx.host();
+    let artifact = SignedArtifact {
+        component_bytes: &fx.bytes,
+        component_signature: &fx.component_signature,
+        sbom: SBOM,
+        sbom_signature: &bad_sbom_sig,
+    };
+    match host.load("filter-hello", &artifact, LoadOptions::untrusted()) {
+        Ok(_) => panic!("an SBOM signature from an untrusted key must be rejected"),
+        Err(e) => assert!(
+            e.to_string().contains("SBOM signature"),
+            "rejection reason should name the SBOM signature, got: {e}"
+        ),
+    }
+}
+
+#[test]
+fn empty_trust_policy_loads_nothing() {
+    // The fail-closed default: a host that trusts no keys cannot load even a validly-signed
+    // filter. There is deliberately no "allow unsigned" escape hatch.
+    let fx = fixture();
+    let host = Host::new(TrustPolicy::empty()).unwrap();
+    assert!(
+        host.load("filter-hello", &fx.artifact(), LoadOptions::untrusted())
+            .is_err(),
+        "an empty trust policy must load nothing (deny-by-default)"
+    );
 }

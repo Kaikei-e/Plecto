@@ -49,6 +49,32 @@ impl Guest for FilterHello {
         let inits = host_counter::get("init-calls");
         host_log::log(host_log::Level::Info, &format!("init-calls={inits}"));
 
+        // Guest-LOCAL linear-memory state (NOT host KV): a function-local `static` that
+        // persists across calls on a reused (trusted) instance and resets on a fresh-per-
+        // request (untrusted) one. This makes zeroization falsifiable (ADR 000006 / 000011):
+        // under `untrusted`, memory is fresh by construction, so `local-state` must stay 1.
+        static LOCAL_HITS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+        let local = LOCAL_HITS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+        host_log::log(host_log::Level::Info, &format!("local-state={local}"));
+
+        // Deliberately runaway: the host's epoch deadline (ADR 000006) must interrupt this
+        // and fail-closed, not hang the calling thread.
+        if has_header(&req, "x-plecto-spin") {
+            let mut n: u64 = 0;
+            loop {
+                n = n.wrapping_add(1);
+                core::hint::black_box(n);
+            }
+        }
+
+        // Deliberately over-allocate past the Store memory limit (ADR 000006). The linear-
+        // memory grow fails, the guest allocator aborts, and the host observes a trap — the
+        // host process itself must survive.
+        if has_header(&req, "x-plecto-balloon") {
+            let big: Vec<u8> = Vec::with_capacity(256 << 20);
+            core::hint::black_box(&big);
+        }
+
         if has_header(&req, "x-plecto-ratelimit") {
             let outcome = host_ratelimit::try_acquire(
                 "default",

@@ -25,3 +25,9 @@ parking_lot = "0.12"
 # tracing: host-internal diagnostics (never println!, bp-rust). Distinct from the
 # host-log capability, which is the filter-facing log surface.
 tracing = "0.1"
+# sigstore: cosign signature verification at filter load time (ADR 000006 provenance).
+# default-features=false keeps it to the offline `crypto` module — keyed verify with a
+# local public key, NO Fulcio / Rekor / OCI-registry / network (verified footprint). cosign
+# `sign-blob` over the component/SBOM bytes; the registry fetch + base64 decode is the
+# ADR 000007 / wkg boundary, kept out of the host.
+sigstore = { version = "0.14.0", default-features = false }
