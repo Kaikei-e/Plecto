@@ -7,7 +7,7 @@
 ## Plecto とは
 
 セルフホスト可能・プログラマブルな **L7 リバースプロキシ / API ゲートウェイ（Rust）**。
-**二つの半身**を WIT 型契約で編み込む:
+**相補関係にある二つの構成要素**を WIT 型契約で結ぶ:
 
 - **fast path（native Rust）** — 接続受付・TLS 終端・HTTP/1.1/2/3・ルーティング・LB・upstream 管理。
 - **extension plane（WASM Component Model フィルタ）** — 各リクエストの判断（認証・書換・rate limit・WAF・

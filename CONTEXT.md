@@ -1,14 +1,14 @@
 # Plecto — ドメイン用語集
 
-Plecto は **二つの半身**（native-Rust の fast path / WASM の extension plane）を WIT 型契約で
-編み込む、セルフホスト可能な L7 リバースプロキシ / API ゲートウェイ。本ファイルは用語集
+Plecto は、**相補関係にある二つの構成要素**（native-Rust の fast path / WASM の extension plane）を
+WIT 型契約で結ぶ、セルフホスト可能な L7 リバースプロキシ / API ゲートウェイ。本ファイルは用語集
 （glossary）であり、実装詳細・仕様・決定の置き場ではない。設計判断は `CLAUDE.md` と
 `docs/ADR/`、契約は `wit/` を参照。
 
 ## アーキテクチャ全体
 
 **Fast path**:
-接続受付・TLS 終端・HTTP/1.1/2/3・ルーティング・LB・upstream 管理を担う native-Rust の半身。
+接続受付・TLS 終端・HTTP/1.1/2/3・ルーティング・LB・upstream 管理を担う native-Rust 側の構成要素。
 チェーンを駆動する側。
 _Avoid_: core, engine（曖昧）, data plane（多義）
 
@@ -17,8 +17,9 @@ _Avoid_: core, engine（曖昧）, data plane（多義）
 fast path から WIT 契約越しに駆動される側。
 _Avoid_: plugin layer, middleware layer
 
-**Two halves（二つの半身）**:
-fast path と extension plane の対。両者は WIT 型契約で編み込む（braid）。
+**Two halves（相補関係にある二つの構成要素）**:
+fast path と extension plane の対。相補関係にあり、両者を WIT 型契約で結ぶ。
+_Avoid_: 二つの半身（身体比喩で生硬・"two halves" の直訳調）, より合わせる糸（比喩過多）
 
 ## 契約（`plecto:filter`）
 
