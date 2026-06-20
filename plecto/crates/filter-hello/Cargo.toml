@@ -5,8 +5,9 @@ edition = "2024"
 license = "Apache-2.0"
 
 # A WASM Component Model guest implementing `plecto:filter`. Built for
-# wasm32-wasip2 (crates/host/build.rs drives it). Declares its own [workspace]
-# so the native plecto/ workspace never absorbs it into a host-target build.
+# wasm32-unknown-unknown and componentized by crates/host/build.rs via
+# wit-component (ADR 000010). Declares its own [workspace] so the native
+# plecto/ workspace never absorbs it into a host-target build.
 [lib]
 crate-type = ["cdylib"]
 

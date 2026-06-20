@@ -152,11 +152,11 @@ Plecto は ADR ファーストで作る。各マイルストーンは `docs/ADR/
 - **M0 — 基盤** ✅ *(完了)*
   `plecto:filter@0.1.0` 契約、フィルタをロード&実行する wasmtime ホスト、deny-by-default の能力境界（log / clock / kv）、例フィルタ、E2E/conformance/unit テスト、CI。— [ADR 1](docs/ADR/000001.md) · [2](docs/ADR/000002.md) · [10](docs/ADR/000010.md)
 - **M1 — フィルタ runtime の堅牢化**
-  `InstancePre` + pooling-allocator によるインスタンス再利用、epoch 計量 + メモリ上限、pooling ゼロ化、redb-backed host KV / counter。— [ADR 4](docs/ADR/000004.md) · [6](docs/ADR/000006.md)
+  `InstancePre` + pooling-allocator によるインスタンス再利用、epoch 計量 + メモリ上限、pooling ゼロ化、redb-backed host KV / counter。trusted = pooled+init-once / untrusted = per-request+zeroize の分岐は perf でなく init/zeroization の矛盾ゆえの**必然**。— [ADR 4](docs/ADR/000004.md) · [6](docs/ADR/000006.md) · [11](docs/ADR/000011.md)
 - **M2 — データ経路（fast path）**
   TCP/TLS リスナ、HTTP/1.1 → 2 → 3、ルーティング、実リクエストでのフィルタチェーン駆動、upstream コネクション管理 & ロードバランシング。*Plecto を実際のプロキシにする段。*
-- **M3 — async & ボディ**
-  wasmtime 46 → 非同期ファースト契約、`stream<u8>` ボディ、`wasi:http` 型再利用、body-transform フィルタ、header-only フィルタのゼロコピー・バイパス。— [ADR 3](docs/ADR/000003.md) · [5](docs/ADR/000005.md)
+- **M3 — async & ボディ** *(2段トリガ)*
+  **Stage 1 — host が P3 を走らせられる:** wasmtime 46（Component Model async + WASI 0.3 を default 有効）へ更新。**Stage 2 — P3 ゲストを実用 DX で書ける:** `wasm32-wasip3` の Tier 2 化 / wit-bindgen async の成熟。ボディ作業（非同期ファースト契約・`stream<u8>` ボディ・`wasi:http` 型再利用・body-transform フィルタ）は **Stage 2** に紐づける（46 到来直後に始めると guest toolchain で詰まりうる）。body 非接触は**型レベル**（header/body を別 export）で表し、ゼロコピー bypass を契約から導く。stream splicing 自体は WASI 0.3.x で後続。— [ADR 3](docs/ADR/000003.md) · [5](docs/ADR/000005.md) · [10](docs/ADR/000010.md)
 - **M4 — provenance & 無停止リロード**
   OCI artifact によるフィルタ配布 + cosign 署名検証、宣言的マニフェストの content hash で整合する無停止リロード。— [ADR 6](docs/ADR/000006.md) · [8](docs/ADR/000008.md)
 - **M5 — 可観測性 & オプトイン分散**
@@ -195,6 +195,7 @@ Plecto は load-bearing な判断をすべて ADR に、Fork 形式（*判断 / 
 | [008](docs/ADR/000008.md) | OCI artifact で配布、content hash で整合する無停止リロード |
 | [009](docs/ADR/000009.md) | 単一ノード・ファースト、分散はオプトイン、静的宣言的設定 + 無停止 reload |
 | [010](docs/ADR/000010.md) | 初回増分は sync + 自前 http 型・`wasm32-unknown-unknown`、async は wasmtime 46 へ |
+| [011](docs/ADR/000011.md) | 「ステートレス」=持ち越す可変状態を持たない、trusted/untrusted 分岐は init/zeroization の矛盾ゆえの必然 |
 
 ## コントリビュート
 

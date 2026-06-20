@@ -152,11 +152,11 @@ Plecto is built ADR-first; each milestone realizes specific design decisions in 
 - **M0 — Foundation** ✅ *(done)*
   The `plecto:filter@0.1.0` contract, a wasmtime host that loads & runs filters, a deny-by-default capability boundary (log / clock / kv), an example filter, E2E/conformance/unit tests, and CI. — [ADR 1](docs/ADR/000001.md) · [2](docs/ADR/000002.md) · [10](docs/ADR/000010.md)
 - **M1 — Filter runtime hardening**
-  `InstancePre` + pooling-allocator instance reuse, epoch metering + memory limits, pooling zeroization, redb-backed host KV / counters. — [ADR 4](docs/ADR/000004.md) · [6](docs/ADR/000006.md)
+  `InstancePre` + pooling-allocator instance reuse, epoch metering + memory limits, pooling zeroization, redb-backed host KV / counters. The trusted = pooled-init-once / untrusted = per-request-zeroize split is *forced* (not just perf) by the init/zeroization knot. — [ADR 4](docs/ADR/000004.md) · [6](docs/ADR/000006.md) · [11](docs/ADR/000011.md)
 - **M2 — The data path (fast path)**
   TCP/TLS listener, HTTP/1.1 → 2 → 3, routing, real filter-chain dispatch, upstream connection management & load balancing. *This is what turns Plecto into an actual proxy.*
-- **M3 — Async & bodies**
-  wasmtime 46 → async-first contract, `stream<u8>` bodies, `wasi:http` type reuse, body-transform filters, and zero-copy body bypass for header-only filters. — [ADR 3](docs/ADR/000003.md) · [5](docs/ADR/000005.md)
+- **M3 — Async & bodies** *(two-stage trigger)*
+  **Stage 1 — host can run P3:** upgrade to wasmtime 46 (Component Model async + WASI 0.3 on by default). **Stage 2 — P3 guests are practical to write:** `wasm32-wasip3` reaching Tier 2 / wit-bindgen async maturing. The body work (async-first contract, `stream<u8>` bodies, `wasi:http` type reuse, body-transform filters) is tied to **Stage 2** — starting it the moment wasmtime 46 lands risks stalling on guest tooling. Body-untouching is expressed at the **type level** (separate header/body exports) so zero-copy bypass follows from the contract; stream splicing itself lands later with WASI 0.3.x. — [ADR 3](docs/ADR/000003.md) · [5](docs/ADR/000005.md) · [10](docs/ADR/000010.md)
 - **M4 — Provenance & zero-downtime reload**
   OCI-artifact filter distribution + cosign signature verification, content-hash-reconciled hot reload from a declarative manifest. — [ADR 6](docs/ADR/000006.md) · [8](docs/ADR/000008.md)
 - **M5 — Observability & opt-in distribution**
@@ -195,6 +195,7 @@ Plecto records every load-bearing decision as an ADR, in the Fork form (*decisio
 | [008](docs/ADR/000008.md) | OCI-artifact distribution; content-hash-reconciled zero-downtime reload |
 | [009](docs/ADR/000009.md) | Single-node first; distribution opt-in; static declarative config + hot reload |
 | [010](docs/ADR/000010.md) | First increment: sync + own http types on `wasm32-unknown-unknown`; defer async to wasmtime 46 |
+| [011](docs/ADR/000011.md) | "Stateless" = no carried-over mutable state; the trusted/untrusted instance split is forced by the init/zeroization knot |
 
 ## Contributing
 
