@@ -88,3 +88,19 @@ _Avoid_: syscall, runtime API（曖昧）
 トークンバケットのレート制限を貸す能力。リフィルとカウントは**ホストネイティブ**に保ち
 （超ホット経路は WASM 境界を跨がない）、フィルタは「consult するか・どのキーで」を判断するだけ。
 _Avoid_: throttle, quota（別概念）
+
+## 配布・設定
+
+**Manifest（宣言的マニフェスト）**:
+フィルタを OCI digest で pin し、信頼鍵・チェーン順を宣言する単一の静的設定。「何がロードされているか」の
+source of truth。
+_Avoid_: config（曖昧）, descriptor
+
+**Content pin（digest 固定）**:
+フィルタを OCI content digest（sha256）で固定し、再現性とサプライチェーン整合を担保すること。署名
+（authenticity）とは別レイヤの integrity。
+_Avoid_: version tag（タグは非固定で再現性が壊れる）
+
+**Hot-reload（無停止リロード）**:
+新しいフィルタ集合を並行生成し、アトミックに切替え、旧集合を drain する設定差し替え。
+_Avoid_: restart, hot restart（プロセス再起動を含意）
