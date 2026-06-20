@@ -2,6 +2,7 @@
 plecto/target
 plecto/crates/filter-hello/target
 demo/target
+docs/feedback
 
 # wasm-bindgen demo generated package
 demo/node_pkg
