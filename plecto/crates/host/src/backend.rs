@@ -88,6 +88,11 @@ fn apply_bucket(
             },
         )
     } else {
+        // Retry-After is a deliberate over-estimate: it counts whole refill intervals and
+        // ignores the fraction of the current interval already elapsed, so it can be late by up
+        // to one interval. That is the conservative side for an advisory hint — it never invites
+        // a retry that is too early. Tightening it would mean persisting sub-interval phase,
+        // not worth it for an advisory value.
         let retry_after_ms = if no_refill {
             u64::MAX
         } else {
@@ -132,6 +137,15 @@ fn encode_bucket(state: (u64, u64)) -> Vec<u8> {
     out
 }
 
+/// Map stored bucket bytes to the state `apply_bucket` consumes, **fail-closed on corruption**.
+/// `None` (key absent) is a legitimate first sight → start full. Present-but-malformed bytes must
+/// NOT decode to a full bucket (that is fail-OPEN, inconsistent with the limiter's fail-closed
+/// stance); treat corruption as an empty bucket so the call is denied and the limiter self-heals
+/// via refill.
+fn bucket_input(raw: Option<&[u8]>, now_ms: u64) -> Option<(u64, u64)> {
+    raw.map(|bytes| decode_bucket(bytes).unwrap_or((0, now_ms)))
+}
+
 // --- in-memory backend (default; tests and single-process runs) ---
 
 /// Process-lifetime, in-memory backend. The default until a durable store is configured.
@@ -155,14 +169,20 @@ impl KvBackend for MemoryBackend {
 
     fn increment(&self, key: &[u8], delta: i64) -> i64 {
         let mut map = self.map.lock();
-        let next = decode_i64(map.get(key).map(Vec::as_slice).unwrap_or(&[])).saturating_add(delta);
+        let cur = decode_i64(map.get(key).map(Vec::as_slice).unwrap_or(&[]));
+        // delta == 0 is a counter read (host-counter.get): return the current value without
+        // creating or rewriting the key (mirrors the redb read-txn branch).
+        if delta == 0 {
+            return cur;
+        }
+        let next = cur.saturating_add(delta);
         map.insert(key.to_vec(), next.to_le_bytes().to_vec());
         next
     }
 
     fn try_acquire(&self, key: &[u8], cost: u64, spec: Bucket, now_ms: u64) -> Acquire {
         let mut map = self.map.lock();
-        let prev = map.get(key).and_then(|b| decode_bucket(b));
+        let prev = bucket_input(map.get(key).map(Vec::as_slice), now_ms);
         let (next, result) = apply_bucket(prev, cost, spec, now_ms);
         map.insert(key.to_vec(), encode_bucket(next));
         result
@@ -222,7 +242,13 @@ impl RedbBackend {
     }
 
     fn increment_inner(&self, key: &[u8], delta: i64) -> anyhow::Result<i64> {
-        let wtxn = self.db.begin_write()?;
+        let mut wtxn = self.db.begin_write()?;
+        // Counters are ephemeral hot-path state (ADR 000005): a crash losing the last few
+        // increments is harmless, so skip the per-commit fsync of the default
+        // `Durability::Immediate`. Atomicity is unaffected — the read-modify-write is still one
+        // write txn. Durable KV (`set` / `delete`) keeps `Immediate`. set_durability only errors
+        // if a persistent savepoint changed in this txn; we never use savepoints.
+        wtxn.set_durability(redb::Durability::None)?;
         let next = {
             let mut table = wtxn.open_table(STATE_TABLE)?;
             let cur = table.get(key)?.map(|g| decode_i64(g.value())).unwrap_or(0);
@@ -241,10 +267,16 @@ impl RedbBackend {
         spec: Bucket,
         now_ms: u64,
     ) -> anyhow::Result<Acquire> {
-        let wtxn = self.db.begin_write()?;
+        let mut wtxn = self.db.begin_write()?;
+        // Rate-limit buckets are ephemeral hot-path state (ADR 000005): same reasoning as
+        // counters — skip the per-commit fsync; atomicity stays (one write txn).
+        wtxn.set_durability(redb::Durability::None)?;
         let result = {
             let mut table = wtxn.open_table(STATE_TABLE)?;
-            let prev = table.get(key)?.and_then(|g| decode_bucket(g.value()));
+            let prev = {
+                let guard = table.get(key)?;
+                bucket_input(guard.as_ref().map(|g| g.value()), now_ms)
+            };
             let (next, result) = apply_bucket(prev, cost, spec, now_ms);
             table.insert(key, encode_bucket(next).as_slice())?;
             result
@@ -278,7 +310,16 @@ impl KvBackend for RedbBackend {
     }
 
     fn increment(&self, key: &[u8], delta: i64) -> i64 {
-        match self.increment_inner(key, delta) {
+        // delta == 0 is the canonical counter READ (host-counter.get). Serve it from a read txn
+        // so it never joins the single-writer queue or pays a commit (ADR 000004 / 000005 hot
+        // path). Only a real mutation takes the write path.
+        let r = if delta == 0 {
+            self.get_inner(key)
+                .map(|opt| decode_i64(opt.as_deref().unwrap_or_default()))
+        } else {
+            self.increment_inner(key, delta)
+        };
+        match r {
             Ok(v) => v,
             Err(e) => {
                 tracing::error!(error = %e, "redb increment failed; returning 0");
@@ -341,12 +382,47 @@ mod tests {
         assert!(backend.try_acquire(b"rl", 1, spec, 1000).allowed);
     }
 
+    fn counter_read_via_zero_delta_does_not_create_key(backend: &dyn KvBackend) {
+        // host-counter.get maps to increment(key, 0); a pure read must not create the key — it
+        // takes the redb read-txn / memory read branch, off the single-writer write path.
+        assert_eq!(backend.increment(b"zc", 0), 0, "unset counter reads as 0");
+        assert_eq!(
+            backend.get(b"zc"),
+            None,
+            "a zero-delta read must not create the counter key"
+        );
+        assert_eq!(backend.increment(b"zc", 5), 5);
+        assert_eq!(
+            backend.increment(b"zc", 0),
+            5,
+            "zero-delta still reads the live value"
+        );
+    }
+
+    fn token_bucket_corrupt_state_fails_closed(backend: &dyn KvBackend) {
+        // A malformed stored bucket must DENY (fail-closed), never reset to full (fail-open).
+        let spec = Bucket {
+            capacity: 5,
+            refill_tokens: 1,
+            refill_interval_ms: 1000,
+        };
+        backend.set(b"cb", vec![0xff; 3]); // not 16 bytes → corrupt
+        assert!(
+            !backend.try_acquire(b"cb", 1, spec, 0).allowed,
+            "corrupt bucket must fail closed, not start full"
+        );
+        // and it self-heals: after one interval a refilled token is granted
+        assert!(backend.try_acquire(b"cb", 1, spec, 1000).allowed);
+    }
+
     #[test]
     fn memory_backend_behaviour() {
         let b = MemoryBackend::default();
         kv_roundtrip(&b);
         counter_is_atomic_add_and_get(&b);
+        counter_read_via_zero_delta_does_not_create_key(&b);
         token_bucket_drains_then_refills(&b);
+        token_bucket_corrupt_state_fails_closed(&b);
     }
 
     #[test]
@@ -355,7 +431,9 @@ mod tests {
         let b = RedbBackend::open(dir.path().join("state.redb")).unwrap();
         kv_roundtrip(&b);
         counter_is_atomic_add_and_get(&b);
+        counter_read_via_zero_delta_does_not_create_key(&b);
         token_bucket_drains_then_refills(&b);
+        token_bucket_corrupt_state_fails_closed(&b);
     }
 
     #[test]

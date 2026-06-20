@@ -49,7 +49,11 @@ use bindings::{Filter, FilterPre};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Isolation {
     /// Own filters: one persistent instance, `init` once, reused. No per-request
-    /// zeroization (same trust domain).
+    /// zeroization (same trust domain). Statelessness (Fork 4) is therefore honored by
+    /// *trust*, not *enforced*: a trusted filter that stashes mutable state in its own linear
+    /// memory silently carries it across requests. That is not a security boundary (same
+    /// trust domain) — only `Untrusted`'s fresh-per-request memory enforces statelessness
+    /// structurally (ADR 000011).
     Trusted,
     /// Third-party filters: fresh instance per request, memory fresh by construction.
     Untrusted,
@@ -276,7 +280,10 @@ impl Host {
     ///
     /// `filter_id` is the host-assigned identity used to namespace this filter's keyspace
     /// (ADR 000011). It must be non-empty and free of the namespace delimiter; the filter
-    /// never sees or controls it.
+    /// never sees or controls it. **Uniqueness is the caller's responsibility**: `load`
+    /// rejects an empty or delimiter-bearing id but not a duplicate, so loading the same id
+    /// twice shares one keyspace. A manifest-driven registry will assign and dedup ids
+    /// (ADR 000007).
     pub fn load(
         &self,
         filter_id: &str,

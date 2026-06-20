@@ -107,7 +107,10 @@ interface host-counter {
 interface host-ratelimit {
     // A token-bucket specification. In v0.1.0 the filter supplies it per call because
     // Plecto has no declarative manifest yet (ADR 000007); once the manifest lands the
-    // spec moves host-side and `try-acquire` slims to (key, cost).
+    // spec moves host-side and `try-acquire` slims to (key, cost). Trust caveat: while the
+    // spec is filter-supplied it is the filter's *claim*, not a host-enforced limit — an
+    // untrusted filter could pass a huge `capacity` to neuter its own limiter. Fine for
+    // trusted (operator-authored) filters; the manifest closes this for untrusted ones.
     record bucket {
         // maximum tokens the bucket can hold
         capacity: u64,
