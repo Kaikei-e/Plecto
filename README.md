@@ -149,6 +149,24 @@ cargo test --all
 
 The suite proves the slice end-to-end: a request flows through the host into a real filter component, the typed `decision` round-trips, and the filter reaches **only** the capabilities it was lent (the example component imports `plecto:filter/*` and nothing else — zero WASI, network, or filesystem access).
 
+### Run the demo proxy
+
+A self-contained example wires the **production path** — it signs the example filter, bundles it as an offline OCI layout, generates a TLS cert, writes a manifest, and serves the fast path over HTTPS — then prints commands to try:
+
+```bash
+cd plecto
+cargo run -p plecto-server --example demo   # serves https://localhost:8443, Ctrl-C to stop
+
+# in another shell (self-signed cert → curl -k):
+curl -k https://localhost:8443/api/hello                         # routed + /api stripped + forwarded
+curl -k -H 'x-plecto-block: 1' https://localhost:8443/api/hello  # filter short-circuits 403
+for i in 1 2 3; do curl -k -s -o /dev/null -w '%{http_code} ' \
+  -H 'x-plecto-ratelimit: 1' https://localhost:8443/api/hello; done   # 200 200 429 (host-native rate limit)
+curl -k https://localhost:8443/nope                             # no route → 404
+```
+
+It exercises the whole chain: cosign-style signature + SBOM verification, TLS termination (rustls), host + path-prefix routing with a host-native prefix strip, the filter chain (continue / modify / short-circuit / rate-limit), and response-side rewriting — over real HTTPS.
+
 ## Roadmap
 
 Plecto is built ADR-first; each milestone realizes specific design decisions in `docs/ADR/`.

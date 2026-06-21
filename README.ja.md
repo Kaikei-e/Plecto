@@ -149,6 +149,24 @@ cargo test --all
 
 テストはスライスを end-to-end で実証する: リクエストがホストを通って実フィルタ・コンポーネントへ流れ、型付き `decision` が往復し、フィルタは**貸与された能力だけ**に到達する（例コンポーネントは `plecto:filter/*` のみを import し、WASI・network・filesystem には一切アクセスしない）。
 
+### デモプロキシを動かす
+
+自己完結の example が**本番パス**を一通り組み上げる —— 例フィルタに署名し、オフライン OCI レイアウトに梱包し、TLS 証明書を生成し、manifest を書き、fast path を HTTPS で serve —— して、試すコマンドを表示する:
+
+```bash
+cd plecto
+cargo run -p plecto-server --example demo   # https://localhost:8443 で serve、Ctrl-C で停止
+
+# 別シェルで（自己署名なので curl -k）:
+curl -k https://localhost:8443/api/hello                         # routing + /api strip + 転送
+curl -k -H 'x-plecto-block: 1' https://localhost:8443/api/hello  # フィルタが 403 で short-circuit
+for i in 1 2 3; do curl -k -s -o /dev/null -w '%{http_code} ' \
+  -H 'x-plecto-ratelimit: 1' https://localhost:8443/api/hello; done   # 200 200 429（host-native rate limit）
+curl -k https://localhost:8443/nope                             # ルート無し → 404
+```
+
+cosign 風の署名 ＋ SBOM 検証、TLS 終端（rustls）、host＋path-prefix routing と host-native prefix strip、フィルタチェーン（continue / modify / short-circuit / rate-limit）、response 側書換 —— を実 HTTPS で一気に通す。
+
 ## ロードマップ
 
 Plecto は ADR ファーストで作る。各マイルストーンは `docs/ADR/` の特定の設計判断を具体化する。
