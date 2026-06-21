@@ -17,11 +17,12 @@
 //! counter / ratelimit). No WASI, network, filesystem, or sockets (ADR 000006).
 
 mod backend;
+mod observe;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
 use parking_lot::Mutex;
@@ -34,6 +35,10 @@ use wasmtime::{
 };
 
 pub use backend::{Acquire, Bucket, KvBackend, MemoryBackend, RedbBackend};
+pub use observe::{
+    FanOutSink, FilterSpan, Hook, InMemorySink, MetricsSink, MetricsSnapshot, NoopSink,
+    RequestTrace, SpanOutcome, TelemetrySink,
+};
 
 mod bindings {
     wasmtime::component::bindgen!({
@@ -492,6 +497,9 @@ pub struct Host {
     kv: Arc<dyn KvBackend>,
     /// Public keys this host trusts to sign filters (ADR 000006). Verified at every `load`.
     trust: TrustPolicy,
+    /// Where loaded filters emit their per-execution spans (ADR 000009). Default `NoopSink`
+    /// (observability off); cloned into each filter at `load`, so set it before loading.
+    sink: Arc<dyn TelemetrySink>,
     /// Drives epoch deadlines for both engines; stops on drop. Held only for its lifetime.
     _epoch_ticker: EpochTicker,
 }
@@ -545,8 +553,18 @@ impl Host {
             untrusted_engine,
             kv,
             trust,
+            sink: Arc::new(NoopSink),
             _epoch_ticker,
         })
+    }
+
+    /// Set the telemetry sink (ADR 000009 observability stage). Filters loaded **after** this
+    /// emit one span per `on_request` / `on_response` to `sink`; the default is `NoopSink`
+    /// (observability off, zero cost). Builder style: `Host::new(trust)?.with_telemetry_sink(sink)`.
+    /// The sink is cloned into each filter at `load`, so set it before loading.
+    pub fn with_telemetry_sink(mut self, sink: Arc<dyn TelemetrySink>) -> Self {
+        self.sink = sink;
+        self
     }
 
     /// Load a filter component under the given isolation mode. Type-checks and resolves
@@ -607,6 +625,8 @@ impl Host {
             engine: engine.clone(),
             kv: self.kv.clone(),
             kv_prefix: format!("{filter_id}{KV_NS_DELIM}"),
+            filter_id: filter_id.to_string(),
+            sink: self.sink.clone(),
             pre,
             isolation: opts.isolation,
             init_deadline_ms: opts.init_deadline_ms,
@@ -631,6 +651,10 @@ struct LoadedInner {
     engine: Engine,
     kv: Arc<dyn KvBackend>,
     kv_prefix: String,
+    /// The filter id (span name + telemetry attribute, ADR 000009).
+    filter_id: String,
+    /// Where this filter's per-execution spans go (cloned from the `Host` at load).
+    sink: Arc<dyn TelemetrySink>,
     pre: FilterPre<HostState>,
     isolation: Isolation,
     init_deadline_ms: u64,
@@ -761,10 +785,35 @@ impl LoadedFilter {
         self.inner.isolation
     }
 
-    /// Run the request-side hook. Returns the typed decision plus any log lines the filter
-    /// emitted (captured via the host-log capability), or a `RunError` the caller MUST
+    /// Run the request-side hook under the request's trace context (`trace`, ADR 000009). The
+    /// host times the call and emits one span — parented by `trace`, carrying the outcome and
+    /// the filter's host-log lines as events — to its `TelemetrySink`. Returns the typed
+    /// decision plus those log lines (the direct-access form), or a `RunError` the caller MUST
     /// fail-closed on (deadline / trap / instantiation — never a pass-through to upstream).
     pub fn on_request(
+        &self,
+        req: &HttpRequest,
+        trace: &RequestTrace,
+    ) -> std::result::Result<(RequestDecision, Vec<LogLine>), RunError> {
+        let start = SystemTime::now();
+        let elapsed = Instant::now();
+        let result = self.run_on_request(req);
+        let outcome = match &result {
+            Ok((decision, _)) => SpanOutcome::from(decision),
+            Err(err) => SpanOutcome::from(err),
+        };
+        self.emit_span(
+            trace,
+            Hook::OnRequest,
+            outcome,
+            start,
+            elapsed.elapsed(),
+            &result,
+        );
+        result
+    }
+
+    fn run_on_request(
         &self,
         req: &HttpRequest,
     ) -> std::result::Result<(RequestDecision, Vec<LogLine>), RunError> {
@@ -795,8 +844,61 @@ impl LoadedFilter {
         }
     }
 
+    /// Build and emit the span for one filter execution (ADR 000009). The filter's host-log
+    /// lines (`Ok`) become span events; a `RunError` carries no logs but its outcome
+    /// (trap / deadline / …) is still recorded. Errors never abort emission — telemetry is
+    /// best-effort and out of the fail-closed path.
+    fn emit_span<T>(
+        &self,
+        trace: &RequestTrace,
+        hook: Hook,
+        outcome: SpanOutcome,
+        start: SystemTime,
+        duration: Duration,
+        result: &std::result::Result<(T, Vec<LogLine>), RunError>,
+    ) {
+        let logs: &[LogLine] = match result {
+            Ok((_, logs)) => logs,
+            Err(_) => &[],
+        };
+        let span = observe::build_filter_span(
+            trace,
+            &self.inner.filter_id,
+            self.inner.isolation,
+            hook,
+            outcome,
+            start,
+            duration,
+            logs,
+        );
+        self.inner.sink.export(&span);
+    }
+
     /// Run the response-side hook for one response. Same fail-closed contract as `on_request`.
     pub fn on_response(
+        &self,
+        resp: &HttpResponse,
+        trace: &RequestTrace,
+    ) -> std::result::Result<(ResponseDecision, Vec<LogLine>), RunError> {
+        let start = SystemTime::now();
+        let elapsed = Instant::now();
+        let result = self.run_on_response(resp);
+        let outcome = match &result {
+            Ok((decision, _)) => SpanOutcome::from(decision),
+            Err(err) => SpanOutcome::from(err),
+        };
+        self.emit_span(
+            trace,
+            Hook::OnResponse,
+            outcome,
+            start,
+            elapsed.elapsed(),
+            &result,
+        );
+        result
+    }
+
+    fn run_on_response(
         &self,
         resp: &HttpResponse,
     ) -> std::result::Result<(ResponseDecision, Vec<LogLine>), RunError> {

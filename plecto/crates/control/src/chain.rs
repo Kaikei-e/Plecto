@@ -3,7 +3,8 @@
 //! Fail-closed — a trapped / timed-out filter (`RunError`) never falls through to upstream.
 
 use plecto_host::{
-    Header, HttpRequest, HttpResponse, RequestDecision, RequestEdit, ResponseDecision, ResponseEdit,
+    Header, HttpRequest, HttpResponse, RequestDecision, RequestEdit, RequestTrace,
+    ResponseDecision, ResponseEdit,
 };
 
 use crate::ActiveConfig;
@@ -17,14 +18,20 @@ pub enum ChainOutcome {
     Forward(HttpRequest),
 }
 
-pub(crate) fn dispatch_request(active: &ActiveConfig, mut request: HttpRequest) -> ChainOutcome {
+pub(crate) fn dispatch_request(
+    active: &ActiveConfig,
+    mut request: HttpRequest,
+    trace: &RequestTrace,
+) -> ChainOutcome {
     for id in &active.chain {
         // `build_active` validates chain ⊆ filters, so this is always `Some`; staying total
         // (no indexing panic) honours the data-plane no-panic discipline (bp-rust).
         let Some(filter) = active.filters.get(id) else {
             continue;
         };
-        match filter.on_request(&request) {
+        // `trace` parents each filter span (ADR 000009): the host times the call and emits the
+        // span to its sink; we drive only the decision here.
+        match filter.on_request(&request, trace) {
             Ok((RequestDecision::Continue, _logs)) => {}
             Ok((RequestDecision::Modified(edit), _logs)) => apply_request_edit(&mut request, edit),
             Ok((RequestDecision::ShortCircuit(response), _logs)) => {
@@ -37,14 +44,19 @@ pub(crate) fn dispatch_request(active: &ActiveConfig, mut request: HttpRequest) 
     ChainOutcome::Forward(request)
 }
 
-pub(crate) fn dispatch_response(active: &ActiveConfig, mut response: HttpResponse) -> HttpResponse {
+pub(crate) fn dispatch_response(
+    active: &ActiveConfig,
+    mut response: HttpResponse,
+    trace: &RequestTrace,
+) -> HttpResponse {
     // The response side runs the chain in reverse (CONTEXT: request/response are symmetric).
-    // `response-decision` has no short-circuit, so the chain only continues or rewrites.
+    // `response-decision` has no short-circuit, so the chain only continues or rewrites. The
+    // same `trace` as the request side, so request + response spans share one trace (ADR 000009).
     for id in active.chain.iter().rev() {
         let Some(filter) = active.filters.get(id) else {
             continue;
         };
-        match filter.on_response(&response) {
+        match filter.on_response(&response, trace) {
             Ok((ResponseDecision::Continue, _logs)) => {}
             Ok((ResponseDecision::Modified(edit), _logs)) => {
                 apply_response_edit(&mut response, edit)

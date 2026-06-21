@@ -37,8 +37,12 @@ pub use reload::{ReloadOutcome, ReloadSource, serve_reloads};
 pub use snapshot::ConfigSnapshot;
 
 // Re-export the host surface a caller drives the control plane with, so they need not depend
-// on `plecto-host` directly for the common path.
-pub use plecto_host::{Host, HttpRequest, HttpResponse, TrustPolicy};
+// on `plecto-host` directly for the common path — including the ADR 000009 observability
+// types (build a `Host` with a sink, then drive snapshots that carry the trace context).
+pub use plecto_host::{
+    FanOutSink, FilterSpan, Host, HttpRequest, HttpResponse, InMemorySink, MetricsSink,
+    MetricsSnapshot, NoopSink, RequestTrace, SpanOutcome, TelemetrySink, TrustPolicy,
+};
 
 /// The atomically-swappable active configuration: the loaded filters, the chain order, and
 /// the `content_hash` of the manifest that produced them. Held behind an `ArcSwap`; never
@@ -197,7 +201,15 @@ impl Control {
     /// fast-path server takes one snapshot per request and drives both halves through it, so a
     /// concurrent reload cannot desync the request and response sides of the same transaction.
     pub fn snapshot(&self) -> ConfigSnapshot {
-        ConfigSnapshot::new(self.active.load_full())
+        self.snapshot_with_trace(RequestTrace::root())
+    }
+
+    /// Like [`Control::snapshot`], but continue an inbound trace context (ADR 000009): the
+    /// fast-path server parses the request's W3C `traceparent` into a [`RequestTrace`] and
+    /// passes it here, so the chain's spans join the caller's distributed trace instead of
+    /// starting a fresh root.
+    pub fn snapshot_with_trace(&self, trace: RequestTrace) -> ConfigSnapshot {
+        ConfigSnapshot::new(self.active.load_full(), trace)
     }
 
     /// Drive a request through the chain. Returns whether to forward the (possibly edited)

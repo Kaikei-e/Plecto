@@ -5,9 +5,16 @@
 
 use plecto_host::test_support::{TestSigner, bound_sbom};
 use plecto_host::{
-    Header, Host, HttpRequest, LoadOptions, LoadedFilter, LogLine, RequestDecision, RunError,
-    SignedArtifact,
+    Header, Host, HttpRequest, LoadOptions, LoadedFilter, LogLine, RequestDecision, RequestTrace,
+    RunError, SignedArtifact,
 };
+
+/// Run the request hook under a fresh per-request trace (ADR 000009). These tests assert on
+/// the returned decision + logs (telemetry shape is covered in `observe.rs` / the sink tests),
+/// so a throwaway root trace per call is fine.
+fn on_req(f: &LoadedFilter, r: &HttpRequest) -> Result<(RequestDecision, Vec<LogLine>), RunError> {
+    f.on_request(r, &RequestTrace::root())
+}
 
 fn component_bytes() -> Vec<u8> {
     std::fs::read(env!("FILTER_HELLO_COMPONENT")).expect("read filter-hello component")
@@ -77,7 +84,7 @@ fn local_state(logs: &[LogLine]) -> u32 {
 fn continues_when_request_is_not_blocked() {
     let (_host, filter) = signed_load(LoadOptions::untrusted());
 
-    let (decision, logs) = filter.on_request(&request(&[])).unwrap();
+    let (decision, logs) = on_req(&filter, &request(&[])).unwrap();
 
     assert!(
         matches!(decision, RequestDecision::Continue),
@@ -90,9 +97,7 @@ fn continues_when_request_is_not_blocked() {
 fn short_circuits_when_block_header_present() {
     let (_host, filter) = signed_load(LoadOptions::untrusted());
 
-    let (decision, _logs) = filter
-        .on_request(&request(&[("x-plecto-block", "1")]))
-        .unwrap();
+    let (decision, _logs) = on_req(&filter, &request(&[("x-plecto-block", "1")])).unwrap();
 
     match decision {
         RequestDecision::ShortCircuit(resp) => {
@@ -115,7 +120,7 @@ fn trusted_filter_runs_init_once_across_requests() {
     let (_host, filter) = signed_load(LoadOptions::trusted());
 
     for _ in 0..3 {
-        let (_decision, logs) = filter.on_request(&request(&[])).unwrap();
+        let (_decision, logs) = on_req(&filter, &request(&[])).unwrap();
         assert_eq!(init_calls(&logs), 1, "trusted init must run exactly once");
     }
 }
@@ -128,7 +133,7 @@ fn untrusted_filter_reinitializes_each_request() {
 
     let mut seen = Vec::new();
     for _ in 0..3 {
-        let (_decision, logs) = filter.on_request(&request(&[])).unwrap();
+        let (_decision, logs) = on_req(&filter, &request(&[])).unwrap();
         seen.push(init_calls(&logs));
     }
     assert_eq!(seen, vec![1, 2, 3], "untrusted init must run every request");
@@ -143,14 +148,14 @@ fn rate_limit_short_circuits_after_capacity() {
     let limited = request(&[("x-plecto-ratelimit", "1")]);
 
     for n in 1..=2 {
-        let (decision, _logs) = filter.on_request(&limited).unwrap();
+        let (decision, _logs) = on_req(&filter, &limited).unwrap();
         assert!(
             matches!(decision, RequestDecision::Continue),
             "request {n} within capacity should continue"
         );
     }
 
-    let (decision, _logs) = filter.on_request(&limited).unwrap();
+    let (decision, _logs) = on_req(&filter, &limited).unwrap();
     match decision {
         RequestDecision::ShortCircuit(resp) => {
             assert_eq!(resp.status, 429, "exhausted bucket must get 429");
@@ -178,7 +183,7 @@ fn rate_limit_counting_is_host_native_across_fresh_untrusted_instances() {
     let limited = request(&[("x-plecto-ratelimit", "1")]);
 
     for n in 1..=2 {
-        let (decision, logs) = filter.on_request(&limited).unwrap();
+        let (decision, logs) = on_req(&filter, &limited).unwrap();
         assert_eq!(
             init_calls(&logs),
             n,
@@ -190,7 +195,7 @@ fn rate_limit_counting_is_host_native_across_fresh_untrusted_instances() {
         );
     }
 
-    let (decision, logs) = filter.on_request(&limited).unwrap();
+    let (decision, logs) = on_req(&filter, &limited).unwrap();
     assert_eq!(
         init_calls(&logs),
         3,
@@ -211,7 +216,7 @@ fn runaway_filter_is_interrupted_by_epoch_deadline() {
     // (If epoch interruption were absent this test would never return.)
     let (_host, filter) = signed_load(LoadOptions::untrusted().with_request_deadline_ms(50));
 
-    let result = filter.on_request(&request(&[("x-plecto-spin", "1")]));
+    let result = on_req(&filter, &request(&[("x-plecto-spin", "1")]));
     assert!(
         matches!(result, Err(RunError::Deadline)),
         "a runaway filter must trap as Deadline (fail-closed)"
@@ -225,16 +230,15 @@ fn trusted_filter_recovers_after_trap() {
     // staying broken. A trap leaves linear memory undefined, so reuse is not safe.
     let (_host, filter) = signed_load(LoadOptions::trusted().with_request_deadline_ms(50));
 
-    let trapped = filter.on_request(&request(&[("x-plecto-spin", "1")]));
+    let trapped = on_req(&filter, &request(&[("x-plecto-spin", "1")]));
     assert!(
         matches!(trapped, Err(RunError::Deadline)),
         "the runaway request must trap the persistent instance"
     );
 
     // the very next normal request still succeeds: the instance was rebuilt and re-inited.
-    let (decision, logs) = filter
-        .on_request(&request(&[]))
-        .expect("trusted filter must self-heal after a trap");
+    let (decision, logs) =
+        on_req(&filter, &request(&[])).expect("trusted filter must self-heal after a trap");
     assert!(matches!(decision, RequestDecision::Continue));
     assert!(logs.iter().any(|l| l.message.contains("on-request")));
 }
@@ -251,13 +255,13 @@ fn trusted_trap_storm_opens_circuit_breaker() {
 
     for _ in 0..3 {
         assert!(
-            matches!(filter.on_request(&spin), Err(RunError::Deadline)),
+            matches!(on_req(&filter, &spin), Err(RunError::Deadline)),
             "consecutive traps self-heal and surface as Deadline until the breaker opens"
         );
     }
 
     assert!(
-        matches!(filter.on_request(&request(&[])), Err(RunError::Unavailable)),
+        matches!(on_req(&filter, &request(&[])), Err(RunError::Unavailable)),
         "once the breaker is open, even a benign request fails closed cheaply (no rebuild)"
     );
 }
@@ -269,16 +273,14 @@ fn memory_limit_traps_runaway_allocation() {
     // process must survive — the cap bounds the guest, it does not OOM the host.
     let (_host, filter) = signed_load(LoadOptions::untrusted().with_max_memory_bytes(16 << 20));
 
-    let result = filter.on_request(&request(&[("x-plecto-balloon", "1")]));
+    let result = on_req(&filter, &request(&[("x-plecto-balloon", "1")]));
     assert!(
         matches!(result, Err(RunError::Trap(_))),
         "over-allocation past the memory cap must trap (fail-closed), not OOM the host"
     );
 
     // the host is still alive and serves a normal request afterwards.
-    let (decision, _logs) = filter
-        .on_request(&request(&[]))
-        .expect("host survives the guest trap");
+    let (decision, _logs) = on_req(&filter, &request(&[])).expect("host survives the guest trap");
     assert!(matches!(decision, RequestDecision::Continue));
 }
 
@@ -292,7 +294,7 @@ fn untrusted_guest_memory_is_fresh_each_request() {
     let (_host, filter) = signed_load(LoadOptions::untrusted());
 
     for _ in 0..3 {
-        let (_decision, logs) = filter.on_request(&request(&[])).unwrap();
+        let (_decision, logs) = on_req(&filter, &request(&[])).unwrap();
         assert_eq!(
             local_state(&logs),
             1,
@@ -311,7 +313,7 @@ fn trusted_guest_memory_persists_across_requests() {
 
     let mut seen = Vec::new();
     for _ in 0..3 {
-        let (_decision, logs) = filter.on_request(&request(&[])).unwrap();
+        let (_decision, logs) = on_req(&filter, &request(&[])).unwrap();
         seen.push(local_state(&logs));
     }
     assert_eq!(

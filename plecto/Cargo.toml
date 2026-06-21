@@ -31,6 +31,12 @@ tracing = "0.1"
 # `sign-blob` over the component/SBOM bytes; the registry fetch + base64 decode is the
 # ADR 000007 / wkg boundary, kept out of the host.
 sigstore = { version = "0.14.0", default-features = false }
+# opentelemetry: the OTel data model ONLY (ADR 000009 host observability stage). We pull just
+# the API crate's `trace` types (TraceId/SpanId/SpanContext/SpanKind/Status/KeyValue/Event) —
+# default-features=false drops `metrics`/`logs`/`tracing`/`futures`, and crucially NO `rt-tokio`,
+# so this stays no-tokio. The async `SpanExporter` SDK + OTLP network export (and the wasi-otel
+# guest contract) are named-deferred; our sync `TelemetrySink` seam maps to them later.
+opentelemetry = { version = "0.32", default-features = false, features = ["trace"] }
 
 # --- plecto-control (ADR 000007 / 000008): declarative manifest, OCI artifact load,
 # --- chain dispatch, atomic hot-reload. ---

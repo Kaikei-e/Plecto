@@ -4,8 +4,11 @@
 //! `reload` swaps the active set atomically. Uses the in-memory store so these tests need no
 //! OCI layout (the offline OCI store is covered separately).
 
+use std::sync::Arc;
+
 use plecto_control::{
-    ChainOutcome, Control, ControlError, Host, HttpRequest, Manifest, MemoryStore, ResolvedArtifact,
+    ChainOutcome, Control, ControlError, Host, HttpRequest, HttpResponse, InMemorySink, Manifest,
+    MemoryStore, ResolvedArtifact,
 };
 use plecto_host::Header;
 use plecto_host::test_support::{TestSigner, bound_sbom, filter_hello_component};
@@ -186,6 +189,41 @@ fn control_load_rejects_digest_mismatch() {
         Ok(_) => panic!("a wrong pinned digest must be rejected"),
         Err(e) => assert!(matches!(e, ControlError::DigestMismatch { .. }), "got {e}"),
     }
+}
+
+#[test]
+fn request_and_response_spans_share_one_trace_via_snapshot() {
+    // ADR 000009: a request transaction takes ONE snapshot; both halves run under its trace, so
+    // the request-side and response-side filter spans belong to the same trace and share a
+    // parent (the request span). The host emits them to its injected sink as the chain runs.
+    let sink = Arc::new(InMemorySink::new());
+    let (signer, artifact) = signed_filter_hello();
+    let mut store = MemoryStore::new();
+    let digest = store.insert("fh", artifact);
+    let host = Host::new(signer.trust_policy().unwrap())
+        .unwrap()
+        .with_telemetry_sink(sink.clone());
+    let manifest = Manifest::from_toml(&manifest_toml(&digest, &["fh"])).unwrap();
+    let control = Control::load(host, &manifest, Box::new(store)).unwrap();
+
+    let snap = control.snapshot();
+    let _ = snap.on_request(req(&[]));
+    let _ = snap.on_response(HttpResponse {
+        status: 200,
+        headers: vec![],
+        body: vec![],
+    });
+
+    let spans = sink.spans();
+    assert_eq!(spans.len(), 2, "one request span + one response span");
+    assert_eq!(
+        spans[0].trace_id, spans[1].trace_id,
+        "both halves of one transaction share a trace"
+    );
+    assert_eq!(
+        spans[0].parent_span_id, spans[1].parent_span_id,
+        "both filter spans are children of the request span"
+    );
 }
 
 #[test]

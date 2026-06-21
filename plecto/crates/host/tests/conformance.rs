@@ -10,7 +10,8 @@
 
 use plecto_host::test_support::{TestSigner, bound_sbom};
 use plecto_host::{
-    Host, HttpResponse, Isolation, LoadOptions, ResponseDecision, SignedArtifact, TrustPolicy,
+    Host, HttpResponse, Isolation, LoadOptions, RequestTrace, ResponseDecision, SignedArtifact,
+    TrustPolicy,
 };
 
 fn component_bytes() -> Vec<u8> {
@@ -99,7 +100,7 @@ fn response_hook_is_honoured() {
         headers: vec![],
         body: vec![],
     };
-    let (decision, _logs) = filter.on_response(&resp).unwrap();
+    let (decision, _logs) = filter.on_response(&resp, &RequestTrace::root()).unwrap();
     assert!(matches!(decision, ResponseDecision::Continue));
 }
 

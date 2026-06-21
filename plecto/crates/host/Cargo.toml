@@ -18,6 +18,8 @@ sigstore = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 serde_json = { workspace = true }
+# opentelemetry: OTel data-model types only (ADR 000009 observability stage; no-tokio).
+opentelemetry = { workspace = true }
 
 # build.rs builds the filter-hello guest (wasm32-unknown-unknown) and wraps the
 # core module into a Component Model component, hermetically (no external CLI).
