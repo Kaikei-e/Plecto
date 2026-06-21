@@ -33,8 +33,14 @@ pub(crate) fn sha256_pinned(bytes: &[u8]) -> String {
 }
 
 /// An in-memory `ArtifactStore` keyed by source name — the reference / test store. Its
-/// content digest is `sha256` over the component bytes, so the pin mechanism is exercised
-/// without an on-disk OCI layout. The offline `OciLayoutStore` is the real one.
+/// content digest is `sha256` over the **component bytes**, so the pin mechanism is exercised
+/// without an on-disk OCI layout.
+///
+/// Note the pin semantics differ from the real store (f000004 #5): `OciLayoutStore` pins the
+/// OCI **image-manifest** digest (the Merkle root over all layers), whereas this store pins
+/// the component digest directly. The `digest` a manifest carries therefore means different
+/// things across stores — a deliberate test simplification, not a portable pin. The offline
+/// `OciLayoutStore` is the real one; production manifests pin image-manifest digests.
 #[derive(Default)]
 pub struct MemoryStore {
     artifacts: HashMap<String, ResolvedArtifact>,

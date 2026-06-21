@@ -18,6 +18,7 @@ mod error;
 mod manifest;
 pub mod oci;
 mod reload;
+mod snapshot;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -33,6 +34,7 @@ pub use manifest::{Chain, FilterEntry, IsolationKind, Manifest, Trust};
 #[cfg(unix)]
 pub use reload::SignalReloadSource;
 pub use reload::{ReloadOutcome, ReloadSource, serve_reloads};
+pub use snapshot::ConfigSnapshot;
 
 // Re-export the host surface a caller drives the control plane with, so they need not depend
 // on `plecto-host` directly for the common path.
@@ -58,6 +60,10 @@ pub struct Control {
     store: Box<dyn ArtifactStore>,
     active: ArcSwap<ActiveConfig>,
     manifest_path: Option<PathBuf>,
+    /// The `[trust]` section the `Host` was built from, captured at construction. A reload that
+    /// would change it is rejected (`TrustChangeRequiresRestart`) rather than silently dropped
+    /// (f000004 #1): trust roots are fixed for the life of the `Host` / epoch ticker.
+    trust: Trust,
 }
 
 impl Control {
@@ -87,6 +93,7 @@ impl Control {
             store,
             active: ArcSwap::from_pointee(active),
             manifest_path: None,
+            trust: manifest.trust.clone(),
         })
     }
 
@@ -105,6 +112,7 @@ impl Control {
             store: Box::new(store),
             active: ArcSwap::from_pointee(active),
             manifest_path: Some(manifest_path.to_path_buf()),
+            trust: manifest.trust.clone(),
         })
     }
 
@@ -124,6 +132,7 @@ impl Control {
             store,
             active: ArcSwap::from_pointee(active),
             manifest_path: Some(manifest_path.to_path_buf()),
+            trust: manifest.trust.clone(),
         })
     }
 
@@ -132,8 +141,20 @@ impl Control {
     /// filter fails to resolve / verify / load, the swap does **not** happen and the current
     /// set stays live — reload is all-or-nothing. The trust policy is fixed at construction.
     pub fn reload(&self, manifest: &Manifest) -> Result<(), ControlError> {
+        self.ensure_trust_unchanged(manifest)?;
         let active = build_active(&self.host, manifest, self.store.as_ref())?;
         self.active.store(Arc::new(active));
+        Ok(())
+    }
+
+    /// Reject a reload whose manifest changes the `[trust]` section (f000004 #1). Trust roots
+    /// are fixed for the life of the `Host` / epoch ticker; an operator rotates them by
+    /// restarting with the new manifest, not by reloading — otherwise a trust-only edit would
+    /// flip the content hash and be reported as a successful reload while having no effect.
+    fn ensure_trust_unchanged(&self, manifest: &Manifest) -> Result<(), ControlError> {
+        if manifest.trust != self.trust {
+            return Err(ControlError::TrustChangeRequiresRestart);
+        }
         Ok(())
     }
 
@@ -151,6 +172,9 @@ impl Control {
             .as_ref()
             .ok_or(ControlError::NoManifestPath)?;
         let manifest = read_manifest(path)?;
+        // A [trust] change is rejected before anything else: it must never be reported as a
+        // successful reload (f000004 #1), even though it would flip the content hash below.
+        self.ensure_trust_unchanged(&manifest)?;
         let new_hash = manifest.content_hash()?;
         // Cheap idempotency gate: skip the rebuild + drain entirely when the config version
         // is unchanged (a comment-only edit, or a spurious trigger).
@@ -169,17 +193,25 @@ impl Control {
         self.active.load().hash.clone()
     }
 
+    /// Pin the active config for one request transaction (see [`ConfigSnapshot`]). The
+    /// fast-path server takes one snapshot per request and drives both halves through it, so a
+    /// concurrent reload cannot desync the request and response sides of the same transaction.
+    pub fn snapshot(&self) -> ConfigSnapshot {
+        ConfigSnapshot::new(self.active.load_full())
+    }
+
     /// Drive a request through the chain. Returns whether to forward the (possibly edited)
     /// request upstream, or to respond now (a filter short-circuited, or the chain failed
-    /// closed on a trap / deadline).
+    /// closed on a trap / deadline). Convenience for a one-shot caller; a request transaction
+    /// that also runs a response should use [`Control::snapshot`] to pin one config.
     pub fn on_request(&self, request: HttpRequest) -> ChainOutcome {
-        chain::dispatch_request(&self.active.load(), request)
+        self.snapshot().on_request(request)
     }
 
     /// Drive a response back through the chain in reverse, applying response edits. A trapped
-    /// filter yields a fail-closed 5xx.
+    /// filter yields a fail-closed 5xx. See [`Control::snapshot`] for the transaction-pinned form.
     pub fn on_response(&self, response: HttpResponse) -> HttpResponse {
-        chain::dispatch_response(&self.active.load(), response)
+        self.snapshot().on_response(response)
     }
 
     /// The ids currently loaded (for diagnostics / tests). Order is unspecified.
