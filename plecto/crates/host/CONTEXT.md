@@ -46,14 +46,21 @@ _Avoid_: body mode（曖昧）, body flag（点ではなく分類）
 ボディを `stream<u8>` で流しながら読む/変換するフィルタ。WASM 税（コピー）を負う側。
 
 **Trusted filter / Untrusted filter**:
-信頼できる自家製フィルタ（単一インスタンスを init-once で再利用）と、第三者製で per-request 新規
-生成＋ゼロ化を要するフィルタの区別。生成戦略と分離強度が変わり、ロード時の Isolation で様式が決まる。
+信頼できる自家製フィルタ（再利用可能インスタンスのプールを init-once で再利用）と、第三者製で
+per-request 新規生成＋ゼロ化を要するフィルタの区別。生成戦略と分離強度が変わり、ロード時の Isolation で
+様式が決まる。
 
 **Isolation（lifecycle mode）**:
-ロード時に選ぶインスタンス生成・分離の様式。`Trusted`（単一インスタンスを init-once で再利用）/
-`Untrusted`（リクエストごと新規生成、メモリは構造的に fresh）。「誰が trusted か」の判定基準
-（署名・provenance）とは別レイヤで、こちらは**様式の選択**。
+ロード時に選ぶインスタンス生成・分離の様式。`Trusted`（再利用インスタンスのプールを checkout 方式で
+再利用、init は instance ごと一度）/ `Untrusted`（リクエストごと新規生成、メモリは構造的に fresh）。
+「誰が trusted か」の判定基準（署名・provenance）とは別レイヤで、こちらは**様式の選択**。
 _Avoid_: trust level / trust score（点数ではなく lifecycle の様式）
+
+**Instance pool**:
+trusted フィルタの再利用可能インスタンスの固定容量プール。各リクエストはここから一つ checkout し、
+実行後に返却する。飽和（全 checkout 済み）時は有界待ち後 fail-closed。一定数のリクエストを処理した
+インスタンスは recycle（破棄・再生成）され、可変状態の持ち越しを bound する。
+_Avoid_: instance cache（再利用の意図が出ない）, worker pool（スレッドプールと混同）
 
 ## 能力境界
 

@@ -155,8 +155,8 @@ Plecto は ADR ファーストで作る。各マイルストーンは `docs/ADR/
 
 - **M0 — 基盤** ✅ *(完了)*
   `plecto:filter@0.1.0` 契約、フィルタをロード&実行する wasmtime ホスト、deny-by-default の能力境界（log / clock / kv）、例フィルタ、E2E/conformance/unit テスト、CI。— [ADR 1](docs/ADR/000001.md) · [2](docs/ADR/000002.md) · [10](docs/ADR/000010.md)
-- **M1 — フィルタ runtime の堅牢化** 🚧 *(中核は着地)*
-  **着地:** trust 分岐ランタイム —— `InstancePre`、trusted = pooling エンジン上の init-once 単一インスタンス、untrusted = on-demand エンジンで per-request fresh（線形メモリは構造的に fresh ゆえゼロ化不要）、redb-backed host KV + アトミック counter + **ホストネイティブな token-bucket rate limit**、全 host-API キーをフィルタごとに名前空間化、ephemeral なホット経路は毎コミット fsync を省く。**保留:** epoch 計量 + メモリ上限、および pooling の利得が待つ per-worker インスタンス + 状態 sharding。trusted/untrusted の分岐は perf でなく init/zeroization の矛盾ゆえの**必然**。— [ADR 4](docs/ADR/000004.md) · [5](docs/ADR/000005.md) · [6](docs/ADR/000006.md) · [11](docs/ADR/000011.md)
+- **M1 — フィルタ runtime の堅牢化** ✅ *(着地)*
+  trust 分岐ランタイム —— `InstancePre`、trusted は固定容量・遅延充填の**インスタンスプール**をリクエストごとに checkout 再利用（pooling エンジンが初めて活きる。飽和は有界待ち後 fail-closed、決定的に trap するフィルタには pool 全体の circuit breaker が開き、一定リクエスト数で instance を recycle して状態蓄積を bound）、untrusted = on-demand エンジンで per-request fresh（線形メモリは構造的に fresh ゆえゼロ化不要）、redb-backed host KV + アトミック counter + **ホストネイティブな token-bucket rate limit**、全 host-API キーをフィルタごとに名前空間化、ephemeral なホット経路は毎コミット fsync を省く、**epoch 計量 + メモリ/テーブル上限**を実装。trusted/untrusted の分岐は perf でなく init/zeroization の矛盾ゆえの**必然**。**M2 へ繰延**（fast-path server と不可分）: プールを tokio/quinn データ経路へ結線する sync↔async ブリッジと、状態 backend の sharding。— [ADR 4](docs/ADR/000004.md) · [5](docs/ADR/000005.md) · [6](docs/ADR/000006.md) · [11](docs/ADR/000011.md) · [12](docs/ADR/000012.md)
 - **M2 — データ経路（fast path）**
   TCP/TLS リスナ、HTTP/1.1 → 2 → 3、ルーティング、実リクエストでのフィルタチェーン駆動、upstream コネクション管理 & ロードバランシング。*Plecto を実際のプロキシにする段。*
 - **M3 — async & ボディ** *(2段トリガ)*

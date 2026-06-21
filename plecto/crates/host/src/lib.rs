@@ -2,10 +2,15 @@
 //!
 //! ADR 000004 slice: the filter **runtime model**. The host branches on trust at load
 //! (ADR 000011's knot, made concrete):
-//!   - **trusted** filters get ONE persistent instance, `init` runs **once**, and every
-//!     request reuses it — Tenet 4 finally pays off (init-derived state stays resident).
-//!     Built on a **pooling-allocator** engine. Per-worker-thread sharding lands with the
-//!     fast-path server; v0.1 reuses a single instance serially.
+//!   - **trusted** filters get a fixed-capacity **pool** of reusable instances on a
+//!     **pooling-allocator** engine, checked out per request (ADR 000012). `init` runs once
+//!     *per instance* — Tenet 4 pays off (init-derived state stays resident). The pool is
+//!     lazily filled: a single thread only ever needs one instance, so init stays once; under
+//!     concurrency the pool builds more (up to its cap), which is where the pooling allocator
+//!     finally earns its keep. Saturation (every instance checked out) waits a bounded time
+//!     then fails **closed** (`Unavailable`), and an instance is recycled after serving a
+//!     configured number of requests to bound linear-memory state accumulation (§6.6).
+//!     Binding the pool to the tokio/quinn fast path (blocking pool vs fiber) is M2's job.
 //!   - **untrusted** filters get a **fresh instance per request** on an on-demand engine,
 //!     so linear memory is zeroized **by construction** (no slot reuse → CVE-2022-39393
 //!     surface absent, ADR 000006). The cost is `init` every request — the deliberate
@@ -24,7 +29,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use anyhow::Result;
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use sha2::{Digest, Sha256};
 use sigstore::crypto::{CosignVerificationKey, Signature};
 use wasmtime::component::{Component, HasSelf, Linker};
@@ -56,12 +61,14 @@ use bindings::{Filter, FilterPre};
 /// this only says which lifecycle a loaded filter gets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Isolation {
-    /// Own filters: one persistent instance, `init` once, reused. No per-request
-    /// zeroization (same trust domain). Statelessness (Fork 4) is therefore honored by
-    /// *trust*, not *enforced*: a trusted filter that stashes mutable state in its own linear
-    /// memory silently carries it across requests. That is not a security boundary (same
-    /// trust domain) — only `Untrusted`'s fresh-per-request memory enforces statelessness
-    /// structurally (ADR 000011).
+    /// Own filters: a pool of reusable instances, `init` once per instance, checked out per
+    /// request (ADR 000012). No per-request zeroization (same trust domain). Statelessness
+    /// (Fork 4) is therefore honored by *trust*, not *enforced*: a trusted filter that stashes
+    /// mutable state in its own linear memory silently carries it across requests on a reused
+    /// instance — and, with a pool, *which* instance a request lands on becomes observable
+    /// (§6.6 footgun). That is not a security boundary (same trust domain); periodic recycling
+    /// (`max_requests_per_instance`) bounds the accumulation, but only `Untrusted`'s
+    /// fresh-per-request memory enforces statelessness structurally (ADR 000011).
     Trusted,
     /// Third-party filters: fresh instance per request, memory fresh by construction.
     Untrusted,
@@ -85,6 +92,36 @@ const DEFAULT_MAX_MEMORY_BYTES: u64 = 64 << 20;
 /// for any reasonable filter and bounds the pathological case — cheap defense-in-depth.
 const MAX_TABLE_ELEMENTS: usize = 100_000;
 
+/// Bounded wait (ms) for a free trusted instance before a checkout fails closed (ADR 000012).
+/// wasmtime's pooling allocator has no internal queue and the official guidance is for the
+/// embedder to apply its own backpressure; this is that wait. Kept short — orders of magnitude
+/// below a connection pool's seconds-long default — because on a gateway hot path it is better
+/// to shed load (`Unavailable`) than to queue unboundedly. M2 ties this to the real SLO.
+const DEFAULT_CHECKOUT_TIMEOUT_MS: u64 = 250;
+/// Recycle (discard + rebuild) a trusted instance after it has served this many requests
+/// (ADR 000012 / §6.6). Generous so steady-state reuse dominates (init-once still effectively
+/// holds), while still bounding accidental linear-memory state accumulation over an instance's
+/// life. Following Fastly's reusable-sandbox `max-requests`.
+const DEFAULT_MAX_REQUESTS_PER_INSTANCE: u64 = 1 << 16;
+/// Default ceiling for the auto-sized trusted pool (`available_parallelism`, clamped here).
+/// Modest so a multi-filter manifest does not, by default, multiply out past the engine's
+/// global pooling budget before the manifest registry (ADR 000007) can apportion it.
+const TRUSTED_POOL_DEFAULT_CEIL: usize = 8;
+/// Hard ceiling on a trusted pool, matched to the pooling engine's per-kind slot budget so a
+/// single filter cannot, by itself, demand more instances than the engine reserved.
+const TRUSTED_POOL_MAX: usize = TRUSTED_POOL_SLOTS;
+
+/// Auto-sized default trusted pool capacity: worker-scale (foundation plan §6.3), approximated
+/// by `available_parallelism` until the fast-path server brings real worker threads (M2). A
+/// single-threaded caller still only ever builds one instance (lazy fill), so this does not
+/// change the init-once behaviour observed serially.
+fn default_trusted_pool_size() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .clamp(1, TRUSTED_POOL_DEFAULT_CEIL)
+}
+
 /// Options for `Host::load`. A struct (not a bare arg) because deny-by-default grows more
 /// load-time knobs onto it. Defaults to the safe side: `Untrusted` (fail-closed) with
 /// metering on (ADR 000006). A future declarative manifest (ADR 000007) injects these.
@@ -97,6 +134,15 @@ pub struct LoadOptions {
     pub request_deadline_ms: u64,
     /// Per-instance linear-memory cap (bytes), enforced by a `StoreLimits`.
     pub max_memory_bytes: u64,
+    /// Trusted pool: maximum concurrent reusable instances (lazily filled, ADR 000012).
+    /// Clamped to `[1, TRUSTED_POOL_MAX]` at load. Ignored for `Untrusted` (fresh-per-request).
+    pub trusted_pool_size: usize,
+    /// Trusted pool: bounded wait (ms) for a free instance under saturation before failing
+    /// closed (`RunError::Unavailable`). Ignored for `Untrusted`.
+    pub checkout_timeout_ms: u64,
+    /// Trusted pool: recycle an instance (discard + rebuild) after this many requests, bounding
+    /// linear-memory state accumulation (§6.6). Ignored for `Untrusted`.
+    pub max_requests_per_instance: u64,
 }
 
 impl Default for LoadOptions {
@@ -106,6 +152,9 @@ impl Default for LoadOptions {
             init_deadline_ms: DEFAULT_INIT_DEADLINE_MS,
             request_deadline_ms: DEFAULT_REQUEST_DEADLINE_MS,
             max_memory_bytes: DEFAULT_MAX_MEMORY_BYTES,
+            trusted_pool_size: default_trusted_pool_size(),
+            checkout_timeout_ms: DEFAULT_CHECKOUT_TIMEOUT_MS,
+            max_requests_per_instance: DEFAULT_MAX_REQUESTS_PER_INSTANCE,
         }
     }
 }
@@ -133,6 +182,21 @@ impl LoadOptions {
     /// Override the per-instance linear-memory cap (bytes).
     pub fn with_max_memory_bytes(mut self, bytes: u64) -> Self {
         self.max_memory_bytes = bytes;
+        self
+    }
+    /// Override the trusted pool capacity (max concurrent reusable instances).
+    pub fn with_trusted_pool_size(mut self, n: usize) -> Self {
+        self.trusted_pool_size = n;
+        self
+    }
+    /// Override the bounded checkout wait (ms) before a saturated trusted pool fails closed.
+    pub fn with_checkout_timeout_ms(mut self, ms: u64) -> Self {
+        self.checkout_timeout_ms = ms;
+        self
+    }
+    /// Override how many requests a trusted instance serves before it is recycled.
+    pub fn with_max_requests_per_instance(mut self, n: u64) -> Self {
+        self.max_requests_per_instance = n;
         self
     }
 }
@@ -496,6 +560,10 @@ pub struct Host {
     _epoch_ticker: EpochTicker,
 }
 
+/// Pooling-engine per-kind slot budget (memories / tables / instances), shared by every
+/// trusted filter's pool (ADR 000012). VA-reservation cost only (slots × `max_memory_size`).
+const TRUSTED_POOL_SLOTS: usize = 256;
+
 enum Allocation {
     Pooling,
     OnDemand,
@@ -514,12 +582,17 @@ fn build_engine(alloc: Allocation) -> Result<Engine> {
     // copy-on-write heap image — the safe posture against CVE-2022-39393 (ADR 000006).
     if let Allocation::Pooling = alloc {
         let mut pool = PoolingAllocationConfig::default();
-        // Conservative v0.1 single-node caps (the pool reserves virtual address space up
-        // front). Raised when per-worker-thread sharding arrives with the server.
-        pool.total_memories(64);
-        pool.total_tables(64);
-        pool.total_core_instances(64);
-        pool.total_component_instances(64);
+        // Global per-kind slot budget for ALL trusted filters' pools combined (ADR 000012). The
+        // pool reserves virtual address space up front (slots × max_memory_size), so this caps
+        // VA reservation, not resident memory. `TRUSTED_POOL_MAX` bounds any single filter's
+        // pool below this; the manifest registry (ADR 000007) will apportion the budget across
+        // filters when the fast-path server lands. Exhaustion is a hard error (no internal
+        // queue), surfaced as a fail-closed `RunError::Instantiate`.
+        let slots = TRUSTED_POOL_SLOTS as u32;
+        pool.total_memories(slots);
+        pool.total_tables(slots);
+        pool.total_core_instances(slots);
+        pool.total_component_instances(slots);
         pool.max_memory_size(64 << 20); // 64 MiB per linear memory
         config.allocation_strategy(InstanceAllocationStrategy::Pooling(pool));
     }
@@ -616,10 +689,19 @@ impl Host {
 
         let trusted = match opts.isolation {
             Isolation::Untrusted => None,
-            // create the persistent instance and run init exactly once
-            Isolation::Trusted => Some(Mutex::new(TrustedSlot::new(
-                inner.instantiate_initialized()?,
-            ))),
+            Isolation::Trusted => {
+                let cap = opts.trusted_pool_size.clamp(1, TRUSTED_POOL_MAX);
+                // Eager-build ONE instance now so a broken `init` surfaces at load (not on the
+                // first request) and a single-threaded caller then reuses it (init-once holds).
+                // The rest of the pool fills lazily, only when concurrency demands it (ADR 000012).
+                let first = inner.instantiate_initialized()?;
+                Some(TrustedPool::new(
+                    cap,
+                    Duration::from_millis(opts.checkout_timeout_ms),
+                    opts.max_requests_per_instance,
+                    first,
+                ))
+            }
         };
 
         Ok(LoadedFilter { inner, trusted })
@@ -658,50 +740,119 @@ impl LoadedInner {
         Ok(Instance { store, filter })
     }
 
-    /// Run one trusted-instance call through the circuit-breaker (review f000003 #5). While in
-    /// trap-cooldown, reject fast (`Unavailable`) without rebuilding. Otherwise (re)build the
-    /// instance if a prior trap discarded it (self-heal, ADR 000006), run `call` under the
-    /// per-request deadline, and record the outcome: reset on success; on trap discard the
-    /// instance and — after `TRUSTED_TRAP_BREAKER_THRESHOLD` consecutive traps — open a short
-    /// cooldown so a deterministically-trapping filter cannot force re-init every request.
-    fn run_trusted<T>(
+    /// Check out a trusted instance from the pool (ADR 000012): reuse an idle one, lazily build
+    /// a fresh one while under `cap`, or — when every instance is checked out — wait up to the
+    /// pool's `checkout_timeout` for one to free and then fail **closed** (`Unavailable`).
+    /// Also fails closed fast while the pool-wide breaker's cooldown is open. wasmtime's pooling
+    /// allocator has no internal wait queue, so this bounded wait is the host-side backpressure
+    /// its docs call for.
+    fn checkout(&self, pool: &TrustedPool) -> std::result::Result<PooledInstance, RunError> {
+        // The decision made under the lock; acted on (build / return) after releasing it.
+        enum Step {
+            Use(PooledInstance),
+            Build,
+            Retry,
+        }
+        loop {
+            let step = {
+                let mut g = pool.inner.lock();
+                if wall_now_ms() < g.cooldown_until_ms {
+                    return Err(RunError::Unavailable);
+                }
+                if let Some(p) = g.idle.pop() {
+                    Step::Use(p)
+                } else if g.live < pool.cap {
+                    g.live += 1; // reserve the slot before the (slow) build, done outside the lock
+                    Step::Build
+                } else if pool
+                    .available
+                    .wait_for(&mut g, pool.checkout_timeout)
+                    .timed_out()
+                {
+                    // saturated and nothing freed in time → shed load, fail closed.
+                    return Err(RunError::Unavailable);
+                } else {
+                    Step::Retry
+                }
+            };
+            match step {
+                Step::Use(p) => return Ok(p),
+                Step::Build => match self.instantiate_initialized() {
+                    Ok(instance) => {
+                        return Ok(PooledInstance {
+                            instance,
+                            served: 0,
+                        });
+                    }
+                    Err(e) => {
+                        // roll back the reserved slot and wake a waiter that may now build.
+                        {
+                            let mut g = pool.inner.lock();
+                            g.live = g.live.saturating_sub(1);
+                        }
+                        pool.available.notify_one();
+                        return Err(RunError::Instantiate(e));
+                    }
+                },
+                Step::Retry => continue,
+            }
+        }
+    }
+
+    /// Run one request through the trusted pool (ADR 000012): check out an instance, run `call`
+    /// under the per-request deadline, then check it back in — returning it to `idle`, recycling
+    /// it once it has served `max_requests_per_instance` (so init re-runs, bounding linear-memory
+    /// state accumulation, §6.6), or discarding it on a trap. The circuit breaker is **pool-wide**
+    /// (review f000003 #5, generalised): a deterministically-trapping filter trips the whole pool
+    /// once rather than forcing every instance to the threshold independently. A trapped
+    /// instance's memory is undefined, so the discard is per-instance.
+    fn run_pooled<T>(
         &self,
-        slot: &mut TrustedSlot,
+        pool: &TrustedPool,
         call: impl FnOnce(&Filter, &mut Store<HostState>) -> wasmtime::Result<T>,
     ) -> std::result::Result<(T, Vec<LogLine>), RunError> {
-        if wall_now_ms() < slot.cooldown_until_ms {
-            return Err(RunError::Unavailable);
-        }
-        if slot.instance.is_none() {
-            slot.instance = Some(
-                self.instantiate_initialized()
-                    .map_err(RunError::Instantiate)?,
-            );
-        }
-        // Scope the instance borrow so the breaker bookkeeping below can mutate `slot`.
-        let outcome = {
-            let inst = slot.instance.as_mut().expect("rebuilt above");
-            inst.store.data_mut().begin_request();
-            inst.store.set_epoch_deadline(self.request_deadline_ms);
-            match call(&inst.filter, &mut inst.store) {
-                Ok(value) => Ok((value, std::mem::take(&mut inst.store.data_mut().logs))),
-                Err(e) => Err(e),
-            }
-        };
-        match outcome {
-            Ok(ok) => {
-                slot.consecutive_traps = 0;
-                slot.cooldown_until_ms = 0;
-                Ok(ok)
+        let mut pooled = self.checkout(pool)?;
+
+        pooled.instance.store.data_mut().begin_request();
+        pooled
+            .instance
+            .store
+            .set_epoch_deadline(self.request_deadline_ms);
+        let result = call(&pooled.instance.filter, &mut pooled.instance.store);
+
+        match result {
+            Ok(value) => {
+                let logs = std::mem::take(&mut pooled.instance.store.data_mut().logs);
+                pooled.served = pooled.served.saturating_add(1);
+                if pooled.served >= pool.max_requests_per_instance {
+                    // Recycle: drop the Store (returning the slot + freeing memory) BEFORE the
+                    // logical `live` decrement, so the physical instance count never transiently
+                    // exceeds `cap`. The next checkout lazily rebuilds (re-init).
+                    drop(pooled);
+                    let mut g = pool.inner.lock();
+                    g.clear_breaker();
+                    g.live = g.live.saturating_sub(1);
+                } else {
+                    let mut g = pool.inner.lock();
+                    g.clear_breaker();
+                    g.idle.push(pooled);
+                }
+                pool.available.notify_one();
+                Ok((value, logs))
             }
             Err(e) => {
-                // A trap leaves linear memory undefined → discard the instance (self-heal on
-                // the next allowed call); after the threshold, open the cooldown.
-                slot.instance = None;
-                slot.consecutive_traps = slot.consecutive_traps.saturating_add(1);
-                if slot.consecutive_traps >= TRUSTED_TRAP_BREAKER_THRESHOLD {
-                    slot.cooldown_until_ms = wall_now_ms().saturating_add(TRUSTED_TRAP_COOLDOWN_MS);
+                // Trap → this instance's linear memory is undefined → discard it (release the
+                // slot first), then bump the pool-wide breaker; past the threshold open a short
+                // cooldown so a deterministically-trapping filter fails closed cheaply.
+                drop(pooled);
+                let mut g = pool.inner.lock();
+                g.live = g.live.saturating_sub(1);
+                g.consecutive_traps = g.consecutive_traps.saturating_add(1);
+                if g.consecutive_traps >= TRUSTED_TRAP_BREAKER_THRESHOLD {
+                    g.cooldown_until_ms = wall_now_ms().saturating_add(TRUSTED_TRAP_COOLDOWN_MS);
                 }
+                drop(g);
+                pool.available.notify_one();
                 Err(RunError::from_call(e))
             }
         }
@@ -714,46 +865,91 @@ struct Instance {
     filter: Filter,
 }
 
-/// Consecutive trusted-instance traps before the circuit-breaker opens a cooldown
-/// (review f000003 #5). The first few traps still self-heal (rebuild + retry); only a
-/// deterministically-trapping filter reaches the threshold.
+/// Consecutive trusted-pool traps before the circuit-breaker opens a cooldown (review f000003
+/// #5, now pool-wide — ADR 000012). The first few traps still self-heal (a fresh instance is
+/// built on the next checkout); only a deterministically-trapping filter reaches the threshold.
 const TRUSTED_TRAP_BREAKER_THRESHOLD: u32 = 3;
-/// How long the breaker stays open once tripped: during it, trusted calls fail closed cheaply
-/// (`RunError::Unavailable`) without re-instantiating. After it, the next call retries once.
+/// How long the breaker stays open once tripped: during it, trusted checkouts fail closed
+/// cheaply (`RunError::Unavailable`) without rebuilding. After it, the next checkout retries.
 const TRUSTED_TRAP_COOLDOWN_MS: u64 = 500;
 
-/// The trusted-filter slot behind the per-filter lock: the persistent instance plus the
-/// circuit-breaker state (review f000003 #5). `instance` is `None` only after a trap (rebuilt
-/// on the next allowed call); the counters bound re-init storms from a deterministically-
-/// trapping trusted filter.
-struct TrustedSlot {
-    instance: Option<Instance>,
+/// An instance in the trusted pool, plus how many requests it has served since it was last
+/// (re)initialized — the counter that drives recycling (ADR 000012 / §6.6).
+struct PooledInstance {
+    instance: Instance,
+    served: u64,
+}
+
+/// The trusted pool's mutable interior, behind one lock (ADR 000012). `idle` holds warm
+/// instances ready to check out; `live` counts every instance that currently exists (idle +
+/// checked-out + being-built), bounding lazy fill to the pool `cap`. The circuit breaker is
+/// **pool-wide**: a deterministically-trapping filter trips the whole pool once, not each
+/// instance independently.
+struct PoolInner {
+    idle: Vec<PooledInstance>,
+    live: usize,
     consecutive_traps: u32,
     cooldown_until_ms: u64,
 }
 
-impl TrustedSlot {
-    fn new(instance: Instance) -> Self {
+impl PoolInner {
+    /// Clear the breaker after a successful call (a healthy request resets the trap streak).
+    fn clear_breaker(&mut self) {
+        self.consecutive_traps = 0;
+        self.cooldown_until_ms = 0;
+    }
+}
+
+/// A fixed-capacity pool of reusable trusted instances (ADR 000012). Replaces the v0.1
+/// single-instance-behind-one-`Mutex` placeholder (concurrency=1). Checkout reuses an idle
+/// instance, lazily builds one while under `cap`, or waits up to `checkout_timeout` then fails
+/// closed; `available` is signalled whenever an instance is returned or a slot is freed.
+struct TrustedPool {
+    inner: Mutex<PoolInner>,
+    available: Condvar,
+    cap: usize,
+    checkout_timeout: Duration,
+    max_requests_per_instance: u64,
+}
+
+impl TrustedPool {
+    /// Build a pool seeded with one eager, already-initialized instance (so a single-threaded
+    /// caller reuses it and `init` stays once). `cap` is the caller's clamped pool size.
+    fn new(
+        cap: usize,
+        checkout_timeout: Duration,
+        max_requests_per_instance: u64,
+        first: Instance,
+    ) -> Self {
         Self {
-            instance: Some(instance),
-            consecutive_traps: 0,
-            cooldown_until_ms: 0,
+            inner: Mutex::new(PoolInner {
+                idle: vec![PooledInstance {
+                    instance: first,
+                    served: 0,
+                }],
+                live: 1,
+                consecutive_traps: 0,
+                cooldown_until_ms: 0,
+            }),
+            available: Condvar::new(),
+            cap,
+            checkout_timeout,
+            max_requests_per_instance,
         }
     }
 }
 
-/// A loaded filter, ready to run per request. Trusted filters hold one persistent `Instance`
-/// reused serially (in a `TrustedSlot` with circuit-breaker state); untrusted filters
-/// instantiate fresh each request.
+/// A loaded filter, ready to run per request. Trusted filters reuse instances from a
+/// `TrustedPool` (checked out per request, ADR 000012); untrusted filters instantiate fresh
+/// each request.
 ///
-/// Inside the lock the trusted slot keeps the instance plus the breaker counters: a trap
-/// leaves the guest's linear memory undefined, so the host discards the instance and the next
-/// allowed request rebuilds + re-inits it (self-heal, ADR 000006), with a cooldown bounding
-/// re-init storms (review f000003 #5). The outer `Option` is the isolation discriminator —
+/// A trap leaves the guest's linear memory undefined, so the host discards that instance and a
+/// later checkout rebuilds + re-inits one (self-heal, ADR 000006), with a pool-wide cooldown
+/// bounding re-init storms (review f000003 #5). The `Option` is the isolation discriminator —
 /// `None` means untrusted (fresh instance per request).
 pub struct LoadedFilter {
     inner: LoadedInner,
-    trusted: Option<Mutex<TrustedSlot>>,
+    trusted: Option<TrustedPool>,
 }
 
 impl LoadedFilter {
@@ -769,13 +965,10 @@ impl LoadedFilter {
         req: &HttpRequest,
     ) -> std::result::Result<(RequestDecision, Vec<LogLine>), RunError> {
         match &self.trusted {
-            // trusted: reuse the persistent instance via the circuit-breaker.
-            Some(cell) => {
-                let mut guard = cell.lock();
-                self.inner.run_trusted(&mut guard, |filter, store| {
-                    filter.call_on_request(store, req)
-                })
-            }
+            // trusted: check an instance out of the pool (reuse / lazily build / fail closed).
+            Some(pool) => self
+                .inner
+                .run_pooled(pool, |filter, store| filter.call_on_request(store, req)),
             // untrusted: fresh instance + init every request (the isolation trade).
             None => {
                 let mut inst = self
@@ -801,12 +994,9 @@ impl LoadedFilter {
         resp: &HttpResponse,
     ) -> std::result::Result<(ResponseDecision, Vec<LogLine>), RunError> {
         match &self.trusted {
-            Some(cell) => {
-                let mut guard = cell.lock();
-                self.inner.run_trusted(&mut guard, |filter, store| {
-                    filter.call_on_response(store, resp)
-                })
-            }
+            Some(pool) => self
+                .inner
+                .run_pooled(pool, |filter, store| filter.call_on_response(store, resp)),
             None => {
                 let mut inst = self
                     .inner
