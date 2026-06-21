@@ -189,6 +189,39 @@ fn control_load_rejects_digest_mismatch() {
 }
 
 #[test]
+fn duplicate_filter_id_is_rejected() {
+    // f000004 #6 / the host flagged filter-id uniqueness as the caller's job — control is that
+    // caller. Two `[[filter]]` sharing an id is a config error, caught before a half-built set
+    // could go live.
+    let (signer, artifact) = signed_filter_hello();
+    let mut store = MemoryStore::new();
+    let digest = store.insert("fh", artifact);
+    let host = Host::new(signer.trust_policy().unwrap()).unwrap();
+    let toml = format!(
+        r#"
+[[filter]]
+id = "fh"
+source = "fh"
+digest = "{digest}"
+
+[[filter]]
+id = "fh"
+source = "fh"
+digest = "{digest}"
+
+[chain]
+filters = ["fh"]
+"#
+    );
+    let manifest = Manifest::from_toml(&toml).unwrap();
+
+    match Control::load(host, &manifest, Box::new(store)) {
+        Ok(_) => panic!("duplicate filter ids must be rejected"),
+        Err(e) => assert!(matches!(e, ControlError::DuplicateFilterId(_)), "got {e}"),
+    }
+}
+
+#[test]
 fn chain_referencing_unknown_filter_is_rejected() {
     // A manifest whose chain names a filter that is not declared is a config error.
     let (signer, artifact) = signed_filter_hello();

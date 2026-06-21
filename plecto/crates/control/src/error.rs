@@ -20,6 +20,14 @@ pub enum ControlError {
     #[error("control plane has no manifest path on disk to reload from")]
     NoManifestPath,
 
+    /// A reload's manifest changed the `[trust]` section. Trust roots are fixed at
+    /// construction (same `Host`, same epoch ticker — ADR 000006 / 000008); a reload only
+    /// swaps the filter set + chain, never the trust policy. Rejecting the change fail-closed
+    /// (rather than silently ignoring it) keeps an operator from believing a key rotation took
+    /// effect when it did not — rotate trust by restarting with the new manifest.
+    #[error("manifest [trust] changed; trust roots are fixed at construction — restart to apply")]
+    TrustChangeRequiresRestart,
+
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
 

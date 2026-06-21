@@ -12,6 +12,11 @@ use crate::error::ControlError;
 /// A parsed manifest. Deserialised from TOML; no I/O happens here (key files and artifacts
 /// are resolved by `Control`). `Serialize` exists only to derive the semantic content hash
 /// (`content_hash`) — the canonical, representation-independent identity of the config.
+///
+/// Determinism invariant (f000004 #6): no map fields (`HashMap`). `content_hash` relies on
+/// `serde_json` emitting fields and `Vec` elements in a fixed order; a `HashMap` would
+/// serialise in nondeterministic order and silently break reload idempotency. If a manifest
+/// ever needs a map, use `BTreeMap` (ordered) and keep this invariant.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
@@ -25,7 +30,9 @@ pub struct Manifest {
 }
 
 /// Trust roots: paths (manifest-relative) to trusted signer public keys, PEM (ADR 000006).
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+/// `PartialEq` lets `reload` detect a trust-section change (which it rejects — trust is fixed
+/// at construction, f000004 #1).
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Trust {
     #[serde(default)]
@@ -37,6 +44,12 @@ pub struct Trust {
 #[serde(deny_unknown_fields)]
 pub struct FilterEntry {
     /// Host-assigned identity; namespaces the filter's KV (ADR 000011) and names it in chains.
+    ///
+    /// KV continuity is **per-id and survives reload** (f000004 #4): reloading the same `id`
+    /// with a new `digest` keeps the same KV namespace, so the new version inherits the old
+    /// version's bytes (good for rate-limit counters — a reload doesn't reset them). If a new
+    /// version changes its state encoding, handle the migration or use a new `id` (= a fresh
+    /// namespace).
     pub id: String,
     /// Manifest-relative path to the local OCI image-layout for this filter.
     pub source: String,
