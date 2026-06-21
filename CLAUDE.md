@@ -13,8 +13,10 @@
 - **extension plane（WASM Component Model フィルタ）** — 各リクエストの判断（認証・書換・rate limit・WAF・
   ポリシー）。任意言語で書き、`plecto:filter` WIT 契約で差し込み、無停止で差し替える。
 
-現状は PoC 段階（`plecto/src/lib.rs` は wasm-bindgen のデモ）。設計が向かう先は **wasmtime 埋め込みの
-ホスト + Component Model フィルタ**。作業はこの方向を主軸に置く。
+M0（`plecto:filter` 契約 + wasmtime ホスト）・M1（filter-runtime 堅牢化 + trusted インスタンスプール）・
+M2 slice 1–2（HTTP/1.1 fast path + routing + rustls TLS 終端）が着地済み。動かせるデモは
+`cargo run -p plecto-server --example demo`（旧 wasm-bindgen PoC は撤去）。設計が向かう先は
+**wasmtime 埋め込みホスト + Component Model フィルタ**で、作業はこの方向を主軸に置く。
 
 ## リポジトリ構成
 
@@ -24,13 +26,15 @@
 ├── CLAUDE.md                  ← このファイル
 ├── CONTEXT-MAP.md             ← ドメイン用語集の地図（コンテキスト分割・全体横断語彙）
 ├── docs/ADR/                  ← Architecture Decision Records（NNNNNN.md, 6桁）
-├── plecto/                    ← Rust workspace（fast path / host / control / filter ランタイム）
-│   ├── wit/                   ← plecto:filter ワールド（契約・contract-first）
-│   └── crates/
-│       ├── host/              ← wasmtime 埋め込みホスト（plecto-host）。CONTEXT.md = Extension plane
-│       ├── control/           ← control plane（plecto-control）。CONTEXT.md = Control
-│       └── filter-hello/      ← 例フィルタ（wasm32-unknown-unknown ゲスト, workspace 外）
-└── demo/                      ← wasm-bindgen デモ（PoC）
+└── plecto/                    ← Rust workspace（fast path / host / control / filter ランタイム）
+    ├── wit/                   ← plecto:filter ワールド（契約・contract-first）
+    ├── deny.toml              ← cargo-deny サプライチェーン方針（CI ブロッキング）
+    └── crates/
+        ├── host/              ← wasmtime 埋め込みホスト（plecto-host）。CONTEXT.md = Extension plane
+        ├── control/           ← control plane（plecto-control）。CONTEXT.md = Control
+        ├── server/            ← fast path（plecto-server）。tokio/hyper listener。CONTEXT.md = Fast path
+        │                        （`examples/demo.rs` = 動かせるデモ）
+        └── filter-hello/      ← 例フィルタ（wasm32-unknown-unknown ゲスト, workspace 外）
 ```
 
 ## コア原則（迷ったらこの順で優先）
