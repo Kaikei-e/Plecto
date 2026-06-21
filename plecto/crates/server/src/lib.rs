@@ -29,6 +29,7 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use plecto_control::{ChainOutcome, Control, Header, HttpRequest, HttpResponse};
 use tokio::net::TcpListener;
+use tokio_rustls::TlsAcceptor;
 
 /// The response body the service yields: either a synthesised buffer (`Full`, for a short-circuit
 /// or a fail-closed 5xx) or the upstream's streamed body (`Incoming`), unified behind one boxed
@@ -81,14 +82,33 @@ pub async fn serve(control: Arc<Control>, listener: TcpListener) -> anyhow::Resu
                 continue;
             }
         };
-        let io = TokioIo::new(stream);
         let state = state.clone();
+        // The TLS config is read PER accept (ADR 000014): a reload's new certs apply to new
+        // connections, while in-flight ones keep the cert they negotiated with. `None` → plain.
+        let tls = state.control.tls_config();
         tokio::spawn(async move {
             let service = service_fn(move |req| handle(state.clone(), req));
-            if let Err(e) = hyper::server::conn::http1::Builder::new()
-                .serve_connection(io, service)
-                .await
-            {
+            let result = match tls {
+                Some(cfg) => match TlsAcceptor::from(cfg).accept(stream).await {
+                    Ok(s) => {
+                        hyper::server::conn::http1::Builder::new()
+                            .serve_connection(TokioIo::new(s), service)
+                            .await
+                    }
+                    // a failed TLS handshake just drops the connection (fail-closed; nothing
+                    // is forwarded), it is not a server error.
+                    Err(e) => {
+                        tracing::debug!(error = %e, "TLS handshake failed");
+                        return;
+                    }
+                },
+                None => {
+                    hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await
+                }
+            };
+            if let Err(e) = result {
                 tracing::debug!(error = %e, "connection closed with error");
             }
         });

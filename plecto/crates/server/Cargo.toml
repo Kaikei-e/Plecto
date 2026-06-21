@@ -24,9 +24,14 @@ http-body-util = { workspace = true }
 bytes = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
+# tokio-rustls: wrap each accepted TCP stream in a TLS handshake before handing it to hyper
+# (ADR 000014). The ServerConfig is built by control; this is just the async acceptor.
+tokio-rustls = { workspace = true }
 
 [dev-dependencies]
 # the host's test_support (TestSigner / bound_sbom / filter_hello_component) for E2E fixtures,
 # and a TOML writer for the on-disk manifest a test points the server at.
 plecto-host = { path = "../host" }
 tempfile = "3"
+# rcgen: generate a fresh self-signed cert for the TLS E2E (ring backend, no aws-lc-rs/cmake).
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
