@@ -61,8 +61,9 @@ oci-spec = { version = "0.10", default-features = false, features = ["image"] }
 # tokio: the async runtime for the fast path. The sync filter chain runs on spawn_blocking
 # (the M1 trusted pool handles instance reuse), so wasmtime's !Send Store never crosses .await.
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "io-util", "time", "signal"] }
-# hyper 1.x: HTTP/1.1 server (downstream) + client (upstream). h2 / h3 (quinn) come later.
-hyper = { version = "1", features = ["http1", "server", "client"] }
+# hyper 1.x: HTTP/1.1 + HTTP/2 server (downstream, ADR 000015) + client (upstream, HTTP/1.1).
+# h3 (quinn) comes later. The h2 termination is TLS+ALPN only (no h2c).
+hyper = { version = "1", features = ["http1", "http2", "server", "client"] }
 # hyper-util: TokioIo adapter + the pooling legacy client (upstream connection reuse for free).
 hyper-util = { version = "0.1", features = ["tokio", "client-legacy", "http1"] }
 # http-body-util: body combinators (Full for synthesised responses, BoxBody to unify the

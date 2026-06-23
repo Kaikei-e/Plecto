@@ -28,8 +28,8 @@ _Avoid_: 二つの半身（身体比喩で生硬・"two halves" の直訳調）,
 - [Control](./plecto/crates/control/CONTEXT.md) — 宣言的マニフェスト・無停止 reload・単一ノード／分散 opt-in・
   config version（`plecto-control`）。
 - [Fast path](./plecto/crates/server/CONTEXT.md) — 接続／HTTP／routing／upstream 転送（`plecto-server`、ADR 000013）。
-  M2 slice 1 着地（HTTP/1.1 平文・host＋path-prefix routing・host-native prefix strip・単一 upstream）。
-  TLS／HTTP2,3／インスタンス間 LB は後続スライス。
+  M2 slice 1–3 着地（host＋path-prefix routing・host-native prefix strip・単一 upstream／rustls TLS 終端 SNI 込み
+  ADR 000014／TLS+ALPN 上の HTTP/2 終端 ADR 000015、h2c は不採用）。HTTP/3（quinn）・インスタンス間 LB は後続スライス。
 
 ## Relationships
 

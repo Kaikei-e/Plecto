@@ -55,3 +55,16 @@ _Avoid_: vhost（routing 側の語と混同）
 **Default cert**:
 SNI がどの host 指定証明書にも一致しないときに提示する host 無指定の証明書。無ければ未一致接続は拒否される。
 _Avoid_: fallback cert（意味は同じだが用語を一つに固定）
+
+## HTTP
+
+**ALPN negotiation（プロトコル選択）**:
+TLS ハンドシェイクの ALPN で h2 / http/1.1 を選ぶ仕組み。fast path は h2 を優先広告し、h2 が選ばれた接続だけ
+HTTP/2 で終端する。それ以外（http/1.1・ALPN 未交渉）と平文接続は HTTP/1.1。h2c（平文 HTTP/2）は採らない。
+_Avoid_: protocol upgrade（h2c / Upgrade 経路を含意）
+
+**HTTP/2 stream（= 1 トランザクション）**:
+h2 接続が多重化する各ストリーム。1 ストリーム = 1 トランザクション = 1 snapshot で、route → chain → forward を
+HTTP/1.1 と同一経路で回す。同一接続の並行ストリームが filter chain の並行駆動（M1 プールへの並行 checkout）を
+生む最初の局面。
+_Avoid_: request（多重化の単位であることが出ない）, channel（h2 用語でない）

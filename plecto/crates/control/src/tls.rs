@@ -41,8 +41,9 @@ impl ResolvesServerCert for SniResolver {
 
 /// Build the TLS `ServerConfig` from the manifest's `[[tls]]` entries, or `None` when there are
 /// none (the server then serves plain HTTP/1.1). Any unreadable / unparsable / duplicate cert is
-/// a fail-closed `ControlError` that aborts the caller's build (ADR 000014). ALPN advertises only
-/// `http/1.1` for now (h2 is ADR 000015).
+/// a fail-closed `ControlError` that aborts the caller's build (ADR 000014). ALPN advertises
+/// `h2` then `http/1.1` (h2 preferred); the server serves HTTP/2 only when `h2` is negotiated,
+/// HTTP/1.1 otherwise (ADR 000015 — h2 over TLS+ALPN only, no h2c).
 pub(crate) fn build_server_config(
     entries: &[TlsCert],
     base_dir: &Path,
@@ -82,7 +83,10 @@ pub(crate) fn build_server_config(
         })?
         .with_no_client_auth()
         .with_cert_resolver(resolver);
-    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    // h2 first (preferred), http/1.1 second: a client that supports both gets HTTP/2; one that
+    // only speaks http/1.1 still negotiates it. The server picks the protocol per the negotiated
+    // ALPN (ADR 000015).
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     Ok(Some(Arc::new(config)))
 }
 
