@@ -1,7 +1,9 @@
-//! plecto-server — the M2 fast path (ADR 000013, TLS 000014, HTTP/2 000015).
+//! plecto-server — the M2 fast path (ADR 000013, TLS 000014, HTTP/2 000015, HTTP/3 000016).
 //!
-//! A tokio + hyper listener that turns Plecto from a library into an actual reverse proxy. It
-//! serves HTTP/1.1, or HTTP/2 when TLS-ALPN negotiates `h2` (h2c is not supported — ADR 000015).
+//! A tokio listener that turns Plecto from a library into an actual reverse proxy. It serves
+//! HTTP/1.1 and HTTP/2 over TCP (hyper, ALPN-negotiated — ADR 000015) and HTTP/3 over QUIC (quinn +
+//! the h3 crate, an independent UDP listener advertised via `Alt-Svc` — ADR 000016). All three
+//! transports feed the same transaction core (`proxy_core`); only the body adapters differ.
 //! Per request it: builds a header-only `HttpRequest`, asks the control plane which route
 //! matches (host + path prefix), runs that route's filter chain, and either responds now (a
 //! filter short-circuited / failed closed) or forwards the request to the route's upstream and
@@ -17,11 +19,14 @@
 //! The chain only edits headers / status (and may synthesise a short-circuit body of its own).
 
 use std::convert::Infallible;
+use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 use http_body_util::{BodyExt, Full, combinators::BoxBody};
-use hyper::body::Incoming;
+use hyper::body::{Body, Frame, Incoming};
 use hyper::header::{HeaderName, HeaderValue};
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
@@ -29,17 +34,26 @@ use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use plecto_control::{ChainOutcome, Control, Header, HttpRequest, HttpResponse};
+use quinn::crypto::rustls::QuicServerConfig;
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
+
+/// A boxed, `Send` error — the unified error type for the boxed request/response bodies.
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 /// The response body the service yields: either a synthesised buffer (`Full`, for a short-circuit
 /// or a fail-closed 5xx) or the upstream's streamed body (`Incoming`), unified behind one boxed
 /// type so the service has a single return shape.
-type ResponseBody = BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>;
+type ResponseBody = BoxBody<Bytes, BoxError>;
+
+/// The request body forwarded to the upstream, boxed so one type covers every inbound transport:
+/// the hyper `Incoming` (HTTP/1.1 + HTTP/2) and the QUIC/h3 recv stream (HTTP/3, ADR 000016). The
+/// body streams straight through opaquely (header-only contract, ADR 000010) regardless of source.
+type ReqBody = BoxBody<Bytes, BoxError>;
 
 /// The pooling upstream client (hyper-util legacy): connection reuse to each upstream for free.
-/// Plain HTTP/1.1, the inbound body streamed straight through (`Incoming` as the request body).
-type UpstreamClient = Client<HttpConnector, Incoming>;
+/// Plain HTTP/1.1 to the upstream; the inbound body (any transport) is boxed into `ReqBody`.
+type UpstreamClient = Client<HttpConnector, ReqBody>;
 
 /// Hop-by-hop headers a proxy must not forward (RFC 9110 §7.6.1). Stripped both ways so the
 /// upstream's framing (`transfer-encoding`) and connection management never collide with the
@@ -58,10 +72,13 @@ fn is_hop_by_hop(name: &str) -> bool {
     HOP_BY_HOP.iter().any(|h| name.eq_ignore_ascii_case(h))
 }
 
-/// Shared per-server state: the control plane (filters, routes, reload) and the upstream client.
+/// Shared per-server state: the control plane (filters, routes, reload), the upstream client, and
+/// the `Alt-Svc` header value advertising HTTP/3 (ADR 000016) — `Some` only when a QUIC listener is
+/// bound, and added to TCP (HTTP/1.1 + HTTP/2) responses to steer capable clients to h3.
 struct ServerState {
     control: Arc<Control>,
     client: UpstreamClient,
+    alt_svc: Option<HeaderValue>,
 }
 
 /// Per-connection cap on concurrent HTTP/2 streams (ADR 000015). A fixed, conservative bound (not
@@ -78,10 +95,34 @@ const MAX_CONCURRENT_STREAMS: u32 = 100;
 /// `TcpListener::bind` (the caller picks the addr, so a test can use an ephemeral `127.0.0.1:0`
 /// and read `local_addr`).
 pub async fn serve(control: Arc<Control>, listener: TcpListener) -> anyhow::Result<()> {
+    let tcp_addr = listener.local_addr()?;
+
+    // HTTP/3 (ADR 000016): when QUIC TLS is configured (i.e. there is `[[tls]]`), bind an
+    // independent QUIC/UDP listener on the SAME port number as the TCP one and advertise it via
+    // `Alt-Svc` on TCP responses. No TLS → no h3 (QUIC requires TLS), and no `Alt-Svc`.
+    let quic_cfg = control.quic_tls_config();
+    let alt_svc = quic_cfg.as_ref().and_then(|_| {
+        HeaderValue::from_str(&format!("h3=\":{}\"; ma=86400", tcp_addr.port())).ok()
+    });
+
     let state = Arc::new(ServerState {
         control,
         client: Client::builder(TokioExecutor::new()).build_http(),
+        alt_svc,
     });
+
+    if let Some(cfg) = quic_cfg {
+        match build_h3_endpoint(cfg, tcp_addr) {
+            Ok(endpoint) => {
+                tracing::info!(port = tcp_addr.port(), "HTTP/3 (QUIC) listener bound");
+                tokio::spawn(serve_h3(state.clone(), endpoint));
+            }
+            // a QUIC bind failure must not take down the TCP fast path; log and serve TCP only.
+            Err(e) => {
+                tracing::error!(error = %e, "failed to bind HTTP/3 listener; serving TCP only")
+            }
+        }
+    }
 
     loop {
         let (stream, _peer) = match listener.accept().await {
@@ -150,23 +191,33 @@ async fn handle(
     scheme: &'static str,
     req: Request<Incoming>,
 ) -> Result<Response<ResponseBody>, Infallible> {
-    Ok(match route_and_proxy(state, scheme, req).await {
+    // adapt the hyper inbound body (HTTP/1.1 + HTTP/2) into the transport-agnostic `ReqBody`.
+    let (parts, incoming) = req.into_parts();
+    let mut resp = match proxy_core(state.clone(), scheme, parts, box_incoming(incoming)).await {
         Ok(resp) => resp,
         Err(e) => {
             tracing::warn!(error = %e, "fast-path error");
             synth(StatusCode::BAD_GATEWAY, "upstream", b"upstream error")
         }
-    })
+    };
+    // Advertise HTTP/3 on TCP responses (ADR 000016); h3 responses are not tagged (already h3).
+    if let Some(av) = &state.alt_svc {
+        resp.headers_mut()
+            .insert(hyper::header::ALT_SVC, av.clone());
+    }
+    Ok(resp)
 }
 
-/// Route → chain (request side) → forward → chain (response side). Returns the client-visible
-/// response. Errors here are upstream/transport failures the caller maps to a 502.
-async fn route_and_proxy(
+/// The transport-agnostic transaction core: route → chain (request side) → forward → chain
+/// (response side). Takes the request head + a boxed body (so HTTP/1.1, HTTP/2 and HTTP/3 all share
+/// it) and returns the client-visible response. Errors here are upstream/transport failures the
+/// caller maps to a 502.
+async fn proxy_core(
     state: Arc<ServerState>,
     scheme: &'static str,
-    req: Request<Incoming>,
+    parts: hyper::http::request::Parts,
+    body: ReqBody,
 ) -> anyhow::Result<Response<ResponseBody>> {
-    let (parts, body) = req.into_parts();
     let http_req = to_http_request(&parts, scheme);
 
     // One snapshot pins config + trace for the whole transaction (a concurrent reload cannot
@@ -319,14 +370,162 @@ fn synth(status: StatusCode, fault: &str, body: &'static [u8]) -> Response<Respo
 /// A buffered body boxed into `ResponseBody` (its `Infallible` error widened to the boxed type).
 fn full(bytes: Vec<u8>) -> ResponseBody {
     Full::new(Bytes::from(bytes))
-        .map_err(|e: Infallible| -> Box<dyn std::error::Error + Send + Sync> { match e {} })
+        .map_err(|e: Infallible| -> BoxError { match e {} })
         .boxed()
 }
 
 /// The upstream's streamed body boxed into `ResponseBody`.
 fn stream(body: Incoming) -> ResponseBody {
-    body.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })
-        .boxed()
+    body.map_err(|e| -> BoxError { Box::new(e) }).boxed()
+}
+
+/// Box a hyper `Incoming` inbound body into the transport-agnostic `ReqBody`.
+fn box_incoming(body: Incoming) -> ReqBody {
+    body.map_err(|e| -> BoxError { Box::new(e) }).boxed()
+}
+
+// ===== HTTP/3 (ADR 000016) =====
+//
+// An independent QUIC/UDP listener terminates HTTP/3, then feeds each request into the SAME
+// `proxy_core` as the TCP path — only the wire transport and the body adapters differ. The request
+// body (the h3 recv stream) is wrapped as an `http_body::Body` so it streams to the upstream, and
+// the response body streams back out over the h3 send stream. RFC 9114 forbids connection-specific
+// headers in HTTP/3 messages; `headers_to_vec`/`copy_headers` already strip the hop-by-hop set both
+// ways, so what we send over h3 is compliant.
+
+/// Build the QUIC `Endpoint` for HTTP/3 from control's QUIC TLS config, bound on the same port
+/// number as the TCP listener (UDP). Caps concurrent request streams (see below).
+fn build_h3_endpoint(
+    quic_cfg: Arc<plecto_control::TlsServerConfig>,
+    tcp_addr: SocketAddr,
+) -> anyhow::Result<quinn::Endpoint> {
+    let crypto = QuicServerConfig::try_from(quic_cfg)?;
+    let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
+    // Cap concurrent request streams per connection (mirrors ADR 000015's h2 cap): each h3 request
+    // is one bidi stream → one chain dispatch, so this bounds one connection's draw on the M1 pool
+    // and is defence-in-depth against stream-flood DoS. uni streams (h3 control / QPACK) keep
+    // quinn's default. quinn itself enforces QUIC's 3x anti-amplification limit (RFC 9000 §8/§21),
+    // so the endpoint can't be turned into a UDP reflector with a spoofed source address.
+    let mut transport = quinn::TransportConfig::default();
+    transport.max_concurrent_bidi_streams(MAX_CONCURRENT_STREAMS.into());
+    server_config.transport_config(Arc::new(transport));
+    // Same port as the TCP listener, but UDP — an independent protocol namespace.
+    let udp_addr = SocketAddr::new(tcp_addr.ip(), tcp_addr.port());
+    Ok(quinn::Endpoint::server(server_config, udp_addr)?)
+}
+
+/// Accept QUIC connections, set up an h3 connection on each, and drive every request stream through
+/// `handle_h3_request`. A per-connection / per-request error is logged, never fatal.
+async fn serve_h3(state: Arc<ServerState>, endpoint: quinn::Endpoint) {
+    while let Some(incoming) = endpoint.accept().await {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let conn = match incoming.await {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::debug!(error = %e, "QUIC connection failed");
+                    return;
+                }
+            };
+            let mut h3conn = match h3::server::Connection::<h3_quinn::Connection, Bytes>::new(
+                h3_quinn::Connection::new(conn),
+            )
+            .await
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::debug!(error = %e, "h3 connection setup failed");
+                    return;
+                }
+            };
+            loop {
+                match h3conn.accept().await {
+                    Ok(Some(resolver)) => {
+                        let state = state.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = handle_h3_request(state, resolver).await {
+                                tracing::debug!(error = %e, "h3 request failed");
+                            }
+                        });
+                    }
+                    // graceful close (the client sent GOAWAY / closed the connection).
+                    Ok(None) => break,
+                    Err(e) => {
+                        tracing::debug!(error = %e, "h3 accept failed");
+                        break;
+                    }
+                }
+            }
+        });
+    }
+}
+
+/// Handle one HTTP/3 request: split the bidi stream, wrap the recv half as the request body, run
+/// the shared `proxy_core` (scheme is always `https` — h3 is always over TLS), then stream the
+/// response head + body back over the send half.
+async fn handle_h3_request(
+    state: Arc<ServerState>,
+    resolver: h3::server::RequestResolver<h3_quinn::Connection, Bytes>,
+) -> anyhow::Result<()> {
+    let (req, stream) = resolver.resolve_request().await?;
+    let (mut send, recv) = stream.split();
+    let (parts, ()) = req.into_parts();
+    let body = H3ReqBody { recv }.boxed();
+
+    let resp = match proxy_core(state, "https", parts, body).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, "h3 fast-path error");
+            synth(StatusCode::BAD_GATEWAY, "upstream", b"upstream error")
+        }
+    };
+
+    let (rparts, mut rbody) = resp.into_parts();
+    send.send_response(Response::from_parts(rparts, ())).await?;
+    while let Some(frame) = rbody.frame().await {
+        match frame {
+            Ok(f) => {
+                if let Ok(data) = f.into_data() {
+                    send.send_data(data).await?;
+                }
+            }
+            Err(e) => {
+                // a mid-stream upstream body error: stop here and finish the stream.
+                tracing::debug!(error = %e, "h3 response body error");
+                break;
+            }
+        }
+    }
+    send.finish().await?;
+    Ok(())
+}
+
+/// Adapts an HTTP/3 request's recv stream into an `http_body::Body`, so the request body streams to
+/// the upstream like any other inbound body. One copy per chunk into `Bytes` (the recv buffer's
+/// own type is opaque); the body is otherwise opaque pass-through.
+struct H3ReqBody {
+    recv: h3::server::RequestStream<h3_quinn::RecvStream, Bytes>,
+}
+
+impl Body for H3ReqBody {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+        let this = self.get_mut();
+        match this.recv.poll_recv_data(cx) {
+            Poll::Ready(Ok(Some(mut buf))) => {
+                let bytes = buf.copy_to_bytes(buf.remaining());
+                Poll::Ready(Some(Ok(Frame::data(bytes))))
+            }
+            Poll::Ready(Ok(None)) => Poll::Ready(None),
+            Poll::Ready(Err(e)) => Poll::Ready(Some(Err(Box::new(e)))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
 }
 
 #[cfg(test)]

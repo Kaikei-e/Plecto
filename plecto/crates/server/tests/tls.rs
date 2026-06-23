@@ -126,12 +126,13 @@ async fn spawn_proxy(control: Arc<Control>) -> SocketAddr {
     addr
 }
 
-/// An HTTPS GET through the proxy, trusting `root` and sending SNI `localhost`.
+/// An HTTPS GET through the proxy, trusting `root` and sending SNI `localhost`. Returns the status,
+/// the `Alt-Svc` header value (if any), and the body.
 async fn https_get(
     proxy: SocketAddr,
     root: CertificateDer<'static>,
     path: &str,
-) -> (StatusCode, String) {
+) -> (StatusCode, Option<String>, String) {
     let mut roots = RootCertStore::empty();
     roots.add(root).unwrap();
     let config = ClientConfig::builder_with_provider(Arc::new(ring::default_provider()))
@@ -158,8 +159,17 @@ async fn https_get(
         .unwrap();
     let resp = sender.send_request(req).await.unwrap();
     let (parts, body) = resp.into_parts();
+    let alt_svc = parts
+        .headers
+        .get("alt-svc")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
     let bytes = body.collect().await.unwrap().to_bytes();
-    (parts.status, String::from_utf8_lossy(&bytes).into_owned())
+    (
+        parts.status,
+        alt_svc,
+        String::from_utf8_lossy(&bytes).into_owned(),
+    )
 }
 
 #[tokio::test]
@@ -174,7 +184,7 @@ async fn terminates_tls_then_routes_and_forwards() {
     let control = loaded_control(&manifest_toml(upstream, "{digest}", &tls_block)).unwrap();
     let proxy = spawn_proxy(Arc::new(control)).await;
 
-    let (status, body) = https_get(proxy, cert.cert_der.clone(), "/api/hello").await;
+    let (status, alt_svc, body) = https_get(proxy, cert.cert_der.clone(), "/api/hello").await;
 
     assert_eq!(
         status,
@@ -184,6 +194,14 @@ async fn terminates_tls_then_routes_and_forwards() {
     assert_eq!(
         body, "upstream-ok",
         "the upstream body streams back over TLS"
+    );
+    // With TLS configured, a QUIC listener is bound and the TCP response advertises HTTP/3 via
+    // Alt-Svc (ADR 000016 / RFC 7838) on the same port, fresh for a day.
+    let port = proxy.port();
+    assert_eq!(
+        alt_svc.as_deref(),
+        Some(format!("h3=\":{port}\"; ma=86400").as_str()),
+        "TCP responses advertise h3 on the same port via Alt-Svc"
     );
 }
 

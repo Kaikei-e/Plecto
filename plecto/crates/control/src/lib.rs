@@ -64,6 +64,9 @@ pub(crate) struct ActiveConfig {
     /// TLS server config built from `[[tls]]` (ADR 000014), or `None` for plain HTTP/1.1. Rides
     /// the `ArcSwap` with the rest, so a reload swaps certs atomically (new conns get new certs).
     pub(crate) tls: Option<Arc<rustls::ServerConfig>>,
+    /// QUIC TLS server config for HTTP/3 (ADR 000016): ALPN `h3`, TLS 1.3, same SNI cert resolver
+    /// as `tls`. `None` whenever `tls` is `None` (h3 requires TLS). Rides the same `ArcSwap`.
+    pub(crate) quic_tls: Option<Arc<rustls::ServerConfig>>,
     pub(crate) hash: String,
 }
 
@@ -238,6 +241,14 @@ impl Control {
         self.active.load().tls.clone()
     }
 
+    /// The active QUIC TLS config for HTTP/3 (ADR 000016): ALPN `h3`, TLS 1.3, sharing the TCP
+    /// config's SNI cert resolver. `None` whenever there is no `[[tls]]` (h3 requires TLS, so it is
+    /// only offered alongside TLS termination). The fast-path server reads this once to decide
+    /// whether to bind a QUIC listener and what to advertise via `Alt-Svc`.
+    pub fn quic_tls_config(&self) -> Option<Arc<rustls::ServerConfig>> {
+        self.active.load().quic_tls.clone()
+    }
+
     /// Pin the active config for one request transaction (see [`ConfigSnapshot`]). The
     /// fast-path server takes one snapshot per request and drives both halves through it, so a
     /// concurrent reload cannot desync the request and response sides of the same transaction.
@@ -368,15 +379,20 @@ fn build_active(
         });
     }
 
-    // TLS termination config (ADR 000014): build the rustls ServerConfig from `[[tls]]`. A bad
-    // cert is fail-closed here, so a failed reload never swaps in a TLS config that cannot serve.
-    let tls = tls::build_server_config(&manifest.tls, base_dir)?;
+    // TLS termination config (ADR 000014 TCP / ADR 000016 QUIC): build the rustls ServerConfigs
+    // from `[[tls]]`, sharing one SNI cert resolver. A bad cert is fail-closed here, so a failed
+    // reload never swaps in a TLS config that cannot serve.
+    let (tls, quic_tls) = match tls::build_server_configs(&manifest.tls, base_dir)? {
+        Some(configs) => (Some(configs.tcp), Some(configs.quic)),
+        None => (None, None),
+    };
 
     Ok(ActiveConfig {
         filters,
         chain: manifest.chain.filters.clone(),
         routes,
         tls,
+        quic_tls,
         hash: manifest.content_hash()?,
     })
 }

@@ -1,5 +1,6 @@
 //! plecto — the fast-path binary (ADR 000013). Loads a declarative manifest, builds the control
-//! plane (filters, routes, upstreams), and serves the HTTP/1.1 fast path until terminated.
+//! plane (filters, routes, upstreams), and serves the fast path until terminated: HTTP/1.1 and
+//! HTTP/2 over TCP, plus HTTP/3 over QUIC on the same port (UDP) when `[[tls]]` is configured.
 //!
 //! Usage: `plecto <manifest.toml> [listen_addr]` (listen defaults to `127.0.0.1:8080`).
 

@@ -37,3 +37,5 @@ rustls = { workspace = true }
 [dev-dependencies]
 # unique temp dirs for OCI-layout fixtures and trusted-key PEM files
 tempfile = "3"
+# rcgen: a fresh self-signed cert to unit-test the TCP/QUIC ServerConfig builder (ADR 000014/000016).
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
