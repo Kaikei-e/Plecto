@@ -92,9 +92,21 @@ fn remove_headers(headers: &mut Vec<Header>, names: &[String]) {
 
 fn set_headers(headers: &mut Vec<Header>, set: Vec<Header>) {
     for header in set {
-        headers.retain(|existing| !existing.name.eq_ignore_ascii_case(&header.name));
+        // Repeatable headers (Set-Cookie) APPEND: each field line is independent, so collapsing
+        // them on `set` would drop all but the last cookie (review f000005 P3#7). Every other
+        // header REPLACES — the semantics a filter relies on to AUTHORITATIVELY overwrite a value
+        // (e.g. a spoofed `x-authenticated-user`), so this carve-out is for repeatables only.
+        if !is_repeatable(&header.name) {
+            headers.retain(|existing| !existing.name.eq_ignore_ascii_case(&header.name));
+        }
         headers.push(header);
     }
+}
+
+/// Headers that may legitimately appear multiple times and must not be collapsed by `set`.
+/// `Set-Cookie` is the canonical case (RFC 6265: one cookie per field line).
+fn is_repeatable(name: &str) -> bool {
+    name.eq_ignore_ascii_case("set-cookie")
 }
 
 #[cfg(test)]
@@ -172,5 +184,48 @@ mod tests {
                 .iter()
                 .any(|x| x.name.eq_ignore_ascii_case("x-old"))
         );
+    }
+
+    #[test]
+    fn response_edit_appends_repeatable_set_cookie_but_replaces_others() {
+        // review f000005 P3#7: two Set-Cookie in one edit must BOTH survive (append), not collapse
+        // to the last — otherwise a filter setting a session + a flag cookie silently loses one.
+        // A non-repeatable header still replaces (the `set replaces` contract is unchanged for it).
+        let mut response = HttpResponse {
+            status: 200,
+            headers: vec![h("x-keep", "1")],
+            body: vec![],
+        };
+        apply_response_edit(
+            &mut response,
+            ResponseEdit {
+                set_status: None,
+                set_headers: vec![
+                    h("set-cookie", "session=abc"),
+                    h("set-cookie", "flag=1"),
+                    h("x-keep", "2"),
+                ],
+                remove_headers: vec![],
+            },
+        );
+
+        let cookies: Vec<&str> = response
+            .headers
+            .iter()
+            .filter(|x| x.name.eq_ignore_ascii_case("set-cookie"))
+            .map(|x| x.value.as_str())
+            .collect();
+        assert_eq!(
+            cookies,
+            vec!["session=abc", "flag=1"],
+            "both Set-Cookie field lines must survive (append, not collapse)"
+        );
+        let keep: Vec<&Header> = response
+            .headers
+            .iter()
+            .filter(|x| x.name.eq_ignore_ascii_case("x-keep"))
+            .collect();
+        assert_eq!(keep.len(), 1, "a non-repeatable header still replaces");
+        assert_eq!(keep[0].value, "2");
     }
 }

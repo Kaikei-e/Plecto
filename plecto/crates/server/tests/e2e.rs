@@ -31,9 +31,34 @@ async fn echo(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infallibl
         .path_and_query()
         .map(|p| p.as_str().to_string())
         .unwrap_or_default();
+    // Reflect the inbound `traceparent` so a test can prove the proxy continued the caller's trace
+    // (review f000005 P1#2) rather than minting a fresh root.
+    let traceparent = req
+        .headers()
+        .get("traceparent")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    // Reflect the forwarding headers the proxy set, so a test can prove edge-model overwrite
+    // (review f000005 P2#3): the upstream sees Plecto's values, not the client's spoof.
+    let xff = req
+        .headers()
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let xfp = req
+        .headers()
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
     Ok(Response::builder()
         .status(200)
         .header("x-upstream-path", path)
+        .header("x-upstream-traceparent", traceparent)
+        .header("x-upstream-xff", xff)
+        .header("x-upstream-xfproto", xfp)
         .header("x-from", "upstream")
         .header("x-plecto-respedit", "1")
         .body(Full::new(Bytes::from_static(b"upstream-ok")))
@@ -212,5 +237,65 @@ async fn unmatched_route_is_404() {
     assert_eq!(
         headers.get("x-plecto-fault").and_then(|v| v.to_str().ok()),
         Some("no-route"),
+    );
+}
+
+#[tokio::test]
+async fn continues_inbound_trace_context() {
+    // review f000005 P1#2 / ADR 000009: a request carrying a W3C `traceparent` must have its trace
+    // CONTINUED through Plecto — the traceparent forwarded upstream keeps the same trace-id, not a
+    // freshly-minted root. (Before the fix `proxy_core` always called `snapshot()` = a new root.)
+    let upstream = spawn_upstream().await;
+    let proxy = spawn_proxy(control_for(upstream)).await;
+    let client = client();
+    wait_ready(&client, proxy).await;
+
+    let inbound = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+    let (status, headers, _body) =
+        get(&client, proxy, "/api/hello", &[("traceparent", inbound)]).await;
+
+    assert_eq!(status, StatusCode::OK);
+    let forwarded = headers
+        .get("x-upstream-traceparent")
+        .and_then(|v| v.to_str().ok())
+        .expect("the upstream received a traceparent");
+    let trace_id = forwarded.split('-').nth(1).unwrap_or("");
+    assert_eq!(
+        trace_id, "4bf92f3577b34da6a3ce929d0e0e4736",
+        "the inbound trace-id is preserved (the caller's trace continues, not a new root)"
+    );
+}
+
+#[tokio::test]
+async fn overwrites_spoofed_forwarded_headers_with_the_real_peer() {
+    // review f000005 P2#3 / ADR 000018: a client cannot forge its source IP. A spoofed
+    // `X-Forwarded-For: 9.9.9.9` is stripped and replaced by the real connection peer (loopback in
+    // a test), and `X-Forwarded-Proto` reflects the wire scheme — so the upstream (and any
+    // IP-based filter) sees Plecto's authoritative values, never the client's claim.
+    let upstream = spawn_upstream().await;
+    let proxy = spawn_proxy(control_for(upstream)).await;
+    let client = client();
+    wait_ready(&client, proxy).await;
+
+    let (status, headers, _body) = get(
+        &client,
+        proxy,
+        "/api/hello",
+        &[("x-forwarded-for", "9.9.9.9")],
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers.get("x-upstream-xff").and_then(|v| v.to_str().ok()),
+        Some("127.0.0.1"),
+        "the spoofed X-Forwarded-For is replaced by the real loopback peer"
+    );
+    assert_eq!(
+        headers
+            .get("x-upstream-xfproto")
+            .and_then(|v| v.to_str().ok()),
+        Some("http"),
+        "X-Forwarded-Proto reflects the plaintext connection"
     );
 }

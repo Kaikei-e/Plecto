@@ -410,6 +410,12 @@ fn build_active(
         None => (None, None),
     };
 
+    // Compute the content hash BEFORE the registry reconcile (review f000005 P3#8). `reconcile`
+    // is the step that MUTATES persistent state (the health registry, which survives reloads), so
+    // every other fallible step — including this hash — must run before it for the "after reconcile
+    // the build is infallible" / all-or-nothing invariant to hold literally, not just in practice.
+    let hash = manifest.content_hash()?;
+
     // Reconcile the upstream registry LAST among the fallible steps (ADR 000017): this validates
     // duplicate names / empty address lists and preserves health for unchanged `(name, address)`
     // instances across the reload. After it returns Ok the build is infallible, so a rejected
@@ -440,6 +446,6 @@ fn build_active(
         routes,
         tls,
         quic_tls,
-        hash: manifest.content_hash()?,
+        hash,
     })
 }

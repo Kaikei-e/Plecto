@@ -16,6 +16,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use crate::error::ControlError;
 use crate::manifest::{HealthConfig, Upstream};
@@ -133,6 +134,10 @@ pub struct UpstreamGroup {
     /// The instances, in manifest address order. Fixed for the life of this group value; a reload
     /// builds a NEW group, reusing unchanged instances' `Arc`s to preserve their health.
     pub instances: Vec<Arc<UpstreamInstance>>,
+    /// End-to-end timeout for forwarding to this upstream (ADR 000019); `Duration::ZERO` disables
+    /// it. The fast path wraps the upstream call in this and fails closed with 504 on overrun. Not
+    /// part of `health`, so a timeout-only change rebuilds the group but preserves instance health.
+    request_timeout: Duration,
     /// Round-robin cursor. `Relaxed` suffices: it only needs to advance, not synchronise memory.
     rr: AtomicUsize,
 }
@@ -157,6 +162,13 @@ impl UpstreamGroup {
             }
         }
         None
+    }
+
+    /// The end-to-end timeout the fast path applies to a forward to this upstream (ADR 000019).
+    /// `Duration::ZERO` means no timeout (the operator opted out for a streaming / long-poll
+    /// backend); otherwise the call is bounded and overrun fails closed with 504.
+    pub fn request_timeout(&self) -> Duration {
+        self.request_timeout
     }
 }
 
@@ -216,6 +228,7 @@ impl UpstreamRegistry {
                     name: up.name.clone(),
                     health: up.health.clone(),
                     instances,
+                    request_timeout: Duration::from_millis(up.request_timeout_ms),
                     rr: AtomicUsize::new(0),
                 }),
             );
@@ -258,6 +271,7 @@ mod tests {
             name: name.to_string(),
             addresses: addrs.iter().map(|s| s.to_string()).collect(),
             health: h,
+            request_timeout_ms: 30_000,
         }
     }
 
@@ -416,5 +430,32 @@ mod tests {
             upstream("u", &["b:2"], health(1, 1)),
         ]);
         assert!(matches!(dup, Err(ControlError::DuplicateUpstream(_))));
+    }
+
+    #[test]
+    fn zero_thresholds_are_clamped_to_one() {
+        // A manifest typo (`healthy_threshold = 0` / `unhealthy_threshold = 0`) must not become a
+        // config-induced DoS. Without the `.max(1)` clamp a 0 healthy_threshold would make a
+        // never-yet-healthy instance promote on the cold-start path anyway, but a 0
+        // unhealthy_threshold would eject a healthy instance the instant it served — and re-entry
+        // could be impossible. Clamping both to >=1 makes "one success promotes, one failure
+        // ejects, one success restores" hold, never "never promote" or "instant eject".
+        let inst = instance(&health(0, 0));
+        assert!(!inst.is_healthy(), "still starts pessimistic");
+        inst.record_probe_success();
+        assert!(
+            inst.is_healthy(),
+            "one success promotes (healthy_threshold clamped to >=1)"
+        );
+        inst.record_probe_failure();
+        assert!(
+            !inst.is_healthy(),
+            "one real failure ejects — not instant-eject before any failure"
+        );
+        inst.record_probe_success();
+        assert!(
+            inst.is_healthy(),
+            "one success restores after an eject (re-entry is possible)"
+        );
     }
 }

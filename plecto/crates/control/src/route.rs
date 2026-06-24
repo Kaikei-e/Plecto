@@ -59,8 +59,12 @@ fn normalize_host(authority: &str) -> String {
 }
 
 /// Does `path` fall under `prefix` on a `/` boundary? `/api` matches `/api` and `/api/x` but not
-/// `/apix`; `/` matches everything.
+/// `/apix`; `/` matches everything. A `?query` / `#fragment` acts as a boundary too, so a bare
+/// prefix with a query (`/search?q=x` under `/search`) still matches (review f000005 P1#1) — the
+/// inbound `path` carries the query (`path_and_query`), but the MATCH decision is over the path
+/// only. Rewriting (`rewrite_path`) keeps the query; this is purely the selection predicate.
 fn path_under_prefix(prefix: &str, path: &str) -> bool {
+    let path = path.split(['?', '#']).next().unwrap_or(path);
     if !path.starts_with(prefix) {
         return false;
     }
@@ -129,6 +133,7 @@ mod tests {
                 healthy_threshold: 1,
                 unhealthy_threshold: 1,
             },
+            request_timeout_ms: 30_000,
         }])
         .unwrap();
         reg.group(upstream).unwrap()
@@ -165,6 +170,28 @@ mod tests {
     }
 
     #[test]
+    fn query_or_fragment_acts_as_a_prefix_boundary() {
+        // review f000005 P1#1: the inbound path carries the query (`path_and_query`), so a bare
+        // prefix followed by `?`/`#` must still match — `/search?q=foo` is under `/search` exactly
+        // like `/search` and `/search/x` are. The earlier code treated `?` as path text and 404'd.
+        let routes = vec![route(None, "/search", "s")];
+        assert_eq!(select(&routes, "h", "/search"), Some(0));
+        assert_eq!(
+            select(&routes, "h", "/search?q=foo"),
+            Some(0),
+            "a bare prefix followed by a query must match"
+        );
+        assert_eq!(select(&routes, "h", "/search/x?q=foo"), Some(0));
+        assert_eq!(select(&routes, "h", "/search#frag"), Some(0));
+        // the boundary is still a real boundary: `/searching` is not under `/search`.
+        assert_eq!(
+            select(&routes, "h", "/searching?q=foo"),
+            None,
+            "a longer word is not a boundary match even with a query"
+        );
+    }
+
+    #[test]
     fn host_constraint_filters_and_breaks_ties() {
         let routes = vec![
             route(None, "/api", "wild"),
@@ -191,5 +218,43 @@ mod tests {
         assert_eq!(rewrite_path("/api/", Some("/api")), "/");
         assert_eq!(rewrite_path("/other", Some("/api")), "/other", "no strip");
         assert_eq!(rewrite_path("/api/x", None), "/api/x", "no rule");
+    }
+
+    #[test]
+    fn normalize_host_drops_port_and_lowercases() {
+        // Host matching is case-insensitive and port-insensitive (CWE-644: the routing decision
+        // must not be steered by case tricks or a `:port` suffix a client appended).
+        assert_eq!(normalize_host("EXAMPLE.com:8443"), "example.com");
+        assert_eq!(normalize_host("Example.Com"), "example.com");
+        assert_eq!(normalize_host("host:80"), "host");
+    }
+
+    #[test]
+    fn normalize_host_handles_ipv6_literals() {
+        // IPv6 literals keep the colons inside `[...]`; only a trailing `:port` is dropped.
+        assert_eq!(normalize_host("[::1]:8080"), "[::1]");
+        assert_eq!(normalize_host("[::1]"), "[::1]");
+        assert_eq!(normalize_host("[2001:DB8::1]:443"), "[2001:db8::1]");
+    }
+
+    #[test]
+    fn normalize_host_is_panic_free_on_malformed_authority() {
+        // A malformed authority (an unclosed bracket, a lone bracket, an empty string) must not
+        // panic the data plane on the bracket-slice arithmetic — it just yields a non-matching
+        // host. The fast path normalises EVERY inbound authority, so a single OOB slice here
+        // would be a remote DoS.
+        assert_eq!(
+            normalize_host("[::1"),
+            "[::1",
+            "unclosed bracket returned as-is"
+        );
+        assert_eq!(normalize_host("["), "[", "lone bracket does not panic");
+        assert_eq!(
+            normalize_host("[]"),
+            "[]",
+            "empty bracket pair does not panic"
+        );
+        assert_eq!(normalize_host(""), "", "empty authority does not panic");
+        assert_eq!(normalize_host("[]:9"), "[]");
     }
 }

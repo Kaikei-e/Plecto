@@ -73,6 +73,12 @@ pub struct Upstream {
     pub addresses: Vec<String>,
     /// Active-health-check policy for this upstream's instances (ADR 000017).
     pub health: HealthConfig,
+    /// End-to-end timeout (ms) for forwarding a request to this upstream (ADR 000019 / review
+    /// f000005 P2#4). Bounds time-to-response-headers; once headers arrive the body streams without
+    /// a deadline, so streaming responses are unaffected. Exceeding it fails closed with **504**.
+    /// Default 30000; **`0` disables** the timeout (for long-poll / streaming upstreams).
+    #[serde(default = "default_request_timeout_ms")]
+    pub request_timeout_ms: u64,
 }
 
 /// Active-health-check policy (ADR 000017). A background prober issues `GET {path}` to each
@@ -101,6 +107,10 @@ pub struct HealthConfig {
     /// Consecutive failures to eject a healthy instance (default 3).
     #[serde(default = "default_unhealthy_threshold")]
     pub unhealthy_threshold: u32,
+}
+
+fn default_request_timeout_ms() -> u64 {
+    30_000
 }
 
 fn default_interval_ms() -> u64 {
@@ -446,6 +456,45 @@ unhealthy_threshold = 5
         assert_eq!(h.timeout_ms, 100);
         assert_eq!(h.healthy_threshold, 1);
         assert_eq!(h.unhealthy_threshold, 5);
+    }
+
+    #[test]
+    fn upstream_request_timeout_defaults_and_overrides() {
+        // ADR 000019 / review f000005 P2#4: an upstream gets a 30s default end-to-end timeout when
+        // unspecified; an explicit value (incl. 0 = disabled) rides through and flips the hash.
+        let defaulted = Manifest::from_toml(
+            r#"
+[[upstream]]
+name = "x"
+addresses = ["127.0.0.1:9000"]
+[upstream.health]
+path = "/healthz"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            defaulted.upstreams[0].request_timeout_ms, 30_000,
+            "an unspecified upstream timeout defaults to 30s"
+        );
+
+        let overridden = Manifest::from_toml(
+            r#"
+[[upstream]]
+name = "x"
+addresses = ["127.0.0.1:9000"]
+request_timeout_ms = 250
+[upstream.health]
+path = "/healthz"
+"#,
+        )
+        .unwrap();
+        assert_eq!(overridden.upstreams[0].request_timeout_ms, 250);
+        // a timeout change is a real config change → the content hash must flip.
+        assert_ne!(
+            defaulted.content_hash().unwrap(),
+            overridden.content_hash().unwrap(),
+            "changing the upstream timeout must flip the config version"
+        );
     }
 
     #[test]

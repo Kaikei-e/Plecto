@@ -20,7 +20,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -36,7 +36,8 @@ use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use plecto_control::{
-    ChainOutcome, Control, Header, HealthConfig, HttpRequest, HttpResponse, UpstreamInstance,
+    ChainOutcome, Control, Header, HealthConfig, HttpRequest, HttpResponse, RequestTrace,
+    UpstreamInstance,
 };
 use quinn::crypto::rustls::QuicServerConfig;
 use tokio::net::TcpListener;
@@ -74,6 +75,57 @@ const HOP_BY_HOP: &[&str] = &[
 
 fn is_hop_by_hop(name: &str) -> bool {
     HOP_BY_HOP.iter().any(|h| name.eq_ignore_ascii_case(h))
+}
+
+/// The set of header names DYNAMICALLY designated hop-by-hop by `Connection` (RFC 9110 §7.6.1):
+/// `Connection: X-Foo, close` marks `X-Foo` connection-specific, so a proxy must not forward it.
+/// Forwarding such a header is a request-smuggling / header-leak primitive, so we strip these too
+/// — not just the static `HOP_BY_HOP` set (review f000005 P2#5). Tokens are lower-cased for the
+/// case-insensitive name compare; `close` / `keep-alive` are inert (no such header to drop).
+fn connection_named(map: &hyper::HeaderMap) -> HashSet<String> {
+    let mut named = HashSet::new();
+    for value in map.get_all(hyper::header::CONNECTION).iter() {
+        if let Ok(s) = value.to_str() {
+            for token in s.split(',') {
+                let token = token.trim();
+                if !token.is_empty() {
+                    named.insert(token.to_ascii_lowercase());
+                }
+            }
+        }
+    }
+    named
+}
+
+/// Forwarding headers a client could spoof (RFC 7239 + the de-facto `X-Forwarded-*`). As an EDGE
+/// proxy Plecto strips these on ingress and sets its own (review f000005 P2#3), so an untrusted
+/// client cannot forge its source IP / scheme for an IP-based filter or the upstream.
+const FORWARDED_HEADERS: &[&str] = &[
+    "forwarded",
+    "x-forwarded-for",
+    "x-forwarded-proto",
+    "x-forwarded-host",
+];
+
+/// Edge-proxy client-IP propagation: drop any client-supplied forwarding headers, then set
+/// `X-Forwarded-For` (the real connection peer) and `X-Forwarded-Proto` (the wire scheme) afresh.
+/// The chain (so IP-based rate-limit / auth filters can trust them) and the upstream then see only
+/// Plecto's authoritative values, never the client's claim. A trusted-proxy *append* mode (Plecto
+/// behind another LB) is a manifest knob deferred to a later slice; overwrite is the safe default.
+fn set_forwarded(headers: &mut Vec<Header>, peer: IpAddr, scheme: &str) {
+    headers.retain(|h| {
+        !FORWARDED_HEADERS
+            .iter()
+            .any(|f| h.name.eq_ignore_ascii_case(f))
+    });
+    headers.push(Header {
+        name: "x-forwarded-for".to_string(),
+        value: peer.to_string(),
+    });
+    headers.push(Header {
+        name: "x-forwarded-proto".to_string(),
+        value: scheme.to_string(),
+    });
 }
 
 /// Shared per-server state: the control plane (filters, routes, reload), the upstream client, and
@@ -134,7 +186,7 @@ pub async fn serve(control: Arc<Control>, listener: TcpListener) -> anyhow::Resu
     }
 
     loop {
-        let (stream, _peer) = match listener.accept().await {
+        let (stream, peer) = match listener.accept().await {
             Ok(pair) => pair,
             // a transient accept error (e.g. fd exhaustion) must not kill the listener.
             Err(e) => {
@@ -154,14 +206,14 @@ pub async fn serve(control: Arc<Control>, listener: TcpListener) -> anyhow::Resu
                         // ALPN) → HTTP/1.1 (ADR 000015 — h2 over TLS+ALPN only). The connection
                         // terminated TLS, so the chain sees `https`.
                         let h2 = tls_stream.get_ref().1.alpn_protocol() == Some(b"h2".as_ref());
-                        serve_conn(state, TokioIo::new(tls_stream), "https", h2).await;
+                        serve_conn(state, TokioIo::new(tls_stream), "https", h2, peer).await;
                     }
                     // a failed TLS handshake (incl. ALPN mismatch) just drops the connection
                     // (fail-closed; nothing is forwarded), it is not a server error.
                     Err(e) => tracing::debug!(error = %e, "TLS handshake failed"),
                 },
                 // plaintext: HTTP/1.1 only — no h2c / prior-knowledge (ADR 000015). `http` scheme.
-                None => serve_conn(state, TokioIo::new(stream), "http", false).await,
+                None => serve_conn(state, TokioIo::new(stream), "http", false, peer).await,
             }
         });
     }
@@ -171,11 +223,16 @@ pub async fn serve(control: Arc<Control>, listener: TcpListener) -> anyhow::Resu
 /// connection's wire scheme, passed through to the chain. Request handling (route → chain →
 /// forward) is identical across protocols; only the wire framing differs — for h2 the multiplexed
 /// streams each become one transaction, capped at `MAX_CONCURRENT_STREAMS` (ADR 000015).
-async fn serve_conn<I>(state: Arc<ServerState>, io: I, scheme: &'static str, h2: bool)
-where
+async fn serve_conn<I>(
+    state: Arc<ServerState>,
+    io: I,
+    scheme: &'static str,
+    h2: bool,
+    peer: SocketAddr,
+) where
     I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
 {
-    let service = service_fn(move |req| handle(state.clone(), scheme, req));
+    let service = service_fn(move |req| handle(state.clone(), scheme, peer, req));
     let result = if h2 {
         hyper::server::conn::http2::Builder::new(TokioExecutor::new())
             .max_concurrent_streams(MAX_CONCURRENT_STREAMS)
@@ -198,17 +255,19 @@ where
 async fn handle(
     state: Arc<ServerState>,
     scheme: &'static str,
+    peer: SocketAddr,
     req: Request<Incoming>,
 ) -> Result<Response<ResponseBody>, Infallible> {
     // adapt the hyper inbound body (HTTP/1.1 + HTTP/2) into the transport-agnostic `ReqBody`.
     let (parts, incoming) = req.into_parts();
-    let mut resp = match proxy_core(state.clone(), scheme, parts, box_incoming(incoming)).await {
-        Ok(resp) => resp,
-        Err(e) => {
-            tracing::warn!(error = %e, "fast-path error");
-            synth(StatusCode::BAD_GATEWAY, "upstream", b"upstream error")
-        }
-    };
+    let mut resp =
+        match proxy_core(state.clone(), scheme, peer, parts, box_incoming(incoming)).await {
+            Ok(resp) => resp,
+            Err(e) => {
+                tracing::warn!(error = %e, "fast-path error");
+                synth(StatusCode::BAD_GATEWAY, "upstream", b"upstream error")
+            }
+        };
     // Advertise HTTP/3 on TCP responses (ADR 000016); h3 responses are not tagged (already h3).
     if let Some(av) = &state.alt_svc {
         resp.headers_mut()
@@ -224,14 +283,33 @@ async fn handle(
 async fn proxy_core(
     state: Arc<ServerState>,
     scheme: &'static str,
+    peer: SocketAddr,
     parts: hyper::http::request::Parts,
     body: ReqBody,
 ) -> anyhow::Result<Response<ResponseBody>> {
-    let http_req = to_http_request(&parts, scheme);
+    let mut http_req = to_http_request(&parts, scheme);
+
+    // Client-IP propagation, edge model (ADR 000018 / review f000005 P2#3): strip any inbound
+    // `X-Forwarded-*` / `Forwarded` (which an untrusted client can forge) and set them afresh from
+    // the connection's real peer + scheme. Done BEFORE the chain so an IP-based rate-limit / auth
+    // filter sees a value it can trust; the corrected headers then forward to the upstream.
+    set_forwarded(&mut http_req.headers, peer.ip(), scheme);
+
+    // Continue an inbound distributed trace (ADR 000009): if the caller sent a W3C `traceparent`,
+    // parse it and pin the transaction to it so Plecto's filter spans JOIN the caller's trace
+    // (and the traceparent forwarded upstream keeps the same trace-id) instead of starting a fresh
+    // root. Fail-soft — a missing / malformed header falls back to a new root, never a panic on
+    // untrusted input (review f000005 P1#2; `from_traceparent` is the fail-soft parser).
+    let trace = parts
+        .headers
+        .get("traceparent")
+        .and_then(|v| v.to_str().ok())
+        .and_then(RequestTrace::from_traceparent)
+        .unwrap_or_else(RequestTrace::root);
 
     // One snapshot pins config + trace for the whole transaction (a concurrent reload cannot
     // desync the request and response halves); cloning it is a cheap Arc + trace-id clone.
-    let snapshot = state.control.snapshot();
+    let snapshot = state.control.snapshot_with_trace(trace);
     let Some(route) = snapshot.find_route(&http_req.authority, &http_req.path) else {
         return Ok(synth(StatusCode::NOT_FOUND, "no-route", b"no route"));
     };
@@ -268,7 +346,29 @@ async fn proxy_core(
     {
         h.insert("traceparent", v);
     }
-    let upstream_resp = match state.client.request(builder.body(body)?).await {
+    // End-to-end timeout (ADR 000019 / review f000005 P2#4): bound time-to-response-headers, then
+    // stream the body without a deadline (so streaming responses are unaffected). `Duration::ZERO`
+    // means the operator opted out (long-poll / streaming upstream). Overrun fails closed with 504.
+    let upstream_req = builder.body(body)?;
+    let timeout = route.upstream.request_timeout();
+    let result = if timeout.is_zero() {
+        state.client.request(upstream_req).await
+    } else {
+        match tokio::time::timeout(timeout, state.client.request(upstream_req)).await {
+            Ok(result) => result,
+            Err(_elapsed) => {
+                // The upstream did not return response headers in time. Fail closed 504; leave
+                // health to the active prober (a single slow request is not, by itself, an eject —
+                // consistent with ADR 000017, whose re-examination condition (c) this realises).
+                return Ok(synth(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "upstream-timeout",
+                    b"upstream timeout",
+                ));
+            }
+        }
+    };
+    let upstream_resp = match result {
         Ok(resp) => resp,
         Err(e) => {
             // passive ejection (ADR 000017): a real request that couldn't even connect demotes this
@@ -339,10 +439,16 @@ fn to_http_request(parts: &hyper::http::request::Parts, scheme: &str) -> HttpReq
 }
 
 /// Convert a hyper `HeaderMap` to the contract's `Vec<Header>`, lossily decoding values (HTTP
-/// permits non-UTF-8 bytes; the contract is `string`). Hop-by-hop headers are dropped.
+/// permits non-UTF-8 bytes; the contract is `string`). Both the static hop-by-hop set AND any
+/// header dynamically named by `Connection` are dropped (RFC 9110 §7.6.1) — this is the single
+/// ingress point for both the request (from `parts`) and the response (from the upstream parts),
+/// so a connection-specific header can never be carried into the contract and forwarded.
 fn headers_to_vec(map: &hyper::HeaderMap) -> Vec<Header> {
+    let named = connection_named(map);
     map.iter()
-        .filter(|(name, _)| !is_hop_by_hop(name.as_str()))
+        .filter(|(name, _)| {
+            !is_hop_by_hop(name.as_str()) && !named.contains(&name.as_str().to_ascii_lowercase())
+        })
         .map(|(name, value)| Header {
             name: name.as_str().to_string(),
             value: String::from_utf8_lossy(value.as_bytes()).into_owned(),
@@ -457,6 +563,9 @@ async fn serve_h3(state: Arc<ServerState>, endpoint: quinn::Endpoint) {
                     return;
                 }
             };
+            // the client's address, captured before `conn` is moved into the h3 wrapper — fed to
+            // `proxy_core` for X-Forwarded-For (ADR 000018), same as the TCP `accept()` peer.
+            let peer = conn.remote_address();
             let mut h3conn = match h3::server::Connection::<h3_quinn::Connection, Bytes>::new(
                 h3_quinn::Connection::new(conn),
             )
@@ -473,7 +582,7 @@ async fn serve_h3(state: Arc<ServerState>, endpoint: quinn::Endpoint) {
                     Ok(Some(resolver)) => {
                         let state = state.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = handle_h3_request(state, resolver).await {
+                            if let Err(e) = handle_h3_request(state, peer, resolver).await {
                                 tracing::debug!(error = %e, "h3 request failed");
                             }
                         });
@@ -495,6 +604,7 @@ async fn serve_h3(state: Arc<ServerState>, endpoint: quinn::Endpoint) {
 /// response head + body back over the send half.
 async fn handle_h3_request(
     state: Arc<ServerState>,
+    peer: SocketAddr,
     resolver: h3::server::RequestResolver<h3_quinn::Connection, Bytes>,
 ) -> anyhow::Result<()> {
     let (req, stream) = resolver.resolve_request().await?;
@@ -502,7 +612,7 @@ async fn handle_h3_request(
     let (parts, ()) = req.into_parts();
     let body = H3ReqBody { recv }.boxed();
 
-    let resp = match proxy_core(state, "https", parts, body).await {
+    let resp = match proxy_core(state, "https", peer, parts, body).await {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(error = %e, "h3 fast-path error");
@@ -674,6 +784,198 @@ mod tests {
         assert_eq!(
             to_http_request(&parts(false), "http").authority,
             "h1.example"
+        );
+    }
+
+    fn header(name: &str, value: &str) -> Header {
+        Header {
+            name: name.to_string(),
+            value: value.to_string(),
+        }
+    }
+
+    #[test]
+    fn hop_by_hop_set_is_recognised_case_insensitively() {
+        // The exact RFC 9110 §7.6.1 connection-management set a proxy must never forward, plus
+        // `transfer-encoding` — forwarding a client's `Transfer-Encoding`/`Connection` next to the
+        // fresh framing hyper computes is the classic request-smuggling primitive (CWE-444).
+        for h in [
+            "connection",
+            "Keep-Alive",
+            "PROXY-CONNECTION",
+            "Transfer-Encoding",
+            "te",
+            "Trailer",
+            "upgrade",
+        ] {
+            assert!(is_hop_by_hop(h), "{h} must be treated as hop-by-hop");
+        }
+        // a normal end-to-end header is not hop-by-hop.
+        assert!(!is_hop_by_hop("x-api-key"));
+        assert!(!is_hop_by_hop("content-type"));
+    }
+
+    #[test]
+    fn headers_to_vec_strips_hop_by_hop_on_ingress() {
+        // What the chain (and ultimately the upstream) sees must already be free of connection-
+        // management headers: stripping them on the way in is half the smuggling defence (the
+        // other half is `copy_headers` on the way out).
+        let mut map = hyper::HeaderMap::new();
+        map.insert("x-keep", HeaderValue::from_static("1"));
+        map.insert(
+            hyper::header::CONNECTION,
+            HeaderValue::from_static("keep-alive"),
+        );
+        map.insert(
+            hyper::header::TRANSFER_ENCODING,
+            HeaderValue::from_static("chunked"),
+        );
+        map.insert(hyper::header::TE, HeaderValue::from_static("trailers"));
+
+        let out = headers_to_vec(&map);
+        assert!(
+            out.iter().all(|h| !is_hop_by_hop(&h.name)),
+            "no hop-by-hop header may survive the ingress conversion"
+        );
+        assert!(
+            out.iter().any(|h| h.name == "x-keep"),
+            "an end-to-end header is preserved"
+        );
+    }
+
+    #[test]
+    fn headers_to_vec_strips_connection_named_headers() {
+        // RFC 9110 §7.6.1 (review f000005 P2#5): a header NAMED by `Connection` is connection-
+        // specific and must not be forwarded. A client using `Connection: x-secret` to smuggle
+        // `x-secret` past the proxy is defeated; inert tokens (`close`) are ignored.
+        let mut map = hyper::HeaderMap::new();
+        map.insert(
+            hyper::header::CONNECTION,
+            HeaderValue::from_static("X-Secret, close"),
+        );
+        map.append("x-secret", HeaderValue::from_static("leak"));
+        map.insert("x-keep", HeaderValue::from_static("1"));
+
+        let out = headers_to_vec(&map);
+        assert!(
+            !out.iter().any(|h| h.name.eq_ignore_ascii_case("x-secret")),
+            "a Connection-named header must be stripped"
+        );
+        assert!(
+            !out.iter()
+                .any(|h| h.name.eq_ignore_ascii_case("connection")),
+            "Connection itself is hop-by-hop"
+        );
+        assert!(
+            out.iter().any(|h| h.name == "x-keep"),
+            "an unrelated end-to-end header survives"
+        );
+    }
+
+    #[test]
+    fn set_forwarded_overwrites_spoofed_client_headers() {
+        // Edge model (review f000005 P2#3): a client-supplied X-Forwarded-For / Forwarded is
+        // STRIPPED and replaced by the real peer — never appended-to or trusted — so an untrusted
+        // client cannot forge its source IP. X-Forwarded-Proto reflects the wire scheme.
+        let mut headers = vec![
+            header("X-Forwarded-For", "9.9.9.9"),
+            header("forwarded", "for=10.0.0.1"),
+            header("x-keep", "1"),
+        ];
+        set_forwarded(&mut headers, "203.0.113.5".parse().unwrap(), "https");
+
+        let xff: Vec<&str> = headers
+            .iter()
+            .filter(|h| h.name.eq_ignore_ascii_case("x-forwarded-for"))
+            .map(|h| h.value.as_str())
+            .collect();
+        assert_eq!(
+            xff,
+            vec!["203.0.113.5"],
+            "the spoofed XFF is replaced by the real peer (one value, not appended)"
+        );
+        assert!(
+            !headers
+                .iter()
+                .any(|h| h.name.eq_ignore_ascii_case("forwarded")),
+            "a spoofed Forwarded header is stripped"
+        );
+        assert_eq!(
+            headers
+                .iter()
+                .find(|h| h.name.eq_ignore_ascii_case("x-forwarded-proto"))
+                .map(|h| h.value.as_str()),
+            Some("https"),
+            "X-Forwarded-Proto reflects the connection scheme"
+        );
+        assert!(
+            headers.iter().any(|h| h.name == "x-keep"),
+            "an unrelated header is left intact"
+        );
+    }
+
+    #[test]
+    fn copy_headers_drops_hop_by_hop_crlf_and_malformed_names() {
+        // Egress side: a filter (or a buggy/hostile one) must not be able to smuggle framing or
+        // inject a header via an embedded CRLF (CWE-113) or a malformed name. `copy_headers` drops
+        // each silently and never panics (data-plane discipline) — and the rest still copies.
+        let mut dst = hyper::HeaderMap::new();
+        copy_headers(
+            Some(&mut dst),
+            &[
+                header("x-ok", "fine"),
+                header("transfer-encoding", "chunked"), // hop-by-hop → dropped
+                header("x-evil", "a\r\nInjected: pwned"), // CRLF in value → dropped
+                header("bad name", "x"),                // space in name → invalid → dropped
+                header("", "x"),                        // empty name → invalid → dropped
+            ],
+        );
+
+        assert_eq!(
+            dst.get("x-ok").and_then(|v| v.to_str().ok()),
+            Some("fine"),
+            "a valid end-to-end header is copied"
+        );
+        assert!(
+            !dst.contains_key("transfer-encoding"),
+            "a filter cannot re-introduce a hop-by-hop header"
+        );
+        assert!(
+            !dst.contains_key("x-evil") && !dst.contains_key("injected"),
+            "a CRLF-bearing value is rejected, not split into a second header"
+        );
+        assert_eq!(dst.len(), 1, "only the one valid header survives");
+    }
+
+    #[test]
+    fn http_response_clamps_invalid_status_and_drops_invalid_headers_without_panicking() {
+        // A short-circuit / fail-closed response carries a filter-supplied `u16` status and
+        // arbitrary headers. An out-of-range status must clamp to 502 (never panic), and an
+        // invalid header value must be dropped — the data plane must survive hostile filter output.
+        for bad_status in [0u16, 99, 1000] {
+            let resp = http_response(HttpResponse {
+                status: bad_status,
+                headers: vec![],
+                body: Vec::new(),
+            });
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_GATEWAY,
+                "an out-of-range status ({bad_status}) clamps to 502"
+            );
+        }
+
+        // a valid status is preserved; a CRLF-bearing header is dropped, a clean one kept.
+        let resp = http_response(HttpResponse {
+            status: 403,
+            headers: vec![header("x-clean", "ok"), header("x-evil", "a\r\nb")],
+            body: b"denied".to_vec(),
+        });
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(resp.headers().contains_key("x-clean"));
+        assert!(
+            !resp.headers().contains_key("x-evil"),
+            "an invalid header value is dropped from a synthesised response"
         );
     }
 }
