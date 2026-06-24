@@ -158,6 +158,8 @@ cd plecto
 cargo run -p plecto-server --example <name>   # Ctrl-C to stop
 ```
 
+Or take a guided tour: `./examples/try.sh <name>` (or `all`) starts the example, waits for it, runs the `curl` commands, visualizes the output, and cleans up — no manual orchestration.
+
 | `<name>` | What it shows |
 | --- | --- |
 | `wasm-auth` | **A real WASM filter doing real work** — a signed API-key auth component (`crates/filter-apikey`) that 401s without a valid key, stamps the caller's identity, and counts per-user requests in host KV. The point of Plecto. |

@@ -158,6 +158,8 @@ cd plecto
 cargo run -p plecto-server --example <name>   # Ctrl-C で停止
 ```
 
+手早く全部見るなら `./examples/try.sh <name>`（または `all`）: example を起動し、readiness を待ち、`curl` を流し、結果を可視化して、後片付けまで自動でやる。
+
 | `<name>` | 見せるもの |
 | --- | --- |
 | `wasm-auth` | **実用 WASM フィルタ** —— 署名済みの API キー認証コンポーネント（`crates/filter-apikey`）。鍵が無ければ 401、認証できれば呼び出し元の identity を付与し、per-user のリクエスト数を host KV で数える。Plecto の核。 |
