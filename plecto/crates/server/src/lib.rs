@@ -874,12 +874,16 @@ mod tests {
 
     #[test]
     fn set_forwarded_overwrites_spoofed_client_headers() {
-        // Edge model (review f000005 P2#3): a client-supplied X-Forwarded-For / Forwarded is
-        // STRIPPED and replaced by the real peer — never appended-to or trusted — so an untrusted
-        // client cannot forge its source IP. X-Forwarded-Proto reflects the wire scheme.
+        // Edge model (review f000005 P2#3 / ADR 000018 + 000022): the whole de-facto client-IP
+        // family — X-Forwarded-For / Forwarded / X-Real-IP / CDN headers — is STRIPPED and the
+        // peer's value re-issued, never appended-to or trusted, so an untrusted client cannot forge
+        // its source IP. X-Forwarded-For and X-Real-IP carry the real peer; X-Forwarded-Proto the
+        // wire scheme; a stripped CDN header (CF-Connecting-IP) is NOT re-issued.
         let mut headers = vec![
             header("X-Forwarded-For", "9.9.9.9"),
             header("forwarded", "for=10.0.0.1"),
+            header("X-Real-IP", "9.9.9.9"),
+            header("cf-connecting-ip", "8.8.8.8"),
             header("x-keep", "1"),
         ];
         set_forwarded(&mut headers, "203.0.113.5".parse().unwrap(), "https");
@@ -894,11 +898,27 @@ mod tests {
             vec!["203.0.113.5"],
             "the spoofed XFF is replaced by the real peer (one value, not appended)"
         );
+        let xrealip: Vec<&str> = headers
+            .iter()
+            .filter(|h| h.name.eq_ignore_ascii_case("x-real-ip"))
+            .map(|h| h.value.as_str())
+            .collect();
+        assert_eq!(
+            xrealip,
+            vec!["203.0.113.5"],
+            "the spoofed X-Real-IP is replaced by the real peer (one value, re-issued)"
+        );
         assert!(
             !headers
                 .iter()
                 .any(|h| h.name.eq_ignore_ascii_case("forwarded")),
             "a spoofed Forwarded header is stripped"
+        );
+        assert!(
+            !headers
+                .iter()
+                .any(|h| h.name.eq_ignore_ascii_case("cf-connecting-ip")),
+            "a spoofed CDN client-IP header is stripped and not re-issued"
         );
         assert_eq!(
             headers
@@ -911,6 +931,37 @@ mod tests {
         assert!(
             headers.iter().any(|h| h.name == "x-keep"),
             "an unrelated header is left intact"
+        );
+    }
+
+    #[test]
+    fn set_forwarded_normalises_ipv4_mapped_peer() {
+        // An IPv4 client on a dual-stack ([::]) listener arrives as an IPv4-mapped IPv6 peer
+        // (`::ffff:a.b.c.d`); X-Forwarded-For / X-Real-IP must carry the dotted IPv4 form so a
+        // backend all-listing on the IPv4 address matches (ADR 000022).
+        let mut headers = vec![];
+        set_forwarded(&mut headers, "::ffff:203.0.113.5".parse().unwrap(), "https");
+        for name in ["x-forwarded-for", "x-real-ip"] {
+            assert_eq!(
+                headers
+                    .iter()
+                    .find(|h| h.name.eq_ignore_ascii_case(name))
+                    .map(|h| h.value.as_str()),
+                Some("203.0.113.5"),
+                "an IPv4-mapped peer normalises to dotted IPv4 in {name}"
+            );
+        }
+
+        // A genuine IPv6 peer is preserved verbatim (no brackets in XFF).
+        let mut headers = vec![];
+        set_forwarded(&mut headers, "2001:db8::1".parse().unwrap(), "https");
+        assert_eq!(
+            headers
+                .iter()
+                .find(|h| h.name.eq_ignore_ascii_case("x-forwarded-for"))
+                .map(|h| h.value.as_str()),
+            Some("2001:db8::1"),
+            "a real IPv6 peer is kept as-is"
         );
     }
 

@@ -53,12 +53,29 @@ async fn echo(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infallibl
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
+    // `X-Real-IP` is re-issued by Plecto (nginx convention); `CF-Connecting-IP` is part of the
+    // stripped client-IP family but NOT re-issued — so a test can prove both halves of the edge
+    // model (ADR 000022): the re-issued header carries the real peer, the dropped one is empty.
+    let xrealip = req
+        .headers()
+        .get("x-real-ip")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let cfip = req
+        .headers()
+        .get("cf-connecting-ip")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
     Ok(Response::builder()
         .status(200)
         .header("x-upstream-path", path)
         .header("x-upstream-traceparent", traceparent)
         .header("x-upstream-xff", xff)
         .header("x-upstream-xfproto", xfp)
+        .header("x-upstream-xrealip", xrealip)
+        .header("x-upstream-cfip", cfip)
         .header("x-from", "upstream")
         .header("x-plecto-respedit", "1")
         .body(Full::new(Bytes::from_static(b"upstream-ok")))
@@ -268,10 +285,11 @@ async fn continues_inbound_trace_context() {
 
 #[tokio::test]
 async fn overwrites_spoofed_forwarded_headers_with_the_real_peer() {
-    // review f000005 P2#3 / ADR 000018: a client cannot forge its source IP. A spoofed
-    // `X-Forwarded-For: 9.9.9.9` is stripped and replaced by the real connection peer (loopback in
-    // a test), and `X-Forwarded-Proto` reflects the wire scheme — so the upstream (and any
-    // IP-based filter) sees Plecto's authoritative values, never the client's claim.
+    // review f000005 P2#3 / ADR 000018 + 000022: a client cannot forge its source IP. The whole
+    // de-facto client-IP family is stripped — `X-Forwarded-For` AND `X-Real-IP` AND CDN headers
+    // like `CF-Connecting-IP` — then `X-Forwarded-For` / `X-Real-IP` are re-issued from the real
+    // connection peer (loopback in a test) and `X-Forwarded-Proto` from the wire scheme. So the
+    // upstream (and any IP-based filter) sees Plecto's authoritative values, never the client's.
     let upstream = spawn_upstream().await;
     let proxy = spawn_proxy(control_for(upstream)).await;
     let client = client();
@@ -281,7 +299,11 @@ async fn overwrites_spoofed_forwarded_headers_with_the_real_peer() {
         &client,
         proxy,
         "/api/hello",
-        &[("x-forwarded-for", "9.9.9.9")],
+        &[
+            ("x-forwarded-for", "9.9.9.9"),
+            ("x-real-ip", "9.9.9.9"),
+            ("cf-connecting-ip", "8.8.8.8"),
+        ],
     )
     .await;
 
@@ -290,6 +312,18 @@ async fn overwrites_spoofed_forwarded_headers_with_the_real_peer() {
         headers.get("x-upstream-xff").and_then(|v| v.to_str().ok()),
         Some("127.0.0.1"),
         "the spoofed X-Forwarded-For is replaced by the real loopback peer"
+    );
+    assert_eq!(
+        headers
+            .get("x-upstream-xrealip")
+            .and_then(|v| v.to_str().ok()),
+        Some("127.0.0.1"),
+        "the spoofed X-Real-IP is replaced by the real loopback peer"
+    );
+    assert_eq!(
+        headers.get("x-upstream-cfip").and_then(|v| v.to_str().ok()),
+        Some(""),
+        "a spoofed CF-Connecting-IP is stripped and not re-issued"
     );
     assert_eq!(
         headers
