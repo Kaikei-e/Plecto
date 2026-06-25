@@ -79,6 +79,13 @@ pub struct Upstream {
     /// Default 30000; **`0` disables** the timeout (for long-poll / streaming upstreams).
     #[serde(default = "default_request_timeout_ms")]
     pub request_timeout_ms: u64,
+    /// Maximum times the fast path re-sends this upstream's request to a DIFFERENT healthy instance
+    /// after a retryable failure (ADR 000023). A timeout is retried only for an idempotent method
+    /// (the upstream may have acted); a connect failure — the upstream never received the request —
+    /// is retried for any method. Only bodyless requests are retried (the opaque streamed body,
+    /// ADR 000013, can't be replayed). Default 1; **`0` disables** retry.
+    #[serde(default = "default_max_retries")]
+    pub max_retries: u64,
 }
 
 /// Active-health-check policy (ADR 000017). A background prober issues `GET {path}` to each
@@ -111,6 +118,10 @@ pub struct HealthConfig {
 
 fn default_request_timeout_ms() -> u64 {
     30_000
+}
+
+fn default_max_retries() -> u64 {
+    1
 }
 
 fn default_interval_ms() -> u64 {
@@ -494,6 +505,61 @@ path = "/healthz"
             defaulted.content_hash().unwrap(),
             overridden.content_hash().unwrap(),
             "changing the upstream timeout must flip the config version"
+        );
+
+        // `0` is an explicit opt-out (long-poll / streaming upstream) and must parse, not error.
+        let disabled = Manifest::from_toml(
+            r#"
+[[upstream]]
+name = "x"
+addresses = ["127.0.0.1:9000"]
+request_timeout_ms = 0
+[upstream.health]
+path = "/healthz"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            disabled.upstreams[0].request_timeout_ms, 0,
+            "request_timeout_ms = 0 disables the timeout and must parse"
+        );
+    }
+
+    #[test]
+    fn upstream_max_retries_defaults_and_overrides() {
+        // ADR 000023: an upstream gets 1 retry by default; an explicit value (incl. 0 = disabled)
+        // rides through and flips the content hash.
+        let defaulted = Manifest::from_toml(
+            r#"
+[[upstream]]
+name = "x"
+addresses = ["127.0.0.1:9000"]
+[upstream.health]
+path = "/healthz"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            defaulted.upstreams[0].max_retries, 1,
+            "an unspecified upstream defaults to one retry"
+        );
+
+        let disabled = Manifest::from_toml(
+            r#"
+[[upstream]]
+name = "x"
+addresses = ["127.0.0.1:9000"]
+max_retries = 0
+[upstream.health]
+path = "/healthz"
+"#,
+        )
+        .unwrap();
+        assert_eq!(disabled.upstreams[0].max_retries, 0, "0 disables retry");
+        assert_ne!(
+            defaulted.content_hash().unwrap(),
+            disabled.content_hash().unwrap(),
+            "changing max_retries must flip the config version"
         );
     }
 

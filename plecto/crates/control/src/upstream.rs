@@ -138,6 +138,10 @@ pub struct UpstreamGroup {
     /// it. The fast path wraps the upstream call in this and fails closed with 504 on overrun. Not
     /// part of `health`, so a timeout-only change rebuilds the group but preserves instance health.
     request_timeout: Duration,
+    /// Max retries to a DIFFERENT instance after a retryable forward failure (ADR 000023); `0`
+    /// disables retry. Like `request_timeout`, not part of `health`, so a retry-only change rebuilds
+    /// the group but preserves instance health.
+    max_retries: u64,
     /// Round-robin cursor. `Relaxed` suffices: it only needs to advance, not synchronise memory.
     rr: AtomicUsize,
 }
@@ -164,11 +168,37 @@ impl UpstreamGroup {
         None
     }
 
+    /// Pick the next healthy instance OTHER than `exclude` (round-robin), or `None` when `exclude`
+    /// is the only healthy one. Used to retry a failed forward on a different instance (ADR 000023).
+    pub fn pick_excluding(&self, exclude: &Arc<UpstreamInstance>) -> Option<Arc<UpstreamInstance>> {
+        let n = self.instances.len();
+        if n == 0 {
+            return None;
+        }
+        let start = self.rr.fetch_add(1, Ordering::Relaxed);
+        for off in 0..n {
+            let i = start.wrapping_add(off) % n;
+            if let Some(inst) = self.instances.get(i)
+                && inst.is_healthy()
+                && !Arc::ptr_eq(inst, exclude)
+            {
+                return Some(inst.clone());
+            }
+        }
+        None
+    }
+
     /// The end-to-end timeout the fast path applies to a forward to this upstream (ADR 000019).
     /// `Duration::ZERO` means no timeout (the operator opted out for a streaming / long-poll
     /// backend); otherwise the call is bounded and overrun fails closed with 504.
     pub fn request_timeout(&self) -> Duration {
         self.request_timeout
+    }
+
+    /// The max number of retries to a different instance on a retryable forward failure (ADR
+    /// 000023); `0` disables retry.
+    pub fn max_retries(&self) -> u64 {
+        self.max_retries
     }
 }
 
@@ -229,6 +259,7 @@ impl UpstreamRegistry {
                     health: up.health.clone(),
                     instances,
                     request_timeout: Duration::from_millis(up.request_timeout_ms),
+                    max_retries: up.max_retries,
                     rr: AtomicUsize::new(0),
                 }),
             );
@@ -272,6 +303,7 @@ mod tests {
             addresses: addrs.iter().map(|s| s.to_string()).collect(),
             health: h,
             request_timeout_ms: 30_000,
+            max_retries: 1,
         }
     }
 
@@ -330,6 +362,42 @@ mod tests {
         inst.record_probe_failure();
         inst.record_probe_failure();
         assert!(inst.is_healthy(), "non-consecutive failures must not eject");
+    }
+
+    #[test]
+    fn pick_excluding_returns_a_different_healthy_instance_or_none() {
+        // ADR 000023: a retry must land on a DIFFERENT instance; when the failed one is the only
+        // healthy member there is nothing to retry onto.
+        let reg = UpstreamRegistry::new();
+        reg.reconcile(&[upstream(
+            "pool",
+            &["127.0.0.1:9000", "127.0.0.1:9001"],
+            health(1, 3),
+        )])
+        .unwrap();
+        let group = reg.group("pool").unwrap();
+        // promote both (cold-start: one success each).
+        group.instances[0].record_probe_success();
+        group.instances[1].record_probe_success();
+
+        let a = group.instances[0].clone();
+        let other = group
+            .pick_excluding(&a)
+            .expect("a different healthy instance exists");
+        assert!(
+            Arc::ptr_eq(&other, &group.instances[1]),
+            "pick_excluding skips the excluded instance"
+        );
+
+        // eject instance[1] (unhealthy_threshold = 3) → `a` is the only healthy one left.
+        for _ in 0..3 {
+            group.instances[1].record_probe_failure();
+        }
+        assert!(!group.instances[1].is_healthy(), "instance[1] is ejected");
+        assert!(
+            group.pick_excluding(&a).is_none(),
+            "the only healthy instance can't be retried around"
+        );
     }
 
     #[test]
