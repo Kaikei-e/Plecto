@@ -55,6 +55,17 @@ _Avoid_: balancing pool（曖昧）
 版（404 no-route / 502 upstream-error とは別の fault）。
 _Avoid_: circuit break（別概念）
 
+**Retryable failure**:
+別 instance への再送が許される転送失敗——応答ヘッダ到達前の **timeout**（ADR 000019）と、**接続失敗**（upstream が
+未受信）。mid-response の transport fault や upstream の 5xx は retryable ではない（health 信号にもしない）。
+_Avoid_: error（広すぎる）, 5xx（upstream 応答は retry 対象外）
+
+**Upstream retry（bounded）**:
+retryable failure を**別の**healthy instance へ最大回数まで再送する補完（ADR 000023）。timeout retry は冪等メソッド
+限定（upstream が処理済みかもしれない）、接続失敗は任意メソッド（未受信なので安全）、いずれも **bodyless 限定**
+（opaque body は再生不可）。別 instance が無ければ retry せず元の fault を返す。タイムアウトは health 信号にしない。
+_Avoid_: failover（含意が広い）, hedging（並行投機ではなく逐次再送）
+
 ## リクエスト処理
 
 **Opaque body（pass-through）**:

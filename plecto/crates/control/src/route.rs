@@ -134,6 +134,7 @@ mod tests {
                 unhealthy_threshold: 1,
             },
             request_timeout_ms: 30_000,
+            max_retries: 1,
         }])
         .unwrap();
         reg.group(upstream).unwrap()

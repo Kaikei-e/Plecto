@@ -304,6 +304,36 @@ async fn handle(
     Ok(resp)
 }
 
+/// A retryable upstream failure (ADR 000023). A timeout may already have been acted on by the
+/// upstream; a connect failure never reached it.
+#[derive(Clone, Copy)]
+enum Failure {
+    Timeout,
+    Connect,
+}
+
+/// RFC 9110 §9.2.2 idempotent methods — safe to retry on a timeout. Matched case-sensitively
+/// (standard methods are uppercase tokens); any other token is treated as non-idempotent.
+fn is_idempotent(method: &str) -> bool {
+    matches!(
+        method,
+        "GET" | "HEAD" | "PUT" | "DELETE" | "OPTIONS" | "TRACE"
+    )
+}
+
+/// Whether a failed forward MAY be retried on another instance (ADR 000023) — independent of whether
+/// a different instance is actually available (the caller checks that). A retry needs remaining
+/// budget and a replayable (bodyless) body; a timeout additionally needs an idempotent method, while
+/// a connect failure is safe for any method (the upstream never received the request).
+fn may_retry(failure: Failure, method: &str, bodyless: bool, tries_left: u64) -> bool {
+    bodyless
+        && tries_left > 0
+        && match failure {
+            Failure::Timeout => is_idempotent(method),
+            Failure::Connect => true,
+        }
+}
+
 /// The transport-agnostic transaction core: route → chain (request side) → forward → chain
 /// (response side). Takes the request head + a boxed body (so HTTP/1.1, HTTP/2 and HTTP/3 all share
 /// it) and returns the client-visible response. Errors here are upstream/transport failures the
@@ -354,8 +384,18 @@ async fn proxy_core(
         ChainOutcome::Forward(req) => req,
     };
 
-    // --- pick a healthy upstream instance by round-robin; fail closed (503) if none (ADR 000017) ---
-    let Some(instance) = route.upstream.pick() else {
+    // --- forward to a healthy instance, with bounded retry onto ANOTHER instance on a retryable
+    // failure (ADR 000019 timeout / 000023 retry). The per-attempt invariants are computed once. ---
+    let upstream_path = route.rewrite_path(&forward.path);
+    let timeout = route.upstream.request_timeout();
+    // Only a bodyless request can be retried without buffering: the opaque streamed body
+    // (ADR 000013) can't be replayed. `exact() == Some(0)` is hyper's framing-accurate "no body".
+    let bodyless = body.size_hint().exact() == Some(0);
+    let mut real_body = Some(body);
+    let mut tries_left = route.upstream.max_retries();
+
+    // First pick by round-robin; fail closed (503) if no instance is healthy (ADR 000017).
+    let Some(mut instance) = route.upstream.pick() else {
         return Ok(synth(
             StatusCode::SERVICE_UNAVAILABLE,
             "no-healthy-upstream",
@@ -363,50 +403,78 @@ async fn proxy_core(
         ));
     };
 
-    // --- forward to the chosen instance, streaming the original request body opaquely ---
-    let upstream_path = route.rewrite_path(&forward.path);
-    let uri = format!("http://{}{}", instance.address(), upstream_path);
-    let mut builder = Request::builder().method(forward.method.as_str()).uri(uri);
-    copy_headers(builder.headers_mut(), &forward.headers);
-    // continue the trace into the upstream (ADR 000009 W3C propagation).
-    if let Some(h) = builder.headers_mut()
-        && let Ok(v) = HeaderValue::from_str(&snapshot.traceparent())
-    {
-        h.insert("traceparent", v);
-    }
-    // End-to-end timeout (ADR 000019 / review f000005 P2#4): bound time-to-response-headers, then
-    // stream the body without a deadline (so streaming responses are unaffected). `Duration::ZERO`
-    // means the operator opted out (long-poll / streaming upstream). Overrun fails closed with 504.
-    let upstream_req = builder.body(body)?;
-    let timeout = route.upstream.request_timeout();
-    let result = if timeout.is_zero() {
-        state.client.request(upstream_req).await
-    } else {
-        match tokio::time::timeout(timeout, state.client.request(upstream_req)).await {
-            Ok(result) => result,
-            Err(_elapsed) => {
-                // The upstream did not return response headers in time. Fail closed 504; leave
-                // health to the active prober (a single slow request is not, by itself, an eject —
-                // consistent with ADR 000017, whose re-examination condition (c) this realises).
+    let upstream_resp = loop {
+        // Build this attempt. A bodyless request re-sends an empty body to each instance; a bodied
+        // one moves its single streamed body and (since `may_retry` is false for it) is sent once.
+        let attempt_body = if bodyless {
+            empty_req()
+        } else {
+            real_body.take().unwrap_or_else(empty_req)
+        };
+        let uri = format!("http://{}{}", instance.address(), upstream_path);
+        let mut builder = Request::builder().method(forward.method.as_str()).uri(uri);
+        copy_headers(builder.headers_mut(), &forward.headers);
+        // continue the trace into the upstream (ADR 000009 W3C propagation).
+        if let Some(h) = builder.headers_mut()
+            && let Ok(v) = HeaderValue::from_str(&snapshot.traceparent())
+        {
+            h.insert("traceparent", v);
+        }
+        let upstream_req = builder.body(attempt_body)?;
+
+        // The timeout (ADR 000019) bounds time-to-response-headers; `Duration::ZERO` opts out. The
+        // body then streams without a deadline, so streaming responses are unaffected.
+        let send = state.client.request(upstream_req);
+        let outcome = if timeout.is_zero() {
+            Some(send.await)
+        } else {
+            tokio::time::timeout(timeout, send).await.ok()
+        };
+
+        match outcome {
+            Some(Ok(resp)) => break resp,
+            // The deadline elapsed before response headers. Not a health signal (ADR 000019) — leave
+            // liveness to the active prober. Retry onto a DIFFERENT instance if policy allows and one
+            // is available (idempotent-only, ADR 000023), else fail closed 504.
+            None => {
+                if may_retry(
+                    Failure::Timeout,
+                    forward.method.as_str(),
+                    bodyless,
+                    tries_left,
+                ) && let Some(next) = route.upstream.pick_excluding(&instance)
+                {
+                    tries_left -= 1;
+                    instance = next;
+                    continue;
+                }
                 return Ok(synth(
                     StatusCode::GATEWAY_TIMEOUT,
                     "upstream-timeout",
                     b"upstream timeout",
                 ));
             }
-        }
-    };
-    let upstream_resp = match result {
-        Ok(resp) => resp,
-        Err(e) => {
-            // passive ejection (ADR 000017): a real request that couldn't even connect demotes this
-            // instance so the rotation avoids it; the request itself still fails closed (the caller
-            // maps this to 502). A non-connect error (e.g. a mid-response transport fault) is not a
-            // liveness signal — only the active prober governs health in that case.
-            if e.is_connect() {
-                instance.record_passive_failure();
+            Some(Err(e)) => {
+                // A connect failure passively ejects (ADR 000017) and is safe to retry for ANY method
+                // (the upstream never received the request, ADR 000023). A non-connect transport
+                // fault is neither a health signal nor retried — only the active prober governs
+                // health then; the request fails closed (the caller maps the error to 502).
+                if e.is_connect() {
+                    instance.record_passive_failure();
+                    if may_retry(
+                        Failure::Connect,
+                        forward.method.as_str(),
+                        bodyless,
+                        tries_left,
+                    ) && let Some(next) = route.upstream.pick_excluding(&instance)
+                    {
+                        tries_left -= 1;
+                        instance = next;
+                        continue;
+                    }
+                }
+                return Err(e.into());
             }
-            return Err(e.into());
         }
     };
 
@@ -546,6 +614,14 @@ fn stream(body: Incoming) -> ResponseBody {
 /// Box a hyper `Incoming` inbound body into the transport-agnostic `ReqBody`.
 fn box_incoming(body: Incoming) -> ReqBody {
     body.map_err(|e| -> BoxError { Box::new(e) }).boxed()
+}
+
+/// An empty `ReqBody` — used to re-send a bodyless request to another instance on retry (ADR
+/// 000023), since the opaque streamed body (ADR 000013) cannot be replayed.
+fn empty_req() -> ReqBody {
+    Empty::<Bytes>::new()
+        .map_err(|e: Infallible| -> BoxError { match e {} })
+        .boxed()
 }
 
 // ===== HTTP/3 (ADR 000016) =====
@@ -1056,5 +1132,31 @@ mod tests {
             !resp.headers().contains_key("x-evil"),
             "an invalid header value is dropped from a synthesised response"
         );
+    }
+
+    #[test]
+    fn idempotent_methods_per_rfc_9110() {
+        for m in ["GET", "HEAD", "PUT", "DELETE", "OPTIONS", "TRACE"] {
+            assert!(is_idempotent(m), "{m} is idempotent (RFC 9110 §9.2.2)");
+        }
+        for m in ["POST", "PATCH", "CONNECT", "get", ""] {
+            assert!(!is_idempotent(m), "{m} is not idempotent");
+        }
+    }
+
+    #[test]
+    fn may_retry_gates_on_failure_method_body_and_budget() {
+        // A timeout retries only for an idempotent method (the upstream may have acted).
+        assert!(may_retry(Failure::Timeout, "GET", true, 1));
+        assert!(!may_retry(Failure::Timeout, "POST", true, 1));
+        // A connect failure never reached the upstream → safe for ANY method.
+        assert!(may_retry(Failure::Connect, "POST", true, 1));
+        assert!(may_retry(Failure::Connect, "GET", true, 1));
+        // A bodied request can't be replayed (no buffering) → never retried, either failure.
+        assert!(!may_retry(Failure::Timeout, "GET", false, 1));
+        assert!(!may_retry(Failure::Connect, "POST", false, 1));
+        // Exhausted budget → no retry.
+        assert!(!may_retry(Failure::Timeout, "GET", true, 0));
+        assert!(!may_retry(Failure::Connect, "GET", true, 0));
     }
 }

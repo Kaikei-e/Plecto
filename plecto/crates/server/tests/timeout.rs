@@ -88,6 +88,41 @@ upstream = "slow"
     Arc::new(Control::load(host, &manifest, Box::new(MemoryStore::new())).unwrap())
 }
 
+/// A filter-less `/api` route to a single `pool` upstream over several instances, with a short
+/// `request_timeout_ms` and an explicit `max_retries` (ADR 000023).
+fn control_for_pool(
+    addresses: &[SocketAddr],
+    request_timeout_ms: u64,
+    max_retries: u64,
+) -> Arc<Control> {
+    let signer = TestSigner::new().unwrap();
+    let addrs = addresses
+        .iter()
+        .map(|a| format!("\"{a}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let toml = format!(
+        r#"
+[[upstream]]
+name = "pool"
+addresses = [{addrs}]
+request_timeout_ms = {request_timeout_ms}
+max_retries = {max_retries}
+[upstream.health]
+path = "/healthz"
+interval_ms = 50
+timeout_ms = 200
+
+[[route]]
+path_prefix = "/api"
+upstream = "pool"
+"#
+    );
+    let manifest = Manifest::from_toml(&toml).unwrap();
+    let host = Host::new(signer.trust_policy().unwrap()).unwrap();
+    Arc::new(Control::load(host, &manifest, Box::new(MemoryStore::new())).unwrap())
+}
+
 fn client() -> Client<HttpConnector, Empty<Bytes>> {
     Client::builder(TokioExecutor::new()).build_http()
 }
@@ -161,5 +196,60 @@ async fn fast_upstream_within_timeout_succeeds() {
         status,
         StatusCode::OK,
         "a prompt upstream within the timeout forwards normally"
+    );
+}
+
+#[tokio::test]
+async fn timeout_retries_to_a_healthy_instance() {
+    // pool = [slow, fast]: the slow instance answers /healthz promptly (so it joins the rotation)
+    // but stalls 500ms on the real path, far past the 80ms timeout. With max_retries = 1, every
+    // request the round-robin sends to the slow instance must time out and be RE-SENT to the fast
+    // instance — so a GET (bodyless, idempotent) only ever sees 200, never a 504 (ADR 000023).
+    let slow = spawn_slow_upstream(Duration::from_millis(500)).await;
+    let fast = spawn_slow_upstream(Duration::from_millis(0)).await;
+    let proxy = spawn_proxy(control_for_pool(&[slow, fast], 80, 1)).await;
+    let client = client();
+    wait_ready(&client, proxy).await;
+    // let both instances pass a probe so the round-robin actually visits the slow one.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    for _ in 0..24 {
+        let (status, _fault) = get(&client, proxy).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a slow-instance pick must be retried onto the fast instance, never a 504"
+        );
+    }
+}
+
+#[tokio::test]
+async fn max_retries_zero_disables_retry() {
+    // Same pool, but max_retries = 0: a request the round-robin sends to the slow instance now fails
+    // closed with 504 (no retry), while a fast-instance pick still succeeds — over a run we see
+    // BOTH, proving retry is genuinely off, not that every request happened to hit fast (ADR 000023).
+    let slow = spawn_slow_upstream(Duration::from_millis(500)).await;
+    let fast = spawn_slow_upstream(Duration::from_millis(0)).await;
+    let proxy = spawn_proxy(control_for_pool(&[slow, fast], 80, 0)).await;
+    let client = client();
+    wait_ready(&client, proxy).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let mut saw_ok = false;
+    let mut saw_timeout = false;
+    for _ in 0..24 {
+        match get(&client, proxy).await {
+            (StatusCode::OK, _) => saw_ok = true,
+            (StatusCode::GATEWAY_TIMEOUT, fault) => {
+                assert_eq!(fault.as_deref(), Some("upstream-timeout"));
+                saw_timeout = true;
+            }
+            (other, _) => panic!("unexpected status {other}"),
+        }
+    }
+    assert!(saw_ok, "a fast-instance pick still succeeds");
+    assert!(
+        saw_timeout,
+        "a slow-instance pick fails closed with 504 when retry is disabled"
     );
 }
