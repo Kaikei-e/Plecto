@@ -56,6 +56,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      # wasmtime 46 / cranelift (ADR 000021) is a large build, and this job holds BOTH the
+      # debug target/ (cargo test --all) and the release target/ (cargo build --release) at
+      # once. Free the runner's preinstalled bloat (~14GB: Android SDK / .NET / GHC) so both
+      # fit — inline rm, no third-party action (supply-chain stance). Best-effort (|| true).
+      - name: Free disk space for the wasmtime/cranelift build
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc || true
+          df -h /
       - uses: dtolnay/rust-toolchain@1.96.0
         with:
           components: clippy

@@ -7,6 +7,11 @@ repository.workspace = true
 
 [dependencies]
 wasmtime = { workspace = true }
+# M3 Stage 1 (ADR 000021): a minimal `block_on` to drive wasmtime's now-async `call_async` /
+# `instantiate_async` from the host's still-sync public API. The guest runs to completion on a
+# fiber without suspending (epoch is trap-mode, host-API imports never block), so a no-reactor
+# executor suffices. The server-side spawn_blocking removal (true async) is Stage 2.
+pollster = "0.4"
 anyhow = { workspace = true }
 redb = { workspace = true }
 parking_lot = { workspace = true }

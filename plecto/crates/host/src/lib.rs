@@ -49,6 +49,11 @@ mod bindings {
     wasmtime::component::bindgen!({
         path: "../../wit",
         world: "filter",
+        // M3 Stage 1 (ADR 000021): the guest's exported hooks (init / on-request / on-response) run
+        // via call_async on wasmtime fibers — the prerequisite for future WASI async host calls. The
+        // trivial plecto host-API IMPORTS stay sync (they never block, so they don't need to be
+        // async). Body / stream<u8> contract stays frozen until Stage 2.
+        exports: { default: async },
     });
 }
 
@@ -585,9 +590,12 @@ fn build_engine(alloc: Allocation) -> Result<Engine> {
     // advances the epoch; each Store sets a deadline before every guest call so a runaway
     // filter traps instead of hanging the worker (fail-closed).
     config.epoch_interruption(true);
-    // Sync path: we deliberately do NOT enable async_support on wasmtime 45 (ADR 000010).
-    // `memory_init_cow` stays at its default (enabled): every instance gets its own
-    // copy-on-write heap image — the safe posture against CVE-2022-39393 (ADR 000006).
+    // M3 Stage 1 (ADR 000021): the host runs the guest on wasmtime fibers via `call_async` and
+    // bridges it to its still-sync public API with `block_on` (the server-side spawn_blocking
+    // removal is Stage 2). wasmtime 46 needs no `Config::async_support` toggle (it is deprecated /
+    // a no-op) — the async path is selected by the bindgen `exports: async` config plus
+    // `instantiate_async` / `call_async`. `memory_init_cow` stays at its default (enabled): every
+    // instance gets its own copy-on-write heap image — safe against CVE-2022-39393 (ADR 000006).
     if let Allocation::Pooling = alloc {
         let mut pool = PoolingAllocationConfig::default();
         // Global per-kind slot budget for ALL trusted filters' pools combined (ADR 000012). The
@@ -759,8 +767,10 @@ impl LoadedInner {
         store.limiter(|s| &mut s.limits);
         // `init` is heavy (Tenet 4) → the generous init budget, not the tight per-request one.
         store.set_epoch_deadline(self.init_deadline_ms);
-        let filter = self.pre.instantiate(&mut store)?;
-        filter.call_init(&mut store)?;
+        // Async (ADR 000021): the guest runs on a fiber; `block_on` drives it to completion (it
+        // never suspends — epoch is trap-mode, host-API imports don't block) so this stays sync.
+        let filter = pollster::block_on(self.pre.instantiate_async(&mut store))?;
+        pollster::block_on(filter.call_init(&mut store))?;
         Ok(Instance { store, filter })
     }
 
@@ -1015,9 +1025,9 @@ impl LoadedFilter {
     ) -> std::result::Result<(RequestDecision, Vec<LogLine>), RunError> {
         match &self.trusted {
             // trusted: check an instance out of the pool (reuse / lazily build / fail closed).
-            Some(pool) => self
-                .inner
-                .run_pooled(pool, |filter, store| filter.call_on_request(store, req)),
+            Some(pool) => self.inner.run_pooled(pool, |filter, store| {
+                pollster::block_on(filter.call_on_request(store, req))
+            }),
             // untrusted: fresh instance + init every request (the isolation trade).
             None => {
                 let mut inst = self
@@ -1026,7 +1036,7 @@ impl LoadedFilter {
                     .map_err(RunError::Instantiate)?;
                 inst.store
                     .set_epoch_deadline(self.inner.request_deadline_ms);
-                match inst.filter.call_on_request(&mut inst.store, req) {
+                match pollster::block_on(inst.filter.call_on_request(&mut inst.store, req)) {
                     Ok(decision) => {
                         let logs = std::mem::take(&mut inst.store.data_mut().logs);
                         Ok((decision, logs))
@@ -1096,9 +1106,9 @@ impl LoadedFilter {
         resp: &HttpResponse,
     ) -> std::result::Result<(ResponseDecision, Vec<LogLine>), RunError> {
         match &self.trusted {
-            Some(pool) => self
-                .inner
-                .run_pooled(pool, |filter, store| filter.call_on_response(store, resp)),
+            Some(pool) => self.inner.run_pooled(pool, |filter, store| {
+                pollster::block_on(filter.call_on_response(store, resp))
+            }),
             None => {
                 let mut inst = self
                     .inner
@@ -1106,7 +1116,7 @@ impl LoadedFilter {
                     .map_err(RunError::Instantiate)?;
                 inst.store
                     .set_epoch_deadline(self.inner.request_deadline_ms);
-                match inst.filter.call_on_response(&mut inst.store, resp) {
+                match pollster::block_on(inst.filter.call_on_response(&mut inst.store, resp)) {
                     Ok(decision) => {
                         let logs = std::mem::take(&mut inst.store.data_mut().logs);
                         Ok((decision, logs))

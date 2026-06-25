@@ -14,7 +14,11 @@ license = "Apache-2.0"
 repository = "https://github.com/Kaikei-e/Plecto"
 
 [workspace.dependencies]
-wasmtime = "45.0.2"
+# Pinned to 46.0.0 exactly for the M3 Stage 1 host async migration (ADR 000021): wasmtime 46
+# (2026-06-22) ships Component Model async + WASI 0.3 by default. The async / bindgen API is still
+# moving at this release, so we hold the exact version (Cargo.lock pins the resolved build) rather
+# than letting it float; this lives on a migration branch, not main.
+wasmtime = "46.0.0"
 anyhow = "1"
 # redb: embedded transactional KV — durable host-state backend (ADR 000004).
 redb = "4.1"
