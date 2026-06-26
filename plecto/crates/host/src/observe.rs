@@ -230,6 +230,7 @@ impl FilterSpan {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Hook {
     OnRequest,
+    OnRequestBody,
     OnResponse,
 }
 
@@ -237,6 +238,7 @@ impl Hook {
     pub fn as_str(self) -> &'static str {
         match self {
             Hook::OnRequest => "on-request",
+            Hook::OnRequestBody => "on-request-body",
             Hook::OnResponse => "on-response",
         }
     }

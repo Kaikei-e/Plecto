@@ -62,6 +62,16 @@ interface types {
         %continue,
         modified(response-edit),
     }
+
+    // The typed outcome of a request-side BODY filter (buffer-then-decide, ADR 000025). v1 carries
+    // the buffered body as `list<u8>`; the deferred true-streaming increment swaps it to `stream<u8>`
+    // (the contract keeps room for a `body` resource then). Never a bare flag (Tenet 3).
+    variant request-body-decision {
+        // continue with the (possibly transformed) body
+        %continue(list<u8>),
+        // stop the chain and synthesise this response now (don't reach upstream)
+        short-circuit(http-response),
+    }
 }
 
 // --- host-API: deny-by-default capabilities (ADR 000006). One capability per
@@ -139,7 +149,7 @@ interface host-ratelimit {
 }
 
 world filter {
-    use types.{http-request, http-response, request-decision, response-decision};
+    use types.{http-request, http-response, request-decision, response-decision, request-body-decision};
 
     // granted capabilities (deny-by-default: only these are importable, ADR 000006)
     import host-log;
@@ -153,5 +163,9 @@ world filter {
 
     // hot path — one call per request / response
     export on-request: func(req: http-request) -> request-decision;
+    // body filter (buffer-then-decide, ADR 000025). v1: every filter exports it; the
+    // export-presence-based zero-copy bypass for header-only filters (ADR 000005 mechanism 2) is a
+    // follow-up. The host buffers the request body, calls this, and applies the decision.
+    export on-request-body: func(body: list<u8>) -> request-body-decision;
     export on-response: func(resp: http-response) -> response-decision;
 }
