@@ -526,4 +526,61 @@ mod tests {
             "one success restores after an eject (re-entry is possible)"
         );
     }
+
+    #[test]
+    fn round_robin_is_even_over_the_healthy_set_when_degraded() {
+        // With a MIDDLE instance ejected, the rotation must split evenly over whoever is left.
+        // The old forward-scan-from-cursor handed the dead instance's slot to its neighbour, so
+        // `[a, b(down), c]` skewed a:c to ~1:2. Rotating over the healthy SET removes that.
+        let reg = UpstreamRegistry::new();
+        reg.reconcile(&[upstream("u", &["a:1", "b:2", "c:3"], health(1, 1))])
+            .unwrap();
+        let g = reg.group("u").unwrap();
+        g.instances[0].record_probe_success(); // a:1 healthy
+        g.instances[2].record_probe_success(); // c:3 healthy, b:2 stays ejected
+
+        let mut a = 0u32;
+        let mut c = 0u32;
+        for _ in 0..600 {
+            match g.pick().unwrap().address() {
+                "a:1" => a += 1,
+                "c:3" => c += 1,
+                other => panic!("picked a down/unknown instance: {other}"),
+            }
+        }
+        assert_eq!(
+            a, c,
+            "degraded round-robin must split evenly over the healthy set (was ~1:2)"
+        );
+    }
+
+    #[test]
+    fn reconcile_carries_the_round_robin_cursor() {
+        // A reload must not reset the cursor to 0, or the first post-reload pick always lands on
+        // the head of the rotation — an index-0 bias under frequent reloads.
+        let reg = UpstreamRegistry::new();
+        reg.reconcile(&[upstream("u", &["a:1", "b:2", "c:3"], health(1, 3))])
+            .unwrap();
+        let g0 = reg.group("u").unwrap();
+        for i in 0..3 {
+            g0.instances[i].record_probe_success(); // all three healthy
+        }
+        // advance the cursor two steps: a:1, b:2 (cursor now at 2)
+        assert_eq!(g0.pick().unwrap().address(), "a:1");
+        assert_eq!(g0.pick().unwrap().address(), "b:2");
+
+        // reload with the SAME upstream + health policy → instances and health are preserved
+        reg.reconcile(&[upstream("u", &["a:1", "b:2", "c:3"], health(1, 3))])
+            .unwrap();
+        let g1 = reg.group("u").unwrap();
+        assert!(
+            g1.instances.iter().all(|i| i.is_healthy()),
+            "health survives an unchanged-policy reload (ADR 000017)"
+        );
+        assert_eq!(
+            g1.pick().unwrap().address(),
+            "c:3",
+            "the cursor carried across reload (would be a:1 if reset to 0)"
+        );
+    }
 }
