@@ -1,196 +1,254 @@
 # Plecto Performance
 
-A small, honest performance snapshot of Plecto's load-balancing fast path. The goal is
-**transparency about method**, not a leaderboard. Numbers here are an internal regression
-baseline; they are **not** a capacity guide and **not** a comparison against other proxies.
+An honest performance snapshot of Plecto's two halves: the **native load-balancing fast
+path** and the **WASM extension plane** (per-request filters). The goal is **transparency
+about method**, not a leaderboard. Every number here is an internal **regression baseline** —
+not a capacity guide, and not a comparison against other proxies.
 
-> Reports: **this page** covers the load-balancing fast path (throughput, latency, resilience).
-> The cost of the WASM extension plane (filter overhead, instance pooling, short-circuit) is in
-> [`wasm-filters.md`](wasm-filters.md).
+All components — load generator, Plecto, the upstream instances, and any tooling — run
+**co-resident on a single commodity developer host over loopback**, so absolute figures are
+bounded by that host's CPU, not by Plecto in isolation. Read them as **relative** signals.
 
 ## TL;DR
 
-- Under a closed-loop ramp, a single Plecto instance served a steady **~15k requests/second**
-  with a **median ~5 ms** and **p99 ~24 ms**, zero failed requests across ~1.5M requests.
-- Round-robin distribution across three upstream instances was **even** (≈ equal thirds).
-- **Resilience behaved as designed**: ejecting one upstream shifted traffic to the survivors
-  within ~1 s with **no client-visible errors**; a full upstream outage **failed closed with
-  HTTP 503** (no hangs), and the pool **recovered within ~1 s** of health being restored.
-- Reported tail latency depends heavily on the measurement model. We report the **open-loop**
-  tail as the honest one (see [Methodology](#methodology--why-the-numbers-look-the-way-they-do)).
+**Load-balancing fast path** (plaintext HTTP/1.1, 3 upstreams, trivial 0 ms backend):
 
-## Scope and honesty notes
+- Throughput peaks at **~17k req/s** (50–100 closed-loop VUs) with **p99 ≈ 7–12 ms** and zero
+  failures; it holds **~16k at 200 VUs** (p99 ≈ 27 ms) and degrades gracefully as the
+  co-resident host saturates past ~400 VUs.
+- An open-loop arrival rate at ~70% of peak (**~11.9k req/s**) sustains cleanly: **p50 0.69 ms,
+  p99 8.4 ms, p99.9 37 ms**, 0 failures.
+- Round-robin across three upstreams is **even to within one request** (33.3% each).
+- **Resilience is as designed**: ejecting one upstream shifts its traffic to the survivors in
+  ~1 s with **no client-visible errors**; a *total* outage **fails closed with HTTP 503** (no
+  hangs) and the pool **recovers within ~1 s** of health returning.
+- TLS termination (ALPN **h2**) costs real CPU under co-resident load — see the
+  [honesty note](#tls-termination-h2) before reading the gap as a pure server-side cost.
 
-- **Machine specifications are intentionally omitted.** All components — the load generator,
-  Plecto, the upstream instances, and the metrics stack — ran **co-resident on a single
-  commodity developer-class machine** over the loopback interface. Absolute throughput is
-  therefore bounded by loopback and CPU contention on that one host, not by Plecto in
-  isolation. Treat every absolute figure as a **relative / regression** signal.
-- **Upstream backends were trivial** (tiny static responses, no upstream latency). This is
-  deliberate: it isolates the **proxy + load-balancer overhead** rather than backend work.
-- This run covers **plaintext HTTP/1.1** only (the configuration exercised by the bundled
-  `examples/load-balancing`). HTTP/2 and HTTP/3 are out of scope here.
-- We make **no comparative claims**. Mature open-source proxies are referenced only for
-  shared methodology, not for ranking.
+**WASM extension plane** (the cost of running a decision as a sandboxed component):
 
-## Test environment
+- A **pooled** filter (init-once, instances reused) costs about **8% throughput** and **~1 ms
+  p99** versus a no-filter native baseline — cheap on the hot path.
+- The **same** filter run **fresh-per-request** drops to ~3.1k req/s vs ~14.2k pooled — a
+  **~4.6× difference**. Separating `init` from per-request work is what makes the plane cheap.
+- A rejected request (**HTTP 401 short-circuit**) is decided **in well under a millisecond and
+  never reaches the backend** — bad traffic is shed ~30–50× faster than good traffic is forwarded.
 
-| Item | Value |
-| --- | --- |
-| Subject | Plecto fast path, round-robin LB over **3 upstream instances** |
-| Health checking | active probe every **500 ms**, eject after **2** consecutive failures (≈ ~1 s) |
-| Protocol | HTTP/1.1, plaintext |
-| Topology | load generator, proxy, backends, and metrics all on one host (loopback) |
-| Hardware | **intentionally omitted** (single commodity machine) |
-| Load tool | [k6](https://grafana.com/docs/k6/latest/) (open- and closed-loop executors) |
-| Visualization | InfluxDB + Grafana (self-hosted, local only) |
+## Scope & honesty notes
 
-## Scenarios
+- **Machine specs intentionally omitted.** Single commodity host, loopback, everything
+  co-resident. Absolute throughput is contended; treat figures as relative / regression signals.
+- **Trivial upstreams** (tiny static responses, 0 ms latency by default) deliberately isolate
+  **proxy + LB + filter overhead** rather than backend work. A 15 ms synthetic backend is used
+  where realistic proportions matter (WASM W2).
+- The LB figures are **plaintext HTTP/1.1**, except the dedicated [TLS run](#tls-termination-h2)
+  which exercises rustls termination + ALPN h2.
+- **No comparative claims.** Mature proxies are cited only for shared methodology, never ranking.
+- Tooling: [k6](https://grafana.com/docs/k6/latest/) (open- and closed-loop executors); charts
+  rendered with matplotlib → WebP; an optional InfluxDB + Grafana stack provides live dashboards.
 
-Each scenario targets a single Plecto route (`/`) backed by one upstream pool of three
-instances. The k6 executor configuration is given so the shape is unambiguous and reproducible.
+---
 
-### S1 — Throughput ramp (closed-loop)
+# 1. Load-balancing fast path
 
-Find achievable throughput and latency as concurrency rises. A closed-loop (VU) model: each
-virtual user issues the next request only after the previous response.
+Subject: one Plecto route forwarding to an upstream pool of **3 instances**, round-robin pick
+over the healthy set, active health probe every **500 ms** with eject after **2** consecutive
+failures (≈ ~1 s to detect). The scenario mirrors the project's heavy-load scenario, reduced to
+a single host: the three upstream nodes become three loopback backends, so the run needs no
+external network.
 
-```js
-// k6 — ramping virtual users
-scenarios: {
-  ramping: {
-    executor: 'ramping-vus', startVUs: 0,
-    stages: [
-      { duration: '15s', target: 50 },
-      { duration: '30s', target: 50 },
-      { duration: '15s', target: 200 },
-      { duration: '30s', target: 200 },
-      { duration: '10s', target: 0 },
-    ],
-  },
-}
-```
+## Throughput & latency vs concurrency
 
-### S2 — Fixed arrival rate (open-loop)
+Closed-loop sweep — a fixed number of virtual users, each issuing its next request only after
+the previous response. Rising concurrency walks the load curve from comfortable to saturated.
 
-Measure **coordinated-omission-safe** tail latency. An open-loop model sends at a constant
-rate regardless of how quickly responses come back, so queueing shows up in the tail instead
-of being hidden.
+![Throughput vs concurrency](img/throughput_vs_concurrency.webp)
+![Latency percentiles vs concurrency](img/latency_vs_concurrency.webp)
 
-```js
-// k6 — constant arrival rate (rate set to ~70% of the S1 closed-loop max)
-scenarios: {
-  constant_rate: {
-    executor: 'constant-arrival-rate',
-    rate: /* requests/sec */, timeUnit: '1s', duration: '45s',
-    preAllocatedVUs: 200, maxVUs: 2000,
-  },
-}
-```
+| VUs | req/s | p50 | p95 | p99 | p99.9 | failed |
+| --- | --- | --- | --- | --- | --- | --- |
+| 50  | 16,917 | 2.70 ms | 5.34 ms | 7.08 ms | 9.84 ms | 0% |
+| 100 | **16,963** | 5.60 ms | 10.01 ms | 12.33 ms | 15.54 ms | 0% |
+| 200 | 15,974 | 11.92 ms | 22.05 ms | 27.22 ms | 35.06 ms | 0% |
+| 400 | 14,294 | 26.16 ms | 52.28 ms | 66.47 ms | 86.61 ms | 0% |
+| 800 | 7,815 | 48.67 ms | 107.22 ms | **1,941 ms** | 5,030 ms | 0.53% |
 
-### S3 — Resilience under load (open-loop + fault injection)
+Throughput peaks near **100 VUs**; beyond that the closed-loop adds latency faster than work,
+and at **800 VUs** the single host is overwhelmed (p99 collapses to ~2 s, first failures appear).
+The useful reading is the shape: a flat-then-declining throughput ceiling with an orderly
+latency climb, no cliff until genuine saturation.
 
-Hold a steady arrival rate and drive failures on a timeline to observe load-balancing and
-fail-closed behavior. The upstreams expose a toggle that flips their health endpoint; the
-harness drives the timeline below while k6 keeps sending traffic.
+## Tail latency under open-loop load
 
-```
-t ≈ 12 s   eject instance B               -> traffic should shift to A + C
-t ≈ 24 s   restore instance B             -> B should rejoin the rotation
-t ≈ 36 s   eject ALL instances            -> pool should fail closed (HTTP 503)
-t ≈ 46 s   restore ALL instances          -> pool should recover
-```
+Open-loop sends at a **constant arrival rate** regardless of how fast responses come back, so
+queueing surfaces in the tail instead of being hidden — the *coordinated-omission-safe* model.
+At **~70% of the measured peak** the host keeps up with a clean tail:
 
-## Results
+| Model | target | achieved | p50 | p95 | p99 | p99.9 | dropped | failed |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| open-loop, 0 ms backend | 11,873/s | 11,867 req/s | 0.69 ms | 2.51 ms | 8.40 ms | 37.23 ms | 158 | 0% |
 
-### Throughput and latency (indicative)
+Pushed closer to the host's ceiling the open-loop tail climbs steeply (an earlier run at ~10.9k/s
+saw p99.9 ≈ 1.4 s) — that divergence *is* the saturation signal, and it is why we treat the
+open-loop tail, not the optimistic closed-loop p99, as authoritative.
 
-> Single co-resident host, loopback, trivial backends. For relative comparison and regression
-> tracking only — not a capacity claim.
+## Round-robin distribution
 
-| Scenario | Model | Throughput | median | p95 | p99 | p99.9 | Failures |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| S1 ramp (→200 VUs) | closed-loop | ~15k req/s | ~4.7 ms | ~18 ms | ~24 ms | — | 0 |
-| S2 fixed rate | open-loop | ~10k req/s sustained | ~0.7 ms | ~6 ms | ~43 ms | ~1.4 s | 0 |
+![Round-robin distribution](img/rr_distribution.webp)
 
-In S2 the requested rate sat close to what this single host could sustain, so the open-loop
-tail (p99.9 ≈ 1.4 s) climbed sharply and a fraction of iterations were shed by the generator.
-That is expected and instructive: it marks where the host saturates, and it is **why we do not
-quote the closed-loop p99 (~24 ms) as the tail** — see Methodology.
+Over a steady window with all three upstreams healthy, the pool split **118,678 / 118,679 /
+118,678** requests — even to a single request (33.3% each). Round-robin holds under load.
 
-![Throughput by scenario](img/throughput_by_scenario.webp)
+## Resilience: ejection & fail-closed
 
-![Latency percentiles by scenario](img/latency_by_scenario.webp)
-
-### Load-balancing behavior (the portable findings)
-
-These observations are qualitative and do not depend on the host's specifications:
+A steady open-loop rate while a controller drives a fault timeline (`eject b` → `rejoin b` →
+`eject all` → `restore all`) and samples each upstream's served-count every second:
 
 ![Load balancing under fault injection](img/ejection_timeline.webp)
 
-*Steady ~2k req/s split across three upstreams. At **eject b** instance B's share falls to zero
-within ~1 s and the survivors carry on with **no failed requests**; at **eject all** the pool
-fails closed and every request returns HTTP 503 until **restore all**, after which traffic
-rebalances within ~1 s. (When only the middle instance is out, the round-robin skip sends its
-share to the next instance rather than splitting it evenly — visible as the uneven a/c bands.)*
+- **Even baseline.** ~6.9k req/s split three ways while healthy.
+- **Graceful ejection.** When **b** is driven unhealthy its share falls to zero within ~1 s and
+  the survivors (a + c) absorb the full load **with zero failed requests** — round-robin simply
+  skips the ejected instance.
+- **Fail-closed, not fail-open.** With **every** instance unhealthy, Plecto returns **HTTP 503**
+  promptly (no hang, no blind forward); the failed/s line jumps to the full offered rate. Over
+  the whole run **13.67%** of requests got a 503 — exactly those arriving with no healthy upstream.
+- **Fast recovery.** Restoring health returns instances to rotation within ~1 s.
 
-- **Even round-robin.** With all three instances healthy, traffic split into ≈ equal thirds.
-- **Graceful ejection.** After instance B was driven unhealthy, its share dropped to zero
-  within ~1 s (consistent with the 500 ms probe interval and a 2-failure threshold) and the
-  surviving instances absorbed the load **with zero client-visible errors**.
-- **Fail-closed, not fail-open.** With every instance unhealthy, Plecto returned **HTTP 503**
-  promptly rather than hanging or forwarding blindly. During that window ~14% of requests
-  received 503 — exactly the requests that arrived while no healthy upstream existed.
-- **Fast recovery.** Restoring health returned instances to rotation within ~1 s.
+## TLS termination (h2)
+
+The same LB path, re-run with rustls TLS termination so ALPN negotiates **HTTP/2**, against the
+plaintext HTTP/1.1 path at identical concurrency (200 VUs):
+
+![TLS vs plain](img/tls_vs_plain.webp)
+
+| Variant | req/s | p50 | p99 | failed |
+| --- | --- | --- | --- | --- |
+| plain (h1) | 15,694 | 12.15 ms | 27.87 ms | 0% |
+| tls (h2)   | 4,552  | 12.21 ms | 702 ms | 0% |
+
+> **Honesty note.** This gap is *not* a clean "rustls termination is 3.4× slower" number. On a
+> co-resident host the TLS handshake and per-record crypto are paid on **both** the k6 client and
+> the proxy, and HTTP/2 funnels all 200 VUs over a handful of multiplexed connections — so the
+> p99 inflation is largely client-side contention and h2 head-of-line, not server work alone. It
+> establishes that TLS+h2 has real cost here; isolating the server's share needs a load generator
+> on separate hardware (out of scope for this single-host baseline).
+
+---
+
+# 2. WASM extension plane
+
+Plecto runs each request's *decision* — auth, rewriting, rate limiting, policy — as a sandboxed
+**WebAssembly Component Model filter**, not native proxy code. This measures what that costs,
+changing only **how the decision runs**. The bundled `examples/wasm-bench` serves three routes
+that forward to the **same** backend:
+
+| Route | Decision path |
+| --- | --- |
+| `/baseline/*` | no filter — native fast path only |
+| `/trusted/*` | signed `filter-apikey` component, **pooled** (init-once, instances reused) |
+| `/ondemand/*` | the **same** component, **fresh instance per request** |
+
+`filter-apikey` is a real `plecto:filter` component: it reads `x-api-key`, stamps
+`x-authenticated-user` on a valid key and forwards, or returns a typed `short-circuit` **401** on
+a missing/invalid key (the upstream is never reached). It is cosign-signed and loaded through the
+production verify-then-load path (fail-closed).
+
+## Overhead & the value of pooling
+
+![Throughput by decision path](img/wasm_throughput.webp)
+![Per-request latency by decision path](img/wasm_latency.webp)
+
+> W1 — fixed 50 VUs, 0 ms backend, valid key. Isolates filter cost from upstream time.
+
+| Route | req/s | p50 | p95 | p99 |
+| --- | --- | --- | --- | --- |
+| baseline (no filter) | 15,452 | 2.96 ms | 5.63 ms | 7.42 ms |
+| pooled WASM filter | 14,238 | 3.16 ms | 6.36 ms | 8.54 ms |
+| on-demand WASM filter | 3,068 | 16.05 ms | 29.95 ms | 35.03 ms |
+
+The **pooled** filter — Plecto's default for trusted components — tracks the native baseline
+closely: about **8% less throughput**, **+0.2 ms median / +1.1 ms p99**. The *same* filter run
+**on-demand** (fresh, re-initialized every request) collapses to ~3.1k req/s — **~4.6× less
+throughput, ~5× the latency**. That gap is the cost of `init`, paid once when pooled and on every
+request when not.
+
+## Short-circuit: rejecting bad traffic at the edge
+
+![Accept vs reject latency](img/wasm_shortcircuit.webp)
+
+> W2 — fixed 2000 req/s, 15 ms backend, ~90% valid / ~10% bad keys. 71,990 accepted, 8,010 rejected.
+
+| Path | p50 | p95 | p99 |
+| --- | --- | --- | --- |
+| accept (200, forwarded) | 16.50 ms | 17.36 ms | 17.80 ms |
+| reject (401, short-circuited) | 0.31 ms | 0.50 ms | 0.76 ms |
+
+Accepted requests cost the 15 ms backend plus ~1.5–2.8 ms for filter + proxy — the pooled filter
+is a small fraction of a realistic request. Rejected requests are decided **at the edge in well
+under a millisecond** and never reach the upstream: bad traffic is cheap to refuse and harmless
+to the backend it would otherwise hit.
+
+**Why pooling matters.** A filter's lifecycle splits into an expensive, run-once `init` (compile
+regexes, seed host KV, …) and a lightweight per-request `on-request`. Trusted filters keep warm
+instances in a pool so the hot path re-pays only `on-request`; untrusted/on-demand filters rebuild
+per request for stronger isolation, re-paying `init` each time. (Filter faults or deadline
+overruns **fail closed** — 502/504 — exercised by the test suite, not this benchmark.)
+
+---
 
 ## Methodology — why the numbers look the way they do
 
-- **Open- vs closed-loop matters.** A closed-loop generator throttles itself whenever the
-  server slows down, which quietly hides queueing and under-reports tail latency — the
-  *coordinated omission* problem described by Gil Tene. An open-loop, fixed-rate generator
-  keeps offering load and surfaces the real tail. We therefore treat the open-loop figures as
-  authoritative for latency tails, and the closed-loop figures as a throughput ceiling.
-- **One host, loopback.** Co-residency means the load generator competes with Plecto and the
-  backends for CPU; absolute numbers would shift on dedicated hardware and a real network. We
-  publish them only as a baseline to catch regressions between changes.
-- **Prior art.** Open-source proxies and load tools have long published their methods openly —
-  for example HAProxy documents both method and results for its benchmarks, and the
-  fixed-rate / corrected-latency approach is standard in tools such as `wrk2` and k6. This
-  report follows that spirit of disclosing *how* a number was produced, without reusing anyone
-  else's text or figures.
+- **Open- vs closed-loop matters.** A closed-loop generator throttles itself whenever the server
+  slows, quietly hiding queueing and under-reporting the tail (Gil Tene's *coordinated omission*).
+  An open-loop, fixed-rate generator keeps offering load and surfaces the real tail. We treat
+  open-loop figures as authoritative for latency tails and closed-loop figures as a throughput ceiling.
+- **One host, loopback.** Co-residency means the generator competes with Plecto and the backends
+  for CPU; absolute numbers would shift on dedicated hardware and a real network. They exist to
+  catch regressions between changes, nothing more.
+- **Prior art.** Disclosing *how* a number was produced — open- vs closed-loop, corrected latency —
+  is standard in tools such as `wrk2` and k6, and in proxies that publish method alongside results.
+  This report follows that spirit using only its own measurements.
 
 ## Reproducing
 
-The subject is the bundled example:
+The tracked, in-repo subjects:
 
 ```bash
+# LB fast path (round-robin over 3 instances, plaintext HTTP/1.1):
 cargo run --release -p plecto-server --example load-balancing   # proxy on 127.0.0.1:8080
+
+# WASM filter plane (3 routes, one backend; BACKEND_LATENCY_MS models upstream time):
+BACKEND_LATENCY_MS=0  cargo run --release -p plecto-server --example wasm-bench   # :8085
 ```
 
-Then drive it with k6 using the scenario shapes above (closed-loop ramp, fixed-rate open-loop,
-and the S3 fault timeline). Any HTTP load generator that supports an open-loop / constant
-arrival-rate mode can reproduce the latency-tail figures.
+Drive either with k6 using the scenario shapes above — a **closed-loop** concurrency sweep
+(`constant-vus`), a **fixed-rate open-loop** run (`constant-arrival-rate`) for the tail and the
+ejection timeline, and an optional TLS leg (any HTTP/2-capable client over the
+[`tls-http`](../plecto/examples/tls-http) configuration). Per-instance traffic and the round-robin
+share come from each upstream's served-count (or the `X-Instance` response header); the resilience
+timeline is a 1-second aggregation over the fault window.
 
-The charts above are regenerated from the measured CSVs under [`data/`](data/) with:
+Charts are regenerated from the measured CSVs with matplotlib:
 
 ```bash
 python3 performance/plot.py     # reads performance/data/*.csv -> performance/img/*.webp
 ```
 
-`plot.py` needs only `matplotlib` (which brings `numpy` and `Pillow`; Pillow supplies the WebP
-encoder). The per-second resilience timeline in `data/ejection_timeline.csv` comes from tagging
-each response's `X-Instance` header onto a k6 counter and aggregating to 1-second buckets.
+(`matplotlib` brings `numpy` + `Pillow`; Pillow supplies the WebP encoder. The measured CSVs and
+the local heavy-load harness are git-untracked working data, like `bench/`.)
 
 ## Non-goals
 
 - Not a sizing or capacity guide.
-- Not a comparison against other proxies or load balancers.
+- Not a comparison against other proxies, gateways, or Wasm runtimes.
 - Not representative of production hardware, real networks, or non-trivial upstream work.
 
 ## References
 
-- Gil Tene, *coordinated omission*, summarized in ScyllaDB's [On Coordinated Omission](https://www.scylladb.com/2021/04/22/on-coordinated-omission/).
-- [k6 executors](https://grafana.com/docs/k6/latest/using-k6/scenarios/executors/) — closed-loop (VU) vs open-loop (arrival-rate) models.
+- Gil Tene, *coordinated omission* — summarized in ScyllaDB's [On Coordinated Omission](https://www.scylladb.com/2021/04/22/on-coordinated-omission/).
+- [k6 executors](https://grafana.com/docs/k6/latest/using-k6/scenarios/executors/) — closed-loop (`constant-vus`) vs open-loop (`constant-arrival-rate`) models.
 - [wrk2](https://github.com/giltene/wrk2) — constant throughput with corrected latency recording.
-- [OpenSearch — performance testing best practices](https://docs.opensearch.org/latest/benchmark/user-guide/optimizing-benchmarks/performance-testing-best-practices/) — general reproducibility guidance.
+- [Wasmtime](https://docs.wasmtime.dev/) — the pooling allocator and epoch interruption behind pooled vs on-demand filter instances.
+- [WebAssembly Component Model](https://component-model.bytecodealliance.org/) — the `plecto:filter` contract is a Component Model world.
 - [HAProxy benchmark transparency](https://www.haproxy.com/company/news/haproxy-kubernetes-ingress-controller-twice-as-fast-with-lowest-cpu-vs-four-competitors) — an example of publishing method alongside results.

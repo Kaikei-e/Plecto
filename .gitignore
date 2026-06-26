@@ -5,3 +5,6 @@ plecto/crates/filter-apikey/target
 docs/feedback
 docs/plans
 performance/data/*.csv
+# Local heavy-load LB benchmark harness (single-host, loopback; reproduces the
+# Tailscale heavy-load scenario standalone). Git-untracked like bench/.
+/test/

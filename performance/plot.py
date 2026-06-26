@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
 """Render Plecto's performance charts (WebP) from the measured CSVs in ``data/``.
 
-Outputs three figures into ``performance/img/``:
+Covers both planes documented in README.md:
 
-  * throughput_by_scenario.webp  — sustained requests/s per scenario (bar)
-  * latency_by_scenario.webp     — request-duration percentiles per scenario (grouped bar)
-  * ejection_timeline.webp       — per-upstream traffic + failed/s over the resilience run
+  Load-balancing fast path
+    * throughput_vs_concurrency.webp  — sustained req/s vs VUs (closed-loop sweep)
+    * latency_vs_concurrency.webp     — p50/p95/p99 vs VUs (log y)
+    * rr_distribution.webp            — per-instance share under steady load
+    * ejection_timeline.webp          — per-upstream traffic + 503/s over the fault run
+    * tls_vs_plain.webp               — TLS(h2) vs plain(h1) throughput & p99
 
-The CSVs were produced by driving the bundled ``examples/load-balancing`` with k6; the
-timeline CSV is a 1-second aggregation of k6 metrics (per-instance counts come from the
-``X-Instance`` response header tagged onto a custom counter). See ``data/`` and the report.
+  WASM extension plane
+    * wasm_throughput.webp            — req/s by decision path (baseline/pooled/on-demand)
+    * wasm_latency.webp               — per-request latency by decision path (log y)
+    * wasm_shortcircuit.webp          — accept vs reject latency (short-circuit 401)
+
+Each figure is guarded — a missing CSV just skips it.
 
 Usage:
     python3 plot.py                # reads ./data, writes ./img
@@ -33,12 +39,13 @@ IMG.mkdir(exist_ok=True)
 # A restrained, readable palette (instances a/b/c, plus a failure red).
 C_A, C_B, C_C = "#4C9F70", "#E1A53D", "#3D7AB5"
 C_FAIL = "#C0392B"
+C_P50, C_P95, C_P99 = "#3D7AB5", "#E1A53D", "#C0392B"
 DPI = 150
 
 
-def _read(path: pathlib.Path) -> list[dict[str, str]]:
-    with path.open() as fh:
-        return list(csv.DictReader(fh))
+def _read(path: pathlib.Path) -> list[dict]:
+    with path.open(newline="") as f:
+        return list(csv.DictReader(f))
 
 
 def _save(fig, name: str) -> None:
@@ -48,67 +55,88 @@ def _save(fig, name: str) -> None:
     print(f"wrote {out.relative_to(HERE)}")
 
 
-def throughput() -> None:
-    rows = _read(DATA / "throughput_by_scenario.csv")
-    labels = [r["scenario"] for r in rows]
-    vals = [int(r["rps"]) for r in rows]
+# ---------------------------------------------------------------- LB fast path
+def throughput_vs_concurrency() -> None:
+    rows = sorted(_read(DATA / "sweep.csv"), key=lambda r: int(r["vus"]))
+    vus = [int(r["vus"]) for r in rows]
+    rps = [float(r["rps"]) for r in rows]
     fig, ax = plt.subplots(figsize=(7.2, 4.0))
-    bars = ax.bar(labels, vals, color=[C_C, C_A, C_B], width=0.6)
-    ax.bar_label(bars, fmt="%d", padding=3, fontsize=10)
+    ax.plot(vus, rps, marker="o", color=C_C, lw=2.2)
+    for x, y in zip(vus, rps):
+        ax.annotate(f"{int(round(y))}", (x, y), textcoords="offset points",
+                    xytext=(0, 7), ha="center", fontsize=8)
+    ax.set_xlabel("concurrent VUs (closed-loop)")
     ax.set_ylabel("sustained requests / second")
-    ax.set_title("Throughput by scenario (single host, loopback — relative baseline)")
-    ax.set_ylim(0, max(vals) * 1.15)
-    ax.margins(x=0.08)
-    ax.grid(axis="y", alpha=0.3)
-    ax.tick_params(axis="x", labelsize=9)
-    _save(fig, "throughput_by_scenario.webp")
+    ax.set_title("Throughput vs concurrency (single host, loopback, 0 ms backend)")
+    ax.set_xticks(vus)
+    ax.set_ylim(0, max(rps) * 1.18)
+    ax.grid(alpha=0.3)
+    _save(fig, "throughput_vs_concurrency.webp")
 
 
-def latency() -> None:
-    rows = _read(DATA / "latency_by_scenario.csv")
-    pct = ["p50", "p90", "p95", "p99"]
-    x = range(len(pct))
+def latency_vs_concurrency() -> None:
+    rows = sorted(_read(DATA / "sweep.csv"), key=lambda r: int(r["vus"]))
+    vus = [int(r["vus"]) for r in rows]
     fig, ax = plt.subplots(figsize=(7.2, 4.0))
-    n = len(rows)
-    width = 0.8 / n
-    colors = [C_C, C_B]
-    for i, r in enumerate(rows):
-        vals = [float(r[p]) for p in pct]
-        off = (i - (n - 1) / 2) * width
-        bars = ax.bar([xi + off for xi in x], vals, width=width,
-                      label=r["scenario"], color=colors[i % len(colors)])
-        ax.bar_label(bars, fmt="%.1f", padding=2, fontsize=8)
-    ax.set_xticks(list(x))
-    ax.set_xticklabels(pct)
-    ax.set_ylabel("request duration (ms)")
-    ax.set_title("Latency percentiles by scenario")
+    for key, color, lbl in (("p50", C_P50, "p50"), ("p95", C_P95, "p95"), ("p99", C_P99, "p99")):
+        ax.plot(vus, [float(r[key]) for r in rows], marker="o", color=color, lw=2.0, label=lbl)
+    ax.set_xlabel("concurrent VUs (closed-loop)")
+    ax.set_ylabel("request duration (ms, log scale)")
+    ax.set_yscale("log")
+    ax.set_title("Latency percentiles vs concurrency")
+    ax.set_xticks(vus)
+    ax.legend(fontsize=9)
+    ax.grid(alpha=0.3, which="both")
+    _save(fig, "latency_vs_concurrency.webp")
+
+
+def rr_distribution() -> None:
+    rows = _read(DATA / "rr.csv")
+    labels = [r["instance"] for r in rows]
+    counts = [int(r["count"]) for r in rows]
+    total = sum(counts) or 1
+    fig, ax = plt.subplots(figsize=(6.4, 4.0))
+    bars = ax.bar(labels, counts, color=[C_A, C_B, C_C][: len(labels)], width=0.6)
+    for b, c in zip(bars, counts):
+        ax.text(b.get_x() + b.get_width() / 2, c, f"{c}\n({100 * c / total:.1f}%)",
+                ha="center", va="bottom", fontsize=9)
+    ax.axhline(total / len(labels), color="#444", ls="--", lw=1, alpha=0.7,
+               label=f"even share ({total // len(labels)})")
+    ax.set_ylabel("requests served")
+    ax.set_xlabel("upstream instance")
+    ax.set_title("Round-robin distribution under steady load (all healthy)")
+    ax.set_ylim(0, max(counts) * 1.2)
     ax.legend(fontsize=9)
     ax.grid(axis="y", alpha=0.3)
-    _save(fig, "latency_by_scenario.webp")
+    _save(fig, "rr_distribution.webp")
 
 
-def ejection() -> None:
+def ejection_timeline() -> None:
     rows = _read(DATA / "ejection_timeline.csv")
     t = [int(r["t"]) for r in rows]
-    a = [int(r["a"]) for r in rows]
-    b = [int(r["b"]) for r in rows]
-    c = [int(r["c"]) for r in rows]
-    failed = [int(r["failed"]) for r in rows]
+    a = [float(r["a"]) for r in rows]
+    b = [float(r["b"]) for r in rows]
+    c = [float(r["c"]) for r in rows]
+    failed = [float(r["failed"]) for r in rows]
+
+    events = []
+    epath = DATA / "ejection_events.csv"
+    if epath.exists():
+        events = [(int(r["t"]), r["label"]) for r in _read(epath)]
 
     fig, ax = plt.subplots(figsize=(9.5, 4.6))
     ax.stackplot(t, a, b, c, labels=["instance a", "instance b", "instance c"],
                  colors=[C_A, C_B, C_C], alpha=0.9)
     ax.plot(t, failed, color=C_FAIL, lw=2.2, label="failed / s (HTTP 503)")
 
-    events = [(12, "eject b"), (24, "rejoin b"), (36, "eject all"), (46, "restore all")]
-    top = max(max(a[i] + b[i] + c[i], failed[i]) for i in range(len(t)))
+    top = max(max(a[i] + b[i] + c[i], failed[i]) for i in range(len(t))) if t else 1
     for xt, lbl in events:
         ax.axvline(xt, color="#444", ls="--", lw=1, alpha=0.6)
         ax.text(xt + 0.4, top * 0.97, lbl, rotation=90, va="top", ha="left",
                 fontsize=8, color="#333")
 
     ax.set_xlim(min(t), max(t))
-    ax.set_ylim(0, top * 1.05)
+    ax.set_ylim(0, top * 1.08)
     ax.set_xlabel("time (s)")
     ax.set_ylabel("requests / second")
     ax.set_title("Load balancing under fault injection — per-upstream traffic & failures")
@@ -117,6 +145,35 @@ def ejection() -> None:
     _save(fig, "ejection_timeline.webp")
 
 
+def tls_vs_plain() -> None:
+    rows = {r["variant"]: r for r in _read(DATA / "tls.csv")}
+    order = [("plain (h1)", C_C), ("tls (h2)", C_A)]
+    labels = [v for v, _ in order if v in rows]
+    colors = [c for v, c in order if v in rows]
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(9.0, 4.0))
+
+    rps = [float(rows[v]["rps"]) for v in labels]
+    bars = ax1.bar(labels, rps, color=colors, width=0.55)
+    ax1.bar_label(bars, fmt="%d", padding=3, fontsize=9)
+    ax1.set_ylabel("requests / second")
+    ax1.set_title("Throughput")
+    ax1.set_ylim(0, max(rps) * 1.18)
+    ax1.grid(axis="y", alpha=0.3)
+
+    p99 = [float(rows[v]["p99"]) for v in labels]
+    bars2 = ax2.bar(labels, p99, color=colors, width=0.55)
+    ax2.bar_label(bars2, fmt="%.2f", padding=3, fontsize=9)
+    ax2.set_ylabel("p99 latency (ms)")
+    ax2.set_title("Tail latency")
+    ax2.set_ylim(0, max(p99) * 1.18)
+    ax2.grid(axis="y", alpha=0.3)
+
+    fig.suptitle("TLS termination overhead: TLS(h2) vs plain(h1), same LB path", fontsize=11)
+    fig.tight_layout()
+    _save(fig, "tls_vs_plain.webp")
+
+
+# ----------------------------------------------------------- WASM filter plane
 def wasm_throughput() -> None:
     rows = _read(DATA / "wasm_overhead.csv")
     labels = [r["route"] for r in rows]
@@ -182,15 +239,18 @@ def wasm_shortcircuit() -> None:
     _save(fig, "wasm_shortcircuit.webp")
 
 
-def _maybe(fn) -> None:
-    try:
-        fn()
-    except FileNotFoundError as e:
-        print(f"skip {fn.__name__}: missing {e.filename}")
+def main() -> None:
+    figs = (throughput_vs_concurrency, latency_vs_concurrency, rr_distribution,
+            ejection_timeline, tls_vs_plain,
+            wasm_throughput, wasm_latency, wasm_shortcircuit)
+    for fn in figs:
+        try:
+            fn()
+        except FileNotFoundError as e:
+            print(f"skip {fn.__name__}: missing {getattr(e, 'filename', e)}")
+        except Exception as e:
+            print(f"skip {fn.__name__}: {e}")
 
 
 if __name__ == "__main__":
-    for fn in (throughput, latency, ejection,
-               wasm_throughput, wasm_latency, wasm_shortcircuit):
-        _maybe(fn)
-    print("done")
+    main()
