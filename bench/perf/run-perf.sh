@@ -30,14 +30,34 @@ export K6_NO_USAGE_REPORT=true
 LB_ADDR="${LB_ADDR:-127.0.0.1:28080}"
 WASM_ADDR="${WASM_ADDR:-127.0.0.1:28085}"
 TLS_ADDR="${TLS_ADDR:-127.0.0.1:28443}"
+EDGE_ADDR="${EDGE_ADDR:-127.0.0.1:28086}"
 
 log(){ printf '\n\033[1;36m== %s ==\033[0m\n' "$*"; }
 gen(){ taskset -c "$GEN_CPUS" "$@"; }   # run a generator on the generator core set
 
+# Optional live dashboard (opt-in): INFLUX=1 brings up the local InfluxDB+Grafana stack
+# (bench/docker-compose.yml) and streams every k6 phase to it, so a run is watchable in real time at
+# http://localhost:3000. Pulling the two images is a one-time SETUP fetch; the load itself stays
+# fully on loopback (generators + proxy + in-process upstreams), telemetry off. Unset (default) =
+# no docker, CSV + matplotlib charts only.
+INFLUX_OUT=()
+influx_down(){ :; }
+if [[ "${INFLUX:-}" == "1" ]]; then
+  COMPOSE=(docker compose -f "$BENCH/docker-compose.yml")
+  influx_down(){ "${COMPOSE[@]}" down -v >/dev/null 2>&1 || true; }
+  log "INFLUX=1 — bringing up the local InfluxDB + Grafana dashboard (one-time image pull)"
+  "${COMPOSE[@]}" up -d
+  for _ in $(seq 60); do curl -fsS "http://localhost:8086/ping" >/dev/null 2>&1 && break; sleep 1; done
+  curl -fsS -XPOST "http://localhost:8086/query" --data-urlencode "q=DROP DATABASE k6"   >/dev/null 2>&1 || true
+  curl -fsS -XPOST "http://localhost:8086/query" --data-urlencode "q=CREATE DATABASE k6" >/dev/null 2>&1 || true
+  INFLUX_OUT=(--out "influxdb=http://localhost:8086/k6")
+  echo "  Grafana: http://localhost:3000/d/plecto-lb-k6  (anonymous Admin)"
+fi
+
 PROXY_PID=""
 BLOG=""
 stop_proxy(){ [[ -n "$PROXY_PID" ]] && kill "$PROXY_PID" 2>/dev/null; wait "$PROXY_PID" 2>/dev/null; PROXY_PID=""; }
-trap stop_proxy EXIT
+trap 'stop_proxy; influx_down' EXIT
 
 # launch <example> <addr> <health_url|""> [env KEY=VAL ...]
 # health_url empty => skip the http health loop (caller probes itself, e.g. TLS over https).
@@ -67,7 +87,7 @@ phase_sweep(){
   local tmp; tmp="$(mktemp -d)"
   for vus in 50 100 200 400 800; do
     log "  VU=$vus"
-    gen "$K6" run -q \
+    gen "$K6" run -q "${INFLUX_OUT[@]}" \
       -e TARGET="http://$LB_ADDR/" -e VUS=$vus -e DUR=60s -e OUT="$tmp/vu$vus.json" \
       "$BENCH/k6/lb-sweep-step.js" 2>&1 | tail -1
   done
@@ -98,7 +118,7 @@ phase_openloop(){
   rate="${OPENLOOP_RATE:-$(python3 -c "print(max(500,int($peak*0.7)))")}"
   echo "  closed-loop peak≈${peak} rps -> open-loop rate=${rate} rps"
   launch load-balancing "$LB_ADDR" "http://$LB_ADDR/" || return 1
-  gen "$K6" run -q \
+  gen "$K6" run -q "${INFLUX_OUT[@]}" \
     -e TARGET="http://$LB_ADDR/" -e RATE=$rate -e DUR=90s -e OUT="$DATA/openloop.json" \
     "$BENCH/k6/lb-openloop.js" 2>&1 | tail -2
   stop_proxy
@@ -150,7 +170,7 @@ phase_wasm(){
 
   log "Phase 3.3 — short-circuit mixed (k6 2000 rps, 15 ms backend, 90/10) -> wasm_mixed.csv"
   launch wasm-bench "$WASM_ADDR" "http://$WASM_ADDR/baseline/x" BACKEND_LATENCY_MS=15 || return 1
-  gen "$K6" run -q -e BASE="http://$WASM_ADDR" -e RATE=2000 -e DUR=60s -e OUT="$tmp/mixed.json" \
+  gen "$K6" run -q "${INFLUX_OUT[@]}" -e BASE="http://$WASM_ADDR" -e RATE=2000 -e DUR=60s -e OUT="$tmp/mixed.json" \
     "$BENCH/k6-wasm/mixed.js" 2>&1 | tail -2
   stop_proxy
   python3 -c '
@@ -220,10 +240,108 @@ time.sleep(6)
   stop_proxy
 }
 
+# ---------------------------------------------------------------- Phase 6 rate limit (ADR 000026)
+phase_ratelimit(){
+  local tmp; tmp="$(mktemp -d)"
+  # -- 6.1 overhead: a generous (never-deny) bucket isolates the limiter's hot-path cost. Spread the
+  # load across many keys (realistic multi-tenant), compare /ratelimit vs the no-filter /baseline. --
+  log "Phase 6.1 — rate-limit overhead (generous bucket, multi-key) -> ratelimit_overhead.csv"
+  launch edge-bench "$EDGE_ADDR" "http://$EDGE_ADDR/baseline/x" || return 1
+  for rt in baseline ratelimit; do
+    gen "$K6" run -q "${INFLUX_OUT[@]}" -e BASE="http://$EDGE_ADDR" -e ROUTE_PATH="/$rt" \
+      -e KEYS=1000 -e VUS=50 -e DUR=30s -e OUT="$tmp/ov_$rt.json" \
+      "$BENCH/k6-wasm/ratelimit-overhead.js" 2>&1 | tail -1
+  done
+  stop_proxy
+  python3 -c '
+import json,csv,sys
+with open(sys.argv[3],"w",newline="") as o:
+    w=csv.writer(o); w.writerow(["route","rps","p50","p99"])
+    for f in sys.argv[1:3]:
+        d=json.load(open(f)); w.writerow([d["route"],round(d["rps"],1),round(d["p50"],3),round(d["p99"],3)])
+' "$tmp/ov_baseline.json" "$tmp/ov_ratelimit.json" "$DATA/ratelimit_overhead.csv"
+  cat "$DATA/ratelimit_overhead.csv"
+
+  # -- 6.2 enforcement + fairness: a TIGHT bucket (refill 1000/s, burst 2000) host-set in the manifest.
+  # Offer well above the limit and watch the allowed rate converge to the refill rate; a hot key must
+  # not starve a light one (independent per-key state). --
+  log "Phase 6.2 — enforcement + fairness (tight bucket, refill 1000/s) -> ratelimit_{enforce,fairness}.csv"
+  launch edge-bench "$EDGE_ADDR" "http://$EDGE_ADDR/baseline/x" \
+    RL_CAPACITY=2000 RL_REFILL_TOKENS=1000 RL_REFILL_INTERVAL_MS=1000 || return 1
+  gen "$K6" run -q "${INFLUX_OUT[@]}" -e BASE="http://$EDGE_ADDR" -e RATE=5000 -e DUR=30s \
+    -e OUT="$tmp/enforce.json" "$BENCH/k6-wasm/ratelimit-enforce.js" 2>&1 | tail -1
+  gen "$K6" run -q "${INFLUX_OUT[@]}" -e BASE="http://$EDGE_ADDR" -e HOT_RATE=4000 -e LIGHT_RATE=500 \
+    -e DUR=30s -e OUT="$tmp/fairness.json" "$BENCH/k6-wasm/ratelimit-fairness.js" 2>&1 | tail -1
+  stop_proxy
+  python3 -c '
+import json,sys
+d=json.load(open(sys.argv[1]))
+print("metric,value")
+for k in ("target_rps","achieved_rps","allowed_rps","limited_frac","accept_p50","accept_p99","limit_p99","accepted","limited"):
+    print(f"{k},{round(d[k],3)}")
+' "$tmp/enforce.json" > "$DATA/ratelimit_enforce.csv"
+  python3 -c '
+import json,csv,sys
+d=json.load(open(sys.argv[1]))
+with open(sys.argv[2],"w",newline="") as o:
+    w=csv.writer(o); w.writerow(["key","offered_rps","allowed_rps","shed_frac"])
+    hot_shed=d["hot_429"]/max(1,d["hot_ok"]+d["hot_429"])
+    w.writerow(["hot",d["hot_offered_rps"],round(d["hot_allowed_rps"],1),round(hot_shed,4)])
+    w.writerow(["light",d["light_offered_rps"],round(d["light_allowed_rps"],1),round(d["light_429_frac"],4)])
+' "$tmp/fairness.json" "$DATA/ratelimit_fairness.csv"
+  echo "--- enforce ---"; cat "$DATA/ratelimit_enforce.csv"
+  echo "--- fairness ---"; cat "$DATA/ratelimit_fairness.csv"
+}
+
+# ---------------------------------------------------------------- Phase 7 request body (ADR 000025)
+phase_body(){
+  log "Phase 7 — request-body hook overhead + payload sweep -> body.csv"
+  launch edge-bench "$EDGE_ADDR" "http://$EDGE_ADDR/baseline/x" || return 1
+  local tmp; tmp="$(mktemp -d)"
+  local rss=""
+  { echo "size,route,rps,req_mbps,p50,p99"
+    for size in 1024 102400 1048576; do
+      for rt in baseline body; do
+        gen "$K6" run -q "${INFLUX_OUT[@]}" -e BASE="http://$EDGE_ADDR" -e ROUTE_PATH="/$rt" \
+          -e SIZE=$size -e VUS=50 -e DUR=20s -e OUT="$tmp/b_${size}_$rt.json" \
+          "$BENCH/k6-wasm/body-transform.js" >/dev/null 2>&1
+        python3 -c '
+import json,sys
+d=json.load(open(sys.argv[1]))
+print("%d,%s,%.1f,%.2f,%.3f,%.3f"%(d["size"],d["route"],d["rps"],d["req_mbps"],d["p50"],d["p99"]))
+' "$tmp/b_${size}_$rt.json"
+        # Sample the proxy's RSS right after the largest /body run to size the buffer-then-decide cost.
+        [[ "$size" == 1048576 && "$rt" == body ]] && rss="$(grep VmRSS /proc/$PROXY_PID/status | awk '{print $2}')"
+      done
+    done; } > "$DATA/body.csv"
+  stop_proxy
+  cat "$DATA/body.csv"
+  [[ -n "$rss" ]] && echo "VmRSS during 1MB /body (50 VUs): ${rss} kB"
+}
+
+# ---------------------------------------------------------------- Phase 8 connection churn
+phase_churn(){
+  log "Phase 8 — connection churn: keep-alive vs cold-connection (plain h1) -> churn.csv"
+  launch edge-bench "$EDGE_ADDR" "http://$EDGE_ADDR/baseline/x" || return 1
+  local tmp; tmp="$(mktemp -d)"
+  gen "$OHA" -z 30s -c 50 --no-tui --output-format json "http://$EDGE_ADDR/baseline/x" > "$tmp/ka.json" 2>/dev/null
+  echo "  keep-alive        -> $(oha_row "$tmp/ka.json")"
+  gen "$OHA" -z 30s -c 50 --no-tui --disable-keepalive --output-format json "http://$EDGE_ADDR/baseline/x" > "$tmp/cold.json" 2>/dev/null
+  echo "  cold (TCP/req)    -> $(oha_row "$tmp/cold.json")"
+  stop_proxy
+  { echo "variant,rps,p50,p99"
+    add(){ read -r rps p50 _ _ p99 _ <<<"$(oha_row "$2")"; echo "$1,$rps,$p50,$p99"; }
+    add "keep-alive" "$tmp/ka.json"
+    add "cold (TCP/req)" "$tmp/cold.json"; } > "$DATA/churn.csv"
+  cat "$DATA/churn.csv"
+}
+
 case "${1:-all}" in
   sweep) phase_sweep;; openloop) phase_openloop;; rr) phase_rr;; ejection) phase_ejection;;
   wasm) phase_wasm;; tls) phase_tls;; footprint) phase_footprint;;
-  all) phase_sweep; phase_openloop; phase_rr; phase_ejection; phase_wasm; phase_tls; phase_footprint;;
+  ratelimit) phase_ratelimit;; body) phase_body;; churn) phase_churn;;
+  all) phase_sweep; phase_openloop; phase_rr; phase_ejection; phase_wasm; phase_tls; \
+       phase_ratelimit; phase_body; phase_churn; phase_footprint;;
   *) echo "unknown phase: $1"; exit 2;;
 esac
 log "done: $1"

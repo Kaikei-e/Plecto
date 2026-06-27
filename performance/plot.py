@@ -239,10 +239,136 @@ def wasm_shortcircuit() -> None:
     _save(fig, "wasm_shortcircuit.webp")
 
 
+# ------------------------------------------------------- rate limiting (ADR 000026)
+def ratelimit_overhead() -> None:
+    rows = {r["route"].lstrip("/"): r for r in _read(DATA / "ratelimit_overhead.csv")}
+    order = [("baseline", C_C), ("ratelimit", C_B)]
+    labels = [v for v, _ in order if v in rows]
+    colors = [c for v, c in order if v in rows]
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(9.0, 4.0))
+
+    rps = [float(rows[v]["rps"]) for v in labels]
+    bars = ax1.bar(labels, rps, color=colors, width=0.55)
+    ax1.bar_label(bars, fmt="%d", padding=3, fontsize=9)
+    ax1.set_ylabel("requests / second")
+    ax1.set_title("Throughput")
+    ax1.set_ylim(0, max(rps) * 1.18)
+    ax1.grid(axis="y", alpha=0.3)
+
+    p99 = [float(rows[v]["p99"]) for v in labels]
+    bars2 = ax2.bar(labels, p99, color=colors, width=0.55)
+    ax2.bar_label(bars2, fmt="%.2f", padding=3, fontsize=9)
+    ax2.set_ylabel("p99 latency (ms)")
+    ax2.set_title("Tail latency")
+    ax2.set_ylim(0, max(p99) * 1.18)
+    ax2.grid(axis="y", alpha=0.3)
+
+    fig.suptitle("Rate-limit overhead: never-deny bucket vs no-filter baseline", fontsize=11)
+    fig.tight_layout()
+    _save(fig, "ratelimit_overhead.webp")
+
+
+def ratelimit_enforce() -> None:
+    m = {r["metric"]: float(r["value"]) for r in _read(DATA / "ratelimit_enforce.csv")}
+    offered, allowed = m["target_rps"], m["allowed_rps"]
+    shed = m.get("limited_frac", 0.0)
+    fig, ax = plt.subplots(figsize=(6.8, 4.2))
+    bars = ax.bar(["offered", "allowed (200)"], [offered, allowed],
+                  color=[C_B, C_A], width=0.55)
+    ax.bar_label(bars, fmt="%d", padding=3, fontsize=10)
+    ax.set_ylabel("requests / second")
+    ax.set_ylim(0, offered * 1.2)
+    ax.set_title(f"Rate-limit enforcement: {shed * 100:.0f}% shed as 429, "
+                 f"allowed converges to the host bucket's refill rate")
+    ax.grid(axis="y", alpha=0.3)
+    _save(fig, "ratelimit_enforce.webp")
+
+
+def ratelimit_fairness() -> None:
+    rows = {r["key"]: r for r in _read(DATA / "ratelimit_fairness.csv")}
+    keys = [k for k in ("hot", "light") if k in rows]
+    x = range(len(keys))
+    width = 0.38
+    fig, ax = plt.subplots(figsize=(7.0, 4.2))
+    offered = [float(rows[k]["offered_rps"]) for k in keys]
+    allowed = [float(rows[k]["allowed_rps"]) for k in keys]
+    b1 = ax.bar([i - width / 2 for i in x], offered, width=width, label="offered", color=C_B)
+    b2 = ax.bar([i + width / 2 for i in x], allowed, width=width, label="allowed (200)", color=C_A)
+    ax.bar_label(b1, fmt="%d", padding=2, fontsize=8)
+    ax.bar_label(b2, fmt="%d", padding=2, fontsize=8)
+    ax.set_xticks(list(x))
+    ax.set_xticklabels([f"{k} key" for k in keys])
+    ax.set_ylabel("requests / second")
+    ax.set_title("Per-key fairness: a hot key is throttled to its bucket rate; a light key passes")
+    ax.legend(fontsize=9)
+    ax.grid(axis="y", alpha=0.3)
+    _save(fig, "ratelimit_fairness.webp")
+
+
+# ------------------------------------------------------- request body hook (ADR 000025)
+def body_hook() -> None:
+    rows = _read(DATA / "body.csv")
+    sizes = sorted({int(r["size"]) for r in rows})
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(9.4, 4.2))
+    for route, color in (("baseline", C_C), ("body", C_B)):
+        sel = {int(r["size"]): r for r in rows if r["route"].lstrip("/") == route}
+        if not sel:
+            continue
+        mbps = [float(sel[s]["req_mbps"]) for s in sizes if s in sel]
+        p99 = [float(sel[s]["p99"]) for s in sizes if s in sel]
+        xs = [s for s in sizes if s in sel]
+        ax1.plot(xs, mbps, marker="o", color=color, lw=2.0, label=route)
+        ax2.plot(xs, p99, marker="o", color=color, lw=2.0, label=route)
+    for ax in (ax1, ax2):
+        ax.set_xscale("log")
+        ax.set_xticks(sizes)
+        ax.set_xticklabels([f"{s // 1024}K" if s < 1 << 20 else f"{s >> 20}M" for s in sizes])
+        ax.set_xlabel("request body size")
+        ax.grid(alpha=0.3, which="both")
+        ax.legend(fontsize=9)
+    ax1.set_ylabel("request-body throughput (MB/s)")
+    ax1.set_title("Throughput")
+    ax2.set_ylabel("p99 latency (ms)")
+    ax2.set_yscale("log")
+    ax2.set_title("Tail latency")
+    fig.suptitle("Request-body hook (buffer→transform) vs streaming passthrough, by payload size",
+                 fontsize=11)
+    fig.tight_layout()
+    _save(fig, "body.webp")
+
+
+# ------------------------------------------------------- connection churn
+def churn() -> None:
+    rows = {r["variant"]: r for r in _read(DATA / "churn.csv")}
+    order = [("keep-alive", C_A), ("cold (TCP/req)", C_FAIL)]
+    labels = [v for v, _ in order if v in rows]
+    colors = [c for v, c in order if v in rows]
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(9.0, 4.0))
+    rps = [float(rows[v]["rps"]) for v in labels]
+    b1 = ax1.bar(labels, rps, color=colors, width=0.55)
+    ax1.bar_label(b1, fmt="%d", padding=3, fontsize=9)
+    ax1.set_ylabel("requests / second")
+    ax1.set_title("Throughput")
+    ax1.set_ylim(0, max(rps) * 1.18)
+    ax1.grid(axis="y", alpha=0.3)
+    p99 = [float(rows[v]["p99"]) for v in labels]
+    b2 = ax2.bar(labels, p99, color=colors, width=0.55)
+    ax2.bar_label(b2, fmt="%.2f", padding=3, fontsize=9)
+    ax2.set_ylabel("p99 latency (ms)")
+    ax2.set_title("Tail latency")
+    ax2.set_ylim(0, max(p99) * 1.18)
+    ax2.grid(axis="y", alpha=0.3)
+    fig.suptitle("Connection churn: a TCP handshake per request vs a kept-alive connection",
+                 fontsize=11)
+    fig.tight_layout()
+    _save(fig, "churn.webp")
+
+
 def main() -> None:
     figs = (throughput_vs_concurrency, latency_vs_concurrency, rr_distribution,
             ejection_timeline, tls_vs_plain,
-            wasm_throughput, wasm_latency, wasm_shortcircuit)
+            wasm_throughput, wasm_latency, wasm_shortcircuit,
+            ratelimit_overhead, ratelimit_enforce, ratelimit_fairness, body_hook, churn)
     for fn in figs:
         try:
             fn()
