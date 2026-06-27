@@ -60,7 +60,8 @@ mod bindings {
 // One canonical set of contract types for callers and tests.
 pub use bindings::plecto::filter::host_log::Level as LogLevel;
 pub use bindings::plecto::filter::types::{
-    Header, HttpRequest, HttpResponse, RequestDecision, RequestEdit, ResponseDecision, ResponseEdit,
+    Header, HttpRequest, HttpResponse, RequestBodyDecision, RequestDecision, RequestEdit,
+    ResponseDecision, ResponseEdit,
 };
 use bindings::plecto::filter::{host_clock, host_counter, host_kv, host_log, host_ratelimit};
 use bindings::{Filter, FilterPre};
@@ -1037,6 +1038,60 @@ impl LoadedFilter {
                 inst.store
                     .set_epoch_deadline(self.inner.request_deadline_ms);
                 match pollster::block_on(inst.filter.call_on_request(&mut inst.store, req)) {
+                    Ok(decision) => {
+                        let logs = std::mem::take(&mut inst.store.data_mut().logs);
+                        Ok((decision, logs))
+                    }
+                    Err(e) => Err(RunError::from_call(e)),
+                }
+            }
+        }
+    }
+
+    /// Run the request-side BODY hook (buffer-then-decide, ADR 000025). The host hands the filter
+    /// the fully-buffered request body; the filter returns the (possibly transformed) body to
+    /// continue, or a `short-circuit` response (synthesised before upstream is reached). Same
+    /// fail-closed contract and span emission as `on_request`.
+    pub fn on_request_body(
+        &self,
+        body: &[u8],
+        trace: &RequestTrace,
+    ) -> std::result::Result<(RequestBodyDecision, Vec<LogLine>), RunError> {
+        let start = SystemTime::now();
+        let elapsed = Instant::now();
+        let result = self.run_on_request_body(body);
+        let outcome = match &result {
+            Ok((RequestBodyDecision::Continue(_), _)) => SpanOutcome::Continue,
+            Ok((RequestBodyDecision::ShortCircuit(_), _)) => SpanOutcome::ShortCircuit,
+            Err(err) => SpanOutcome::from(err),
+        };
+        self.emit_span(
+            trace,
+            Hook::OnRequestBody,
+            outcome,
+            start,
+            elapsed.elapsed(),
+            &result,
+        );
+        result
+    }
+
+    fn run_on_request_body(
+        &self,
+        body: &[u8],
+    ) -> std::result::Result<(RequestBodyDecision, Vec<LogLine>), RunError> {
+        match &self.trusted {
+            Some(pool) => self.inner.run_pooled(pool, |filter, store| {
+                pollster::block_on(filter.call_on_request_body(store, body))
+            }),
+            None => {
+                let mut inst = self
+                    .inner
+                    .instantiate_initialized()
+                    .map_err(RunError::Instantiate)?;
+                inst.store
+                    .set_epoch_deadline(self.inner.request_deadline_ms);
+                match pollster::block_on(inst.filter.call_on_request_body(&mut inst.store, body)) {
                     Ok(decision) => {
                         let logs = std::mem::take(&mut inst.store.data_mut().logs);
                         Ok((decision, logs))

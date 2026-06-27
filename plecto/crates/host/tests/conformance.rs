@@ -10,8 +10,8 @@
 
 use plecto_host::test_support::{TestSigner, bound_sbom};
 use plecto_host::{
-    Host, HttpResponse, Isolation, LoadOptions, RequestTrace, ResponseDecision, SignedArtifact,
-    TrustPolicy,
+    Host, HttpResponse, Isolation, LoadOptions, RequestBodyDecision, RequestTrace,
+    ResponseDecision, SignedArtifact, TrustPolicy,
 };
 
 fn component_bytes() -> Vec<u8> {
@@ -260,5 +260,45 @@ fn load_rejects_filter_id_with_namespace_delimiter() {
             e.to_string().contains("delimiter"),
             "rejection should name the delimiter, got: {e}"
         ),
+    }
+}
+
+// --- ADR 000025: the request-side body hook (buffer-then-decide, v1 list<u8>) ---
+
+#[test]
+fn request_body_hook_transforms_then_continues() {
+    // buffer-then-decide: the host hands the filter the whole body; filter-hello uppercases it and
+    // continues. The transformed bytes round-trip through the host's `on_request_body`.
+    let fx = fixture();
+    let filter = fx
+        .host()
+        .load("filter-hello", &fx.artifact(), LoadOptions::untrusted())
+        .unwrap();
+
+    let (decision, _logs) = filter
+        .on_request_body(b"hello world", &RequestTrace::root())
+        .unwrap();
+    match decision {
+        RequestBodyDecision::Continue(body) => assert_eq!(body, b"HELLO WORLD".to_vec()),
+        RequestBodyDecision::ShortCircuit(_) => panic!("expected continue with transformed body"),
+    }
+}
+
+#[test]
+fn request_body_hook_short_circuits_before_upstream() {
+    // A body carrying the marker is blocked 403 — and because the host applies the decision before
+    // forwarding (buffer-then-decide), the short-circuit never reaches upstream.
+    let fx = fixture();
+    let filter = fx
+        .host()
+        .load("filter-hello", &fx.artifact(), LoadOptions::untrusted())
+        .unwrap();
+
+    let (decision, _logs) = filter
+        .on_request_body(b"please deny-body now", &RequestTrace::root())
+        .unwrap();
+    match decision {
+        RequestBodyDecision::ShortCircuit(resp) => assert_eq!(resp.status, 403),
+        RequestBodyDecision::Continue(_) => panic!("expected short-circuit 403 on the marker body"),
     }
 }

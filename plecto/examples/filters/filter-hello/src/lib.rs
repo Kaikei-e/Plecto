@@ -147,6 +147,28 @@ impl Guest for FilterHello {
         }
     }
 
+    fn on_request_body(body: Vec<u8>) -> RequestBodyDecision {
+        // buffer-then-decide (ADR 000025): the host buffered the whole body and handed it over.
+        // Short-circuit on a marker (exercises the SC path), otherwise transform (uppercase) and
+        // continue — both before upstream is reached, so a short-circuit is always clean.
+        host_log::log(host_log::Level::Info, "filter-hello: on-request-body");
+        if body
+            .windows(9)
+            .any(|w| w.eq_ignore_ascii_case(b"deny-body"))
+        {
+            RequestBodyDecision::ShortCircuit(HttpResponse {
+                status: 403,
+                headers: vec![Header {
+                    name: "x-plecto".to_string(),
+                    value: "blocked-body".to_string(),
+                }],
+                body: b"blocked body by filter-hello".to_vec(),
+            })
+        } else {
+            RequestBodyDecision::Continue(body.to_ascii_uppercase())
+        }
+    }
+
     fn on_response(resp: HttpResponse) -> ResponseDecision {
         // Opt-in response rewrite (gated on a header so default responses still `continue`):
         // exercises the response-side chain dispatch + edit application (ADR 000007).

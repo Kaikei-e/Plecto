@@ -111,6 +111,13 @@ impl Guest for FilterApiKey {
         })
     }
 
+    fn on_request_body(body: Vec<u8>) -> RequestBodyDecision {
+        // An auth gate doesn't touch the body — pass it through unchanged (buffer-then-decide,
+        // ADR 000025). Until the export-presence-based bypass (ADR 000005 mechanism 2) lands, a
+        // header-only filter still implements a trivial pass-through.
+        RequestBodyDecision::Continue(body)
+    }
+
     fn on_response(_resp: HttpResponse) -> ResponseDecision {
         ResponseDecision::Continue
     }
