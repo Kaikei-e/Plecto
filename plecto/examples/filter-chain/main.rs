@@ -126,6 +126,10 @@ id = "hello"
 source = "filters/hello"
 digest = "{digest}"
 isolation = "trusted"
+# Host-side token bucket for this filter (ADR 000026): capacity 2, no meaningful refill — so the
+# `x-plecto-ratelimit` demo shows 200, 200, 429. Without it the host fails closed (deny) and the
+# first request is already 429.
+ratelimit = {{ capacity = 2, refill_tokens = 1, refill_interval_ms = 60000 }}
 
 [[upstream]]
 name = "app"

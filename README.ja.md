@@ -137,18 +137,20 @@ interface host-kv      { get: func(key: string) -> option<list<u8>>; set: func(k
 interface host-counter { increment: func(key: string, delta: s64) -> s64; /* アトミックな名前付き counter */ }
 interface host-log     { log: func(level: level, message: string); }
 // host-ratelimit は token bucket をホストネイティブに保つ —— ホット経路の refill/カウントは WASM 境界を
-// 跨がず、フィルタは「consult するか・どのキーで」を判断するだけ（ADR 000005）。
+// 跨がない。bucket 仕様（capacity/refill）は manifest で host 設定。フィルタは (key, cost) だけを渡すので、
+// untrusted フィルタは自分の制限を緩められない（ADR 000005 / 000026）。
 
 world filter {
   // 貸与された能力のみ —— log · clock · kv · counter · rate-limit
   import host-log;  import host-clock;  import host-kv;  import host-counter;  import host-ratelimit;
-  export init: func();                                       // 重い・instance ごと一度
-  export on-request:  func(req: http-request)  -> request-decision;   // ホット経路
-  export on-response: func(resp: http-response) -> response-decision;  // ホット経路
+  export init: func();                                        // 重い・instance ごと一度
+  export on-request:      func(req: http-request)  -> request-decision;       // ホット経路（ヘッダ）
+  export on-request-body: func(body: list<u8>)     -> request-body-decision;  // body hook（ADR 000025）
+  export on-response:     func(resp: http-response) -> response-decision;     // ホット経路（ヘッダ）
 }
 ```
 
-> v0.1.0 は当初 **sync・header-only** だったが、**request 側の body hook が着地した** —— `on-request-body`（buffer-then-decide。v1 では body を buffer 済みの `list<u8>` で受け取る、[ADR 000025](docs/ADR/000025.md)）。これでフィルタはヘッダだけでなく body も変換・short-circuit できる。ホスト側の async 移行（M3 Stage 1、[ADR 000021](docs/ADR/000021.md)）も入っている。Stage 2 の残りは、この body hook を fast path に通す配線・`stream<u8>` の真ストリーミング・`wasi:http` 型の再利用で、いずれも P3 ゲスト toolchain が枯れ次第進める — [ADR 000003](docs/ADR/000003.md) / [ADR 000020](docs/ADR/000020.md) 参照。
+> v0.1.0 は当初 **sync・header-only** だったが、**request 側の body hook が end-to-end で配線された** —— `on-request-body`（buffer-then-decide。v1 では body を buffer 済みの `list<u8>` で受け取る、[ADR 000025](docs/ADR/000025.md)）が契約・ホスト・**fast path** を通して動き、ヘッダだけでなく body も変換・short-circuit できる。host は body を **上限付き**で buffer し（16 MiB cap、超過は fail-closed 413）、body 無しリクエストと filter 無しルートは zero-copy ストリーミングのまま。ホスト側の async（M3 Stage 1、[ADR 000021](docs/ADR/000021.md)）も入っている。残りは `stream<u8>` の真ストリーミング（大きな body を buffer せず済む）と `wasi:http` 型の再利用で、いずれも P3 ゲスト toolchain が枯れ次第進める — [ADR 000003](docs/ADR/000003.md) / [ADR 000020](docs/ADR/000020.md) 参照。
 
 ## フィルタを書く
 
@@ -221,15 +223,15 @@ Plecto は ADR ファーストで作る。各マイルストーンは `docs/ADR/
 - **M0 — 基盤** ✅ *(完了)*
   `plecto:filter@0.1.0` 契約、フィルタをロード&実行する wasmtime ホスト、deny-by-default の能力境界（log / clock / kv）、例フィルタ、E2E/conformance/unit テスト、CI。— [ADR 1](docs/ADR/000001.md) · [2](docs/ADR/000002.md) · [10](docs/ADR/000010.md)
 - **M1 — フィルタランタイムの堅牢化** ✅ *(着地)*
-  trusted / untrusted で生成戦略を分ける。trusted は固定容量のプールをリクエストごとに借りて返し（飽和時は上限付きで待ってから fail-closed、trap が続けばプール全体のブレーカーが開き、一定回数で recycle）、untrusted は毎回新しく生成する（線形メモリが構造的にまっさらなのでゼロ化が要らない）。状態は redb 上の host KV とアトミックカウンタに置き、token-bucket のレート制限はホスト側で持つ。epoch 計量とメモリ/テーブル上限も実装済み。trusted/untrusted を分けるのは性能のための選択ではなく、init とゼロ化を両立できないことによる必然。
+  trusted / untrusted で生成戦略を分ける。trusted は固定容量のプールをリクエストごとに借りて返し（飽和時は上限付きで待ってから fail-closed、trap が続けばプール全体のブレーカーが開き、一定回数で recycle）、untrusted は毎回新しく生成する（線形メモリが構造的にまっさらなのでゼロ化が要らない）。状態は redb 上の host KV とアトミックカウンタに置き、token-bucket のレート制限はホスト側で持つ（bucket 仕様は manifest で host 設定・リクエストごとに key 付け —— untrusted フィルタが自分の制限を緩められない、[ADR 26](docs/ADR/000026.md)）。epoch 計量とメモリ/テーブル上限も実装済み。trusted/untrusted を分けるのは性能のための選択ではなく、init とゼロ化を両立できないことによる必然。
 - **M2 — データ経路（fast path）** 🚧 *(slice 1–6 着地)*
   tokio + hyper + quinn で書いた `plecto-server`。**HTTP/1.1・HTTP/2（ALPN）・HTTP/3（QUIC）** と **TLS**（rustls、証明書は manifest 宣言、不正なら fail-closed）を終端し、host＋path-prefix で route を選び、その chain を `spawn_blocking` 経由で M1 のプールに載せて回す。upstream は **healthy な instance に round-robin で分散**し、active/passive の health check（pessimistic 起動、全滅すれば 503 で fail-closed）、クライアント IP の edge 伝播（`X-Forwarded-For` / `X-Real-IP` を実 peer から付け直す）、per-upstream の request timeout（504）、別 instance への有界リトライまで備える。*次:* upstream TLS と least-conn/EWMA。
 - **M4 — provenance & 無停止リロード** ✅ *(着地)*
   OCI artifact によるフィルタ配布（オフライン image-layout・digest ピン）+ cosign 署名検証 + SBOM↔component バインド、宣言的マニフェストの content hash で整合する無停止リロード（`ArcSwap` 原子適用・all-or-nothing・SIGHUP 駆動）。残るのは*リモート*レジストリ取得経路（`wkg` 境界・設計上 out-of-band）。— [ADR 6](docs/ADR/000006.md) · [8](docs/ADR/000008.md)
 - **M5 — 可観測性 & オプトイン分散** 🚧 *(span/metrics の中核は着地・export は deferred)*
   **着地:** ホスト伝播の W3C トレース文脈（受信 `traceparent` をプロキシ越しに継続）、フィルタ実行ごとの span（OpenTelemetry データモデル）、sync な `TelemetrySink`（in-memory + ホスト集計の RED メトリクス）。**deferred:** OTLP ネットワーク export（`wasi-otel` / SDK exporter — no-tokio 維持のため named-deferred）とオプトインの `foca`/`openraft` 設定合意。— [ADR 7](docs/ADR/000007.md) · [9](docs/ADR/000009.md)
-- **M3 — async & ボディ** 🚧 *(Stage 1 着地・Stage 2 着手)*
-  M4・M5 がほぼ片付いたので、ここが次の主戦場。**Stage 1（着地）:** [wasmtime 46](https://github.com/bytecodealliance/wasmtime/releases/tag/v46.0.0)（2026-06-22）が WASI 0.3 と Component Model async を既定で有効にし、host は guest のフックを `call_async` で wasmtime の fiber 上に走らせ、まだ sync の公開 API へ `block_on` で橋渡ししている。**Stage 2（着手）:** **request 側の body hook が着地** —— `on-request-body`（buffer-then-decide。v1 は body を buffer 済みの `list<u8>` で受ける）を契約と host に入れ、conformance まで green にした（[ADR 25](docs/ADR/000025.md)）。次はこれを fast path に通す配線。その先の `stream<u8>` 真ストリーミングと `wasi:http` 収斂は、P3 ゲストの toolchain（`wasm32-wasip3` の Tier-2 化・wit-bindgen async）待ちで gated のまま。方向は [ADR 20](docs/ADR/000020.md) のとおり —— 収斂しても deny-by-default は型語彙と切り離して保つ。
+- **M3 — async & ボディ** 🚧 *(Stage 1 着地・Stage 2 進行中)*
+  M4・M5 がほぼ片付いたので、ここが次の主戦場。**Stage 1（着地）:** [wasmtime 46](https://github.com/bytecodealliance/wasmtime/releases/tag/v46.0.0)（2026-06-22）が WASI 0.3 と Component Model async を既定で有効にし、host は guest のフックを `call_async` で wasmtime の fiber 上に走らせ、まだ sync の公開 API へ `block_on` で橋渡ししている。**Stage 2（進行中）:** **request 側の body hook が end-to-end で配線された** —— `on-request-body`（buffer-then-decide。v1 は body を buffer 済みの `list<u8>` で受ける）を契約・host・**fast path** に通し（プロキシは filter 付きルートの body を上限付きで buffer —— 16 MiB cap・超過は fail-closed 413 —— 一方 body 無しリクエストと filter 無しルートは zero-copy のまま）、conformance と E2E まで green（[ADR 25](docs/ADR/000025.md)）。次は `stream<u8>` 真ストリーミング（大きな body を buffer せず済む）と `wasi:http` 収斂で、P3 ゲストの toolchain（`wasm32-wasip3` の Tier-2 化・wit-bindgen async）待ちで gated のまま。方向は [ADR 20](docs/ADR/000020.md) のとおり —— 収斂しても deny-by-default は型語彙と切り離して保つ。
 - **M6 — polyglot SDK & リファレンスフィルタ**
   Go / JS / Python のフィルタテンプレート、リファレンスの auth / rate-limit / WAF フィルタ。
 

@@ -139,18 +139,20 @@ interface host-kv      { get: func(key: string) -> option<list<u8>>; set: func(k
 interface host-counter { increment: func(key: string, delta: s64) -> s64; /* atomic named counter */ }
 interface host-log     { log: func(level: level, message: string); }
 // host-ratelimit keeps the token bucket host-native — the hot-path refill/counting never crosses
-// the WASM boundary; the filter only decides to consult it and on what key (ADR 000005).
+// the WASM boundary. The bucket spec (capacity/refill) is host-configured in the manifest; the
+// filter passes only (key, cost), so an untrusted filter cannot widen its own limit (ADR 000005 / 000026).
 
 world filter {
   // granted capabilities only — log · clock · kv · counter · rate-limit
   import host-log;  import host-clock;  import host-kv;  import host-counter;  import host-ratelimit;
-  export init: func();                                       // heavy, once per instance
-  export on-request:  func(req: http-request)  -> request-decision;   // hot path
-  export on-response: func(resp: http-response) -> response-decision;  // hot path
+  export init: func();                                        // heavy, once per instance
+  export on-request:      func(req: http-request)  -> request-decision;       // hot path (headers)
+  export on-request-body: func(body: list<u8>)     -> request-body-decision;  // body hook (ADR 000025)
+  export on-response:     func(resp: http-response) -> response-decision;     // hot path (headers)
 }
 ```
 
-> v0.1.0 started **sync + header-only**; the request-side **body hook** has now landed — `on-request-body` (buffer-then-decide; the body is a buffered `list<u8>` in v1, [ADR 000025](docs/ADR/000025.md)) — so a filter can transform or short-circuit on the body, not just headers. The host-side async migration (M3 Stage 1, [ADR 000021](docs/ADR/000021.md)) is in. Still ahead in Stage 2: wiring the body hook through the fast path, `stream<u8>` true-streaming, and `wasi:http` type reuse once the P3 guest toolchain settles — see [ADR 000003](docs/ADR/000003.md) / [ADR 000020](docs/ADR/000020.md).
+> v0.1.0 started **sync + header-only**; the request-side **body hook** is now wired **end-to-end** — `on-request-body` (buffer-then-decide; the body is a buffered `list<u8>` in v1, [ADR 000025](docs/ADR/000025.md)) runs through the contract, the host, **and the fast path**, so a filter can transform or short-circuit on the body, not just headers. The host buffers the body **bounded** (16 MiB cap, fail-closed 413); a bodyless request and a filter-less route keep the zero-copy streaming path. Host-side async (M3 Stage 1, [ADR 000021](docs/ADR/000021.md)) is in. Still ahead: `stream<u8>` true-streaming (so large bodies need not be buffered) and `wasi:http` type reuse once the P3 guest toolchain settles — see [ADR 000003](docs/ADR/000003.md) / [ADR 000020](docs/ADR/000020.md).
 
 ## Writing a filter
 
@@ -223,15 +225,15 @@ Plecto is built ADR-first; each milestone realizes specific design decisions in 
 - **M0 — Foundation** ✅ *(done)*
   The `plecto:filter@0.1.0` contract, a wasmtime host that loads & runs filters, a deny-by-default capability boundary (log / clock / kv), an example filter, E2E/conformance/unit tests, and CI. — [ADR 1](docs/ADR/000001.md) · [2](docs/ADR/000002.md) · [10](docs/ADR/000010.md)
 - **M1 — Filter runtime hardening** ✅ *(landed)*
-  Trust-branched instances: trusted filters reuse a fixed-capacity, lazily-filled **pool** checked out per request (bounded-wait fail-closed, pool-wide circuit breaker, recycle-after-N); untrusted run **fresh-per-request** (linear memory fresh by construction). redb-backed host KV + atomic counters + **host-native token-bucket rate limiting**, per-filter key namespacing, **epoch metering + memory/table limits**. The trusted/untrusted split is *forced* (not just perf) by the init/zeroization knot.
+  Trust-branched instances: trusted filters reuse a fixed-capacity, lazily-filled **pool** checked out per request (bounded-wait fail-closed, pool-wide circuit breaker, recycle-after-N); untrusted run **fresh-per-request** (linear memory fresh by construction). redb-backed host KV + atomic counters + **host-native token-bucket rate limiting** (bucket spec host-set in the manifest, keyed per request — an untrusted filter cannot widen its own limit, [ADR 26](docs/ADR/000026.md)), per-filter key namespacing, **epoch metering + memory/table limits**. The trusted/untrusted split is *forced* (not just perf) by the init/zeroization knot.
 - **M2 — The data path (fast path)** 🚧 *(slices 1–6 landed)*
   A tokio + hyper + quinn `plecto-server` that terminates **HTTP/1.1, HTTP/2 (ALPN) and HTTP/3 (QUIC)** and **TLS** (rustls, manifest-declared certs, fail-closed), routes by host + path prefix, runs the route's filter chain via a `spawn_blocking` bridge to the M1 pool, and **load-balances across healthy upstream instances** — active/passive health checks (pessimistic start, fail-closed 503 when none healthy), edge-model client-IP propagation (re-issue `X-Forwarded-For` / `X-Real-IP` from the real peer), a per-upstream request timeout (504), and bounded request-level retry onto another instance. *Next:* upstream TLS, least-conn/EWMA.
 - **M4 — Provenance & zero-downtime reload** ✅ *(landed)*
   OCI-artifact filter distribution (offline image-layout, digest-pinned) + cosign signature verification + SBOM↔component binding, and content-hash-reconciled hot reload from a declarative manifest (atomic `ArcSwap`, all-or-nothing, SIGHUP-driven). What remains is a *remote* registry fetch path (the `wkg` boundary, out-of-band by design). — [ADR 6](docs/ADR/000006.md) · [8](docs/ADR/000008.md)
 - **M5 — Observability & opt-in distribution** 🚧 *(span/metrics core landed; export deferred)*
   **Landed:** host-propagated W3C trace context (inbound `traceparent` continued through the proxy), one span per filter execution over the OpenTelemetry data model, and a sync `TelemetrySink` (in-memory + host-aggregated RED metrics). **Deferred:** OTLP network export (`wasi-otel` / SDK exporter, named-deferred to stay no-tokio) and opt-in `foca`/`openraft` config consensus. — [ADR 7](docs/ADR/000007.md) · [9](docs/ADR/000009.md)
-- **M3 — Async & bodies** 🚧 *(Stage 1 landed; Stage 2 started)*
-  The frontier, since M4/M5 are largely done. **Stage 1 (landed):** [wasmtime 46](https://github.com/bytecodealliance/wasmtime/releases/tag/v46.0.0) (2026-06-22) made WASI 0.3 + Component Model async default-on; the host runs guest hooks via `call_async` on wasmtime fibers, bridged to its still-sync public API with `block_on`. **Stage 2 (started):** the request-side **body hook** has landed — `on-request-body` (buffer-then-decide; body as a buffered `list<u8>` in v1) through the contract + host, conformance-green ([ADR 25](docs/ADR/000025.md)). Next is wiring it through the fast path; then `stream<u8>` true-streaming and `wasi:http` convergence, which stay gated on the P3 guest toolchain (`wasm32-wasip3` Tier-2, wit-bindgen async). [ADR 20](docs/ADR/000020.md) keeps the convergence direction — deny-by-default independent of the type vocabulary.
+- **M3 — Async & bodies** 🚧 *(Stage 1 landed; Stage 2 in progress)*
+  The frontier, since M4/M5 are largely done. **Stage 1 (landed):** [wasmtime 46](https://github.com/bytecodealliance/wasmtime/releases/tag/v46.0.0) (2026-06-22) made WASI 0.3 + Component Model async default-on; the host runs guest hooks via `call_async` on wasmtime fibers, bridged to its still-sync public API with `block_on`. **Stage 2 (in progress):** the request-side **body hook** is wired **end-to-end** — `on-request-body` (buffer-then-decide; body as a buffered `list<u8>` in v1) through the contract, the host, **and the fast path** (the proxy buffers a filtered route's body bounded — 16 MiB cap, fail-closed 413 — while bodyless requests and filter-less routes stay zero-copy), conformance- and E2E-green ([ADR 25](docs/ADR/000025.md)). Next: `stream<u8>` true-streaming (large bodies need not be buffered) and `wasi:http` convergence, which stay gated on the P3 guest toolchain (`wasm32-wasip3` Tier-2, wit-bindgen async). [ADR 20](docs/ADR/000020.md) keeps the convergence direction — deny-by-default independent of the type vocabulary.
 - **M6 — Polyglot SDKs & reference filters**
   Go / JS / Python filter templates and reference auth / rate-limit / WAF filters.
 
