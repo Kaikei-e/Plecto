@@ -57,6 +57,12 @@ pub enum ControlError {
     #[error("filter {id:?} failed the load gate: {err}")]
     Load { id: String, err: anyhow::Error },
 
+    /// A filter entry carried an out-of-range metering / rate-limit value (e.g. a zero deadline,
+    /// zero memory cap, or a rate-limit bucket that can never refill). Rejected fail-closed at
+    /// build so a config typo cannot reach the host's metering arithmetic (CWE-20).
+    #[error("filter {id:?} has invalid config: {reason}")]
+    InvalidFilterConfig { id: String, reason: String },
+
     #[error("chain references unknown filter {0:?}")]
     UnknownChainFilter(String),
 

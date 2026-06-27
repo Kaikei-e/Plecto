@@ -41,6 +41,7 @@ use plecto_control::{
 };
 use quinn::crypto::rustls::QuicServerConfig;
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 use tokio_rustls::TlsAcceptor;
 
 /// A boxed, `Send` error — the unified error type for the boxed request/response bodies.
@@ -71,6 +72,11 @@ const HOP_BY_HOP: &[&str] = &[
     "te",
     "trailer",
     "upgrade",
+    // Proxy-scoped credentials/challenges are hop-by-hop (RFC 9110 §11.7.1/§11.7.2): a
+    // client's `Proxy-Authorization` must not leak to the upstream, nor an upstream's
+    // `Proxy-Authenticate` back to the client.
+    "proxy-authorization",
+    "proxy-authenticate",
 ];
 
 fn is_hop_by_hop(name: &str) -> bool {
@@ -82,6 +88,24 @@ fn is_hop_by_hop(name: &str) -> bool {
 /// fails closed (413) rather than being read into RAM. A per-route override is a follow-up; the
 /// constant keeps v1 safe. Header-only / bodyless requests never reach this path.
 const MAX_REQUEST_BODY_BUFFER: usize = 16 << 20; // 16 MiB
+
+/// Global cap on concurrently-served connections across all transports (CWE-770). A permit
+/// is acquired BEFORE each accept, so at saturation the listener stops pulling new connections off
+/// the OS backlog (natural backpressure) instead of spawning per-connection tasks unboundedly.
+const MAX_CONNECTIONS: usize = 10_000;
+/// Cap on request bodies buffered concurrently for the `on-request-body` hook. Bounds total
+/// buffered memory at `MAX_INFLIGHT_BODY_BUFFERS × MAX_REQUEST_BODY_BUFFER`.
+const MAX_INFLIGHT_BODY_BUFFERS: usize = 64;
+/// Explicit cap on inbound request header lines. hyper's http1 default (~100) is documented
+/// as not API-stable, so pin it — as `MAX_CONCURRENT_STREAMS` already does for h2.
+const MAX_HEADERS: usize = 100;
+/// How long a connection may take to send its request headers before it is dropped (slowloris on
+/// headers). hyper enforces a header-read timeout ONLY when a timer is configured, so the
+/// server sets both the timer and this value rather than relying on the (timer-less, inert) default.
+const INBOUND_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long the server spends reading a buffered request body before failing closed 408 (slow-body
+/// slowloris): the body hook buffers, and an un-timed read would await trickled frames forever.
+const INBOUND_BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The set of header names DYNAMICALLY designated hop-by-hop by `Connection` (RFC 9110 §7.6.1):
 /// `Connection: X-Foo, close` marks `X-Foo` connection-specific, so a proxy must not forward it.
@@ -169,6 +193,12 @@ struct ServerState {
     control: Arc<Control>,
     client: UpstreamClient,
     alt_svc: Option<HeaderValue>,
+    /// Global connection cap across TCP + QUIC: a permit is held for each connection's
+    /// lifetime, so the server never serves more than `MAX_CONNECTIONS` at once.
+    conn_limit: Arc<Semaphore>,
+    /// Cap on concurrently-buffered request bodies for the `on-request-body` hook, bounding
+    /// total buffered memory.
+    body_buffer_limit: Arc<Semaphore>,
 }
 
 /// Per-connection cap on concurrent HTTP/2 streams (ADR 000015). A fixed, conservative bound (not
@@ -199,6 +229,8 @@ pub async fn serve(control: Arc<Control>, listener: TcpListener) -> anyhow::Resu
         control,
         client: Client::builder(TokioExecutor::new()).build(upstream_connector()),
         alt_svc,
+        conn_limit: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
+        body_buffer_limit: Arc::new(Semaphore::new(MAX_INFLIGHT_BODY_BUFFERS)),
     });
 
     // Active health checks (ADR 000017): a background supervisor probes each upstream instance and
@@ -220,6 +252,13 @@ pub async fn serve(control: Arc<Control>, listener: TcpListener) -> anyhow::Resu
     }
 
     loop {
+        // Acquire a connection permit BEFORE accepting: at saturation we stop pulling
+        // connections off the backlog (backpressure) rather than spawning tasks without bound. The
+        // permit is moved into the connection task and released when it ends.
+        let permit = match state.conn_limit.clone().acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => return Ok(()), // semaphore closed → stop serving
+        };
         let (stream, peer) = match listener.accept().await {
             Ok(pair) => pair,
             // a transient accept error (e.g. fd exhaustion) must not kill the listener.
@@ -233,6 +272,7 @@ pub async fn serve(control: Arc<Control>, listener: TcpListener) -> anyhow::Resu
         // connections, while in-flight ones keep the cert they negotiated with. `None` → plain.
         let tls = state.control.tls_config();
         tokio::spawn(async move {
+            let _permit = permit; // released when this connection task ends
             match tls {
                 Some(cfg) => match TlsAcceptor::from(cfg).accept(stream).await {
                     Ok(tls_stream) => {
@@ -274,6 +314,12 @@ async fn serve_conn<I>(
             .await
     } else {
         hyper::server::conn::http1::Builder::new()
+            // enforce a header-read timeout (slowloris on headers) and an explicit
+            // header-count cap. The header-read timeout only fires with a timer configured, so set
+            // both rather than relying on hyper's timer-less (inert) default.
+            .timer(hyper_util::rt::TokioTimer::new())
+            .header_read_timeout(INBOUND_HEADER_READ_TIMEOUT)
+            .max_headers(MAX_HEADERS)
             .serve_connection(io, service)
             .await
     };
@@ -353,6 +399,22 @@ async fn proxy_core(
 ) -> anyhow::Result<Response<ResponseBody>> {
     let mut http_req = to_http_request(&parts, scheme);
 
+    // Normalize the request path once at ingress (CWE-22 Path Traversal / CWE-436
+    // Interpretation Conflict): route selection, the filter chain, and the forwarded path then all
+    // use the SAME normalized path, so the upstream cannot re-derive a stricter path than the
+    // (possibly laxer, unfiltered) route we selected — closing the per-route-filter bypass. An
+    // ambiguous (encoded-separator) or root-escaping path is rejected fail-closed.
+    match plecto_control::normalize_path(&http_req.path) {
+        Some(path) => http_req.path = path,
+        None => {
+            return Ok(synth(
+                StatusCode::BAD_REQUEST,
+                "bad-path",
+                b"bad request path",
+            ));
+        }
+    }
+
     // Client-IP propagation, edge model (ADR 000018 / review f000005 P2#3): strip any inbound
     // `X-Forwarded-*` / `Forwarded` (which an untrusted client can forge) and set them afresh from
     // the connection's real peer + scheme. Done BEFORE the chain so an IP-based rate-limit / auth
@@ -409,13 +471,31 @@ async fn proxy_core(
         && !bodyless
         && let Some(b) = real_body.take()
     {
-        // Over the cap (or a body read fault) fails closed — never an unbounded buffer.
-        let Some(buffered) = buffer_request_body(b, MAX_REQUEST_BODY_BUFFER).await else {
-            return Ok(synth(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "body-too-large",
-                b"request body too large",
-            ));
+        // Bound concurrent buffered-body memory and the time spent reading one body
+        // (slow-body slowloris): hold a buffer permit and read under a deadline. Over the
+        // size cap → 413, over the time budget → 408 — both fail closed (never an unbounded buffer).
+        let _buf_permit = state.body_buffer_limit.clone().acquire_owned().await.ok();
+        let buffered = match tokio::time::timeout(
+            INBOUND_BODY_READ_TIMEOUT,
+            buffer_request_body(b, MAX_REQUEST_BODY_BUFFER),
+        )
+        .await
+        {
+            Ok(Some(buf)) => buf,
+            Ok(None) => {
+                return Ok(synth(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "body-too-large",
+                    b"request body too large",
+                ));
+            }
+            Err(_) => {
+                return Ok(synth(
+                    StatusCode::REQUEST_TIMEOUT,
+                    "body-timeout",
+                    b"request body read timeout",
+                ));
+            }
         };
         let snap_body = snapshot.clone();
         match tokio::task::spawn_blocking(move || snap_body.dispatch_request_body(idx, buffered))
@@ -727,8 +807,14 @@ fn build_h3_endpoint(
 /// `handle_h3_request`. A per-connection / per-request error is logged, never fatal.
 async fn serve_h3(state: Arc<ServerState>, endpoint: quinn::Endpoint) {
     while let Some(incoming) = endpoint.accept().await {
+        // Count a QUIC connection against the same global cap as TCP.
+        let permit = match state.conn_limit.clone().acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => return, // semaphore closed → stop accepting
+        };
         let state = state.clone();
         tokio::spawn(async move {
+            let _permit = permit; // released when this connection task ends
             let conn = match incoming.await {
                 Ok(c) => c,
                 Err(e) => {
@@ -980,6 +1066,8 @@ mod tests {
             "te",
             "Trailer",
             "upgrade",
+            "Proxy-Authorization",
+            "Proxy-Authenticate",
         ] {
             assert!(is_hop_by_hop(h), "{h} must be treated as hop-by-hop");
         }

@@ -25,6 +25,13 @@ const SIG_MT: &str = "application/vnd.plecto.signature";
 const SBOM_MT: &str = "application/vnd.plecto.sbom";
 const SBOM_SIG_MT: &str = "application/vnd.plecto.sbom.signature";
 
+/// Sanity ceiling on any blob the loader reads (CWE-770): a wasm component plus its
+/// signature / SBOM layers are well under this. Bounds the read so a malicious or oversized
+/// layout cannot OOM the shared data-plane process before the digest check runs.
+const MAX_BLOB_BYTES: u64 = 512 << 20; // 512 MiB
+/// Cap on `index.json` — it carries a single image-manifest descriptor (a few KiB at most).
+const MAX_INDEX_BYTES: u64 = 1 << 20; // 1 MiB
+
 fn artifact_err(source_ref: &str, reason: impl Into<String>) -> ControlError {
     ControlError::Artifact {
         source_ref: source_ref.to_string(),
@@ -61,7 +68,8 @@ fn read_layout(
     source: &str,
     pinned: &str,
 ) -> Result<ResolvedArtifact, ControlError> {
-    let index = ImageIndex::from_file(layout.join("index.json"))
+    let index_bytes = read_capped(&layout.join("index.json"), MAX_INDEX_BYTES, source)?;
+    let index = ImageIndex::from_reader(index_bytes.as_slice())
         .map_err(|e| artifact_err(source, format!("read index.json: {e}")))?;
     let manifest_desc = index
         .manifests()
@@ -123,8 +131,39 @@ fn layer_by_media_type<'a>(
         .ok_or_else(|| artifact_err(source, format!("missing layer of type {media_type}")))
 }
 
-/// Read a digest-addressed blob and verify its content hashes to the descriptor's digest.
+/// Read a file with a hard byte ceiling, refusing symlinks (CWE-59) and anything over `max`
+/// (CWE-770). Used for control-plane inputs whose on-disk size we do not trust.
+fn read_capped(path: &Path, max: u64, source: &str) -> Result<Vec<u8>, ControlError> {
+    use std::io::Read;
+    let meta = std::fs::symlink_metadata(path)
+        .map_err(|e| artifact_err(source, format!("stat {}: {e}", path.display())))?;
+    if meta.file_type().is_symlink() {
+        return Err(artifact_err(
+            source,
+            format!("{} is a symlink (refused)", path.display()),
+        ));
+    }
+    let file = std::fs::File::open(path)
+        .map_err(|e| artifact_err(source, format!("open {}: {e}", path.display())))?;
+    let mut bytes = Vec::new();
+    file.take(max + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| artifact_err(source, format!("read {}: {e}", path.display())))?;
+    if bytes.len() as u64 > max {
+        return Err(artifact_err(
+            source,
+            format!("{} exceeds the {max}-byte cap", path.display()),
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Read a digest-addressed blob and verify its content hashes to the descriptor's digest. The
+/// read is bounded by the descriptor's declared size and a sanity ceiling, symlinks are refused,
+/// and the digest hex is validated as a path component before the `join`.
 fn read_blob(layout: &Path, desc: &Descriptor, source: &str) -> Result<Vec<u8>, ControlError> {
+    use std::io::Read;
+
     let digest = desc.digest().to_string(); // "sha256:<hex>"
     let (algo, hex) = digest
         .split_once(':')
@@ -135,9 +174,55 @@ fn read_blob(layout: &Path, desc: &Descriptor, source: &str) -> Result<Vec<u8>, 
             format!("unsupported digest algorithm {algo}"),
         ));
     }
+    // Defense-in-depth (CWE-22): the hex becomes a filesystem path component, so verify it
+    // is exactly 64 lowercase hex chars locally instead of relying solely on oci-spec's `Digest`
+    // parser — a `..`/`/`-bearing digest can then never reach `Path::join`.
+    if hex.len() != 64
+        || !hex
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(artifact_err(
+            source,
+            format!("invalid sha256 digest encoding {hex}"),
+        ));
+    }
+    // The descriptor's declared size bounds the read; reject an over-ceiling blob up front.
+    let declared = desc.size();
+    if declared > MAX_BLOB_BYTES {
+        return Err(artifact_err(
+            source,
+            format!("blob {hex} declared size {declared} exceeds the {MAX_BLOB_BYTES}-byte cap"),
+        ));
+    }
     let path = layout.join("blobs").join(algo).join(hex);
-    let bytes =
-        std::fs::read(&path).map_err(|e| artifact_err(source, format!("read blob {hex}: {e}")))?;
+    // Refuse a symlinked blob (CWE-59): a layout pointing `blobs/sha256/<hex>` at `/dev/zero` or
+    // any host file must not be followed and read unbounded.
+    let meta = std::fs::symlink_metadata(&path)
+        .map_err(|e| artifact_err(source, format!("stat blob {hex}: {e}")))?;
+    if meta.file_type().is_symlink() {
+        return Err(artifact_err(
+            source,
+            format!("blob {hex} is a symlink (refused)"),
+        ));
+    }
+    // Read at most `declared` bytes (+1 to detect an oversized file), so even a file swapped after
+    // the stat cannot grow the buffer past the bound; the digest check below rejects any mismatch.
+    let file = std::fs::File::open(&path)
+        .map_err(|e| artifact_err(source, format!("open blob {hex}: {e}")))?;
+    let mut bytes = Vec::new();
+    file.take(declared + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| artifact_err(source, format!("read blob {hex}: {e}")))?;
+    if bytes.len() as u64 != declared {
+        return Err(artifact_err(
+            source,
+            format!(
+                "blob {hex} size mismatch (declared {declared}, read {})",
+                bytes.len()
+            ),
+        ));
+    }
     let actual = sha256_hex(&bytes);
     if actual != hex {
         return Err(artifact_err(

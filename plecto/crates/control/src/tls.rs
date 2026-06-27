@@ -129,7 +129,17 @@ fn load_certified_key(entry: &TlsCert, base_dir: &Path) -> Result<CertifiedKey, 
     let key = read_key(entry, base_dir)?;
     let signing_key = ring::sign::any_supported_type(&key)
         .map_err(|e| tls_err(entry, &format!("unsupported private key: {e}")))?;
-    Ok(CertifiedKey::new(cert_chain, signing_key))
+    let certified = CertifiedKey::new(cert_chain, signing_key);
+    // `CertifiedKey::new` does NOT verify the private key matches the leaf certificate, so a
+    // mismatched cert/key pair would build successfully and then fail EVERY TLS handshake at
+    // runtime — contradicting this module's fail-closed-at-build contract. Verify here. `Unknown`
+    // (the provider can't expose the key's SPKI) is not a mismatch — accept it, mirroring rustls'
+    // own `CertifiedKey::from_der`. The `ring` provider does expose it, so a real mismatch is caught.
+    match certified.keys_match() {
+        Ok(()) | Err(rustls::Error::InconsistentKeys(rustls::InconsistentKeys::Unknown)) => {}
+        Err(e) => return Err(tls_err(entry, &format!("cert/key mismatch: {e}"))),
+    }
+    Ok(certified)
 }
 
 fn read_certs(
@@ -212,5 +222,28 @@ mod tests {
                 .is_none(),
             "no [[tls]] means no TLS/QUIC configs (plain HTTP/1.1, no h3)"
         );
+    }
+
+    #[test]
+    fn mismatched_cert_and_key_is_rejected() {
+        // a cert paired with a DIFFERENT private key must fail the build (fail-closed), not
+        // go live and fail every TLS handshake at runtime. Cross two self-signed pairs.
+        let a = rcgen::generate_simple_self_signed(vec!["a.example".to_string()]).unwrap();
+        let b = rcgen::generate_simple_self_signed(vec!["b.example".to_string()]).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        std::fs::write(&cert_path, a.cert.pem()).unwrap(); // cert A
+        std::fs::write(&key_path, b.key_pair.serialize_pem()).unwrap(); // key B (mismatch)
+        let entry = TlsCert {
+            host: None,
+            cert_path: cert_path.to_str().unwrap().to_string(),
+            key_path: key_path.to_str().unwrap().to_string(),
+        };
+        let err = match build_server_configs(&[entry], dir.path()) {
+            Err(e) => e,
+            Ok(_) => panic!("a mismatched cert/key pair must be rejected at build"),
+        };
+        assert!(matches!(err, ControlError::TlsCert { .. }));
     }
 }

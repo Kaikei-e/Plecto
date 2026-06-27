@@ -39,7 +39,7 @@ pub use manifest::{
 #[cfg(unix)]
 pub use reload::SignalReloadSource;
 pub use reload::{ReloadOutcome, ReloadSource, serve_reloads};
-pub use route::RouteInfo;
+pub use route::{RouteInfo, normalize_path};
 /// The rustls TLS server config the fast path terminates with (ADR 000014), re-exported so
 /// `plecto-server` names the same `rustls` type the control plane built.
 pub use rustls::ServerConfig as TlsServerConfig;
@@ -358,6 +358,8 @@ fn build_active(
         if filters.contains_key(&entry.id) {
             return Err(ControlError::DuplicateFilterId(entry.id.clone()));
         }
+        // Reject out-of-range metering / rate-limit values before they reach the host.
+        entry.validate()?;
         let artifact = store.resolve(&entry.source, &entry.digest)?;
         let signed = SignedArtifact {
             component_bytes: &artifact.component,

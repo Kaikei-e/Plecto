@@ -18,3 +18,10 @@ ignore = []
 # requirements (`*`) are likewise a warning, not a block.
 multiple-versions = "warn"
 wildcards = "warn"
+
+# Supply-chain origin gate (OWASP A03). Every crate must come from crates.io; an unknown
+# registry or a git/path source is a hard failure, so a typosquat or an unexpected source cannot
+# land unnoticed. The CI `cargo-deny` job runs `check ... sources` and is blocking.
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

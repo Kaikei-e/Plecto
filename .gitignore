@@ -4,6 +4,7 @@ plecto/examples/filters/filter-hello/target
 plecto/examples/filters/filter-apikey/target
 docs/feedback
 docs/plans
+docs/servey
 performance/data/*.csv
 # Local heavy-load LB benchmark harness (single-host, loopback; reproduces the
 # Tailscale heavy-load scenario standalone). Git-untracked like bench/.

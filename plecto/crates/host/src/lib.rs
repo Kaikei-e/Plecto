@@ -24,6 +24,7 @@
 mod backend;
 mod observe;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
@@ -85,14 +86,43 @@ pub enum Isolation {
     Untrusted,
 }
 
-/// Generous default budget for the heavy once-per-instance `init` (Tenet 4): regex compile,
-/// schema build, config parse. Separate from — and much larger than — the per-request budget
-/// so a legitimately heavy init is not mistaken for a runaway (ADR 000006).
+/// Generous default budget for the heavy once-per-instance `init` of a **trusted** filter
+/// (Tenet 4): regex compile, schema build, config parse. Trusted init runs once per instance
+/// and is then reused, so a large budget is paid once — separate from, and much larger than,
+/// the per-request budget so a legitimately heavy init is not mistaken for a runaway (ADR 000006).
 const DEFAULT_INIT_DEADLINE_MS: u64 = 5_000;
+/// Tight default `init` budget for an **untrusted** filter. Untrusted filters instantiate fresh
+/// and re-run `init` on EVERY request (the isolation trade, ADR 000011), on the worker thread, so
+/// init is on the hot path: the generous 5s trusted budget would let an adversarial untrusted
+/// `init` busy-loop and pin a core for ~5s per request (CWE-770). Bound it near the
+/// per-request budget; an operator may still raise it per filter via the manifest.
+const DEFAULT_UNTRUSTED_INIT_DEADLINE_MS: u64 = 250;
 /// Tight default budget for the hot per-request hooks. This is a *safety* bound that traps
 /// runaway filters (infinite loops), not a latency SLA; header-only filters finish in well
 /// under a millisecond.
 const DEFAULT_REQUEST_DEADLINE_MS: u64 = 100;
+
+// --- host-state (KV / counter / ratelimit) quotas (CWE-770). The host charges every
+// --- value, counter, and bucket against the owning filter's namespace and a global ceiling so
+// --- an untrusted, multi-tenant filter cannot grow host memory/disk without bound. ---
+
+/// Largest value a filter may store under one KV key. A bigger `set` is dropped (fail-closed).
+const MAX_KV_VALUE_BYTES: usize = 256 * 1024;
+/// Largest filter-supplied key. A longer key is dropped (bounds the namespaced key itself).
+const MAX_KV_KEY_BYTES: usize = 1024;
+/// Per-filter (namespace) cap on the number of distinct keys across kv + counter + ratelimit.
+const MAX_NS_ENTRIES: usize = 100_000;
+/// Per-filter (namespace) cap on total stored bytes (keys + values) across all primitives.
+const MAX_NS_BYTES: usize = 64 << 20;
+/// Host-wide cap on total entries across every filter (multi-tenant ceiling).
+const MAX_TOTAL_ENTRIES: usize = 5_000_000;
+/// Host-wide cap on total stored bytes across every filter (multi-tenant ceiling).
+const MAX_TOTAL_BYTES: usize = 1 << 30;
+/// Per-request cap on host-log lines a filter may emit (CWE-770). The last slot is a
+/// single truncation marker so overflow stays observable.
+const MAX_LOG_LINES_PER_REQUEST: usize = 256;
+/// Per-line cap on a host-log message; a longer message is truncated on a char boundary.
+const MAX_LOG_MSG_BYTES: usize = 8 * 1024;
 /// Default per-instance linear-memory cap enforced via a `StoreLimits` (ADR 000006). Matches
 /// the pooling engine's per-slot reservation so trusted and untrusted agree.
 const DEFAULT_MAX_MEMORY_BYTES: u64 = 64 << 20;
@@ -164,7 +194,8 @@ impl Default for LoadOptions {
     fn default() -> Self {
         Self {
             isolation: Isolation::Untrusted,
-            init_deadline_ms: DEFAULT_INIT_DEADLINE_MS,
+            // default is untrusted → init re-runs per request, so bound it tight.
+            init_deadline_ms: DEFAULT_UNTRUSTED_INIT_DEADLINE_MS,
             request_deadline_ms: DEFAULT_REQUEST_DEADLINE_MS,
             max_memory_bytes: DEFAULT_MAX_MEMORY_BYTES,
             trusted_pool_size: default_trusted_pool_size(),
@@ -179,6 +210,8 @@ impl LoadOptions {
     pub fn trusted() -> Self {
         Self {
             isolation: Isolation::Trusted,
+            // trusted init runs ONCE per instance and is reused → keep the generous budget.
+            init_deadline_ms: DEFAULT_INIT_DEADLINE_MS,
             ..Self::default()
         }
     }
@@ -420,6 +453,94 @@ fn wall_now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+#[derive(Default, Clone, Copy)]
+struct NsUsage {
+    entries: usize,
+    bytes: usize,
+}
+
+struct QuotaInner {
+    ns: HashMap<String, NsUsage>,
+    total_entries: usize,
+    total_bytes: usize,
+}
+
+/// Per-filter (namespace) accounting and caps for host-held state (CWE-770). The host
+/// charges every KV value, counter, and rate-limit bucket against the owning filter's namespace
+/// and a host-wide ceiling, so an untrusted, multi-tenant filter cannot grow host memory (or the
+/// redb file) without bound — the `StoreLimits` cap only bounds the guest's own linear memory,
+/// not the host-side store. Enforced here at the capability boundary, keeping `KvBackend` generic.
+/// One per `Host`, shared (`Arc`) across every filter's `HostState`.
+struct KvQuota {
+    inner: Mutex<QuotaInner>,
+}
+
+impl KvQuota {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(QuotaInner {
+                ns: HashMap::new(),
+                total_entries: 0,
+                total_bytes: 0,
+            }),
+        }
+    }
+
+    /// Try to charge `(entries_delta, bytes_delta)` to namespace `ns`. A growth that would push
+    /// the namespace or the host-wide total past a cap is rejected (returns `false`, the caller
+    /// fails closed); a shrink (negative delta) always applies. Commits atomically under the lock.
+    fn admit(&self, ns: &str, entries_delta: isize, bytes_delta: isize) -> bool {
+        let mut g = self.inner.lock();
+        let cur = g.ns.get(ns).copied().unwrap_or_default();
+        let new_ns_entries = cur.entries as isize + entries_delta;
+        let new_ns_bytes = cur.bytes as isize + bytes_delta;
+        let new_total_entries = g.total_entries as isize + entries_delta;
+        let new_total_bytes = g.total_bytes as isize + bytes_delta;
+        // Only growth can violate a cap; a shrink (delete / smaller value) always applies.
+        if (entries_delta > 0
+            && (new_ns_entries as usize > MAX_NS_ENTRIES
+                || new_total_entries as usize > MAX_TOTAL_ENTRIES))
+            || (bytes_delta > 0
+                && (new_ns_bytes as usize > MAX_NS_BYTES
+                    || new_total_bytes as usize > MAX_TOTAL_BYTES))
+        {
+            return false;
+        }
+        let usage = g.ns.entry(ns.to_string()).or_default();
+        usage.entries = new_ns_entries.max(0) as usize;
+        usage.bytes = new_ns_bytes.max(0) as usize;
+        g.total_entries = new_total_entries.max(0) as usize;
+        g.total_bytes = new_total_bytes.max(0) as usize;
+        true
+    }
+
+    /// Release `(entries, bytes)` from `ns` (a delete). Never rejects.
+    fn release(&self, ns: &str, entries: usize, bytes: usize) {
+        self.admit(ns, -(entries as isize), -(bytes as isize));
+    }
+}
+
+/// Neutralize a guest-supplied log message (CWE-117): truncate to a byte cap on a char
+/// boundary and replace control characters (CR/LF for log-line injection, C0/C1/ESC for terminal
+/// ANSI) with the replacement char. The filter is untrusted and may embed `Authorization` header
+/// bytes or escape sequences, so the host — the trust boundary — neutralizes before storing.
+fn sanitize_log_message(mut message: String) -> String {
+    if message.len() > MAX_LOG_MSG_BYTES {
+        let mut end = MAX_LOG_MSG_BYTES;
+        while !message.is_char_boundary(end) {
+            end -= 1;
+        }
+        message.truncate(end);
+    }
+    if message.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        message = message
+            .chars()
+            .map(|c| if c.is_control() { '\u{fffd}' } else { c })
+            .collect();
+    }
+    message
+}
+
 /// Per-request host state: the capability handles lent to a filter plus request-scoped
 /// buffers. For untrusted filters a fresh one is built per request; for trusted filters
 /// the same one is reused with `begin_request` resetting the per-request fields, while the
@@ -440,6 +561,9 @@ pub struct HostState {
     /// 000026). `None` = no bucket configured → `host-ratelimit/try-acquire` fails closed. The
     /// filter cannot supply or override it, so an untrusted filter cannot neuter its own limiter.
     ratelimit_bucket: Option<Bucket>,
+    /// Shared per-namespace accounting + caps for host-held state. Charged on every
+    /// `set` / `increment` / `try_acquire` that grows the store; over-quota writes fail closed.
+    quota: Arc<KvQuota>,
 }
 
 impl HostState {
@@ -448,6 +572,7 @@ impl HostState {
         kv_prefix: String,
         max_memory_bytes: u64,
         ratelimit_bucket: Option<Bucket>,
+        quota: Arc<KvQuota>,
     ) -> Self {
         Self {
             kv,
@@ -459,6 +584,7 @@ impl HostState {
                 .table_elements(MAX_TABLE_ELEMENTS)
                 .build(),
             ratelimit_bucket,
+            quota,
         }
     }
 
@@ -487,7 +613,20 @@ impl bindings::plecto::filter::types::Host for HostState {}
 
 impl host_log::Host for HostState {
     fn log(&mut self, level: LogLevel, message: String) {
-        self.logs.push(LogLine { level, message });
+        // Bound per-request log volume and neutralize control bytes: a guest can
+        // loop `log` until its deadline, so cap the line count (reserving the last slot for one
+        // truncation marker) and sanitize each message before it is stored.
+        match self.logs.len() {
+            n if n < MAX_LOG_LINES_PER_REQUEST - 1 => self.logs.push(LogLine {
+                level,
+                message: sanitize_log_message(message),
+            }),
+            n if n == MAX_LOG_LINES_PER_REQUEST - 1 => self.logs.push(LogLine {
+                level: LogLevel::Warn,
+                message: "… host-log truncated (per-request line cap reached)".to_string(),
+            }),
+            _ => {}
+        }
     }
 }
 
@@ -502,16 +641,52 @@ impl host_kv::Host for HostState {
         self.kv.get(&self.ns_key(TAG_KV, &key))
     }
     fn set(&mut self, key: String, value: Vec<u8>) {
-        self.kv.set(&self.ns_key(TAG_KV, &key), value);
+        // Per-key size limits + per-namespace/global quota. Over-limit writes are dropped
+        // (fail-closed): from the filter's view the host-API is infallible ("reads vanish").
+        if key.len() > MAX_KV_KEY_BYTES || value.len() > MAX_KV_VALUE_BYTES {
+            return;
+        }
+        let nskey = self.ns_key(TAG_KV, &key);
+        // Charge the byte delta vs. any existing value (a new key also charges its key bytes + 1
+        // entry). The read-before-write keeps the byte accounting exact for variable-size values.
+        let (entries_delta, bytes_delta) = match self.kv.get(&nskey).map(|v| v.len()) {
+            None => (1isize, (key.len() + value.len()) as isize),
+            Some(old) => (0isize, value.len() as isize - old as isize),
+        };
+        if !self
+            .quota
+            .admit(&self.kv_prefix, entries_delta, bytes_delta)
+        {
+            return;
+        }
+        self.kv.set(&nskey, value);
     }
     fn delete(&mut self, key: String) {
-        self.kv.delete(&self.ns_key(TAG_KV, &key));
+        let nskey = self.ns_key(TAG_KV, &key);
+        if let Some(old) = self.kv.get(&nskey).map(|v| v.len()) {
+            self.kv.delete(&nskey);
+            self.quota.release(&self.kv_prefix, 1, key.len() + old);
+        }
     }
 }
 
 impl host_counter::Host for HostState {
     fn increment(&mut self, key: String, delta: i64) -> i64 {
-        self.kv.increment(&self.ns_key(TAG_COUNTER, &key), delta)
+        let nskey = self.ns_key(TAG_COUNTER, &key);
+        // A zero delta is a pure read (host-counter.get); it neither creates a key nor is charged.
+        if delta == 0 {
+            return self.kv.increment(&nskey, 0);
+        }
+        // A counter is a fixed 8-byte value: only a NEW key grows the store, so charge one entry
+        // when first created and fail closed (report the current value, do not create) over quota.
+        if self.kv.get(&nskey).is_none()
+            && !self
+                .quota
+                .admit(&self.kv_prefix, 1, (key.len() + 8) as isize)
+        {
+            return 0;
+        }
+        self.kv.increment(&nskey, delta)
     }
     fn get(&mut self, key: String) -> i64 {
         // increment-by-zero is an atomic read of the current value (and the canonical
@@ -532,9 +707,21 @@ impl host_ratelimit::Host for HostState {
                 retry_after_ms: 0,
             };
         };
-        let r = self
-            .kv
-            .try_acquire(&self.ns_key(TAG_RATELIMIT, &key), cost, spec, self.now_ms);
+        let nskey = self.ns_key(TAG_RATELIMIT, &key);
+        // A bucket is a fixed 16-byte value: charge one entry when first created. Over quota a
+        // filter cannot mint unbounded distinct-key buckets — deny (fail-closed), do not create.
+        if self.kv.get(&nskey).is_none()
+            && !self
+                .quota
+                .admit(&self.kv_prefix, 1, (key.len() + 16) as isize)
+        {
+            return host_ratelimit::Acquire {
+                allowed: false,
+                remaining: 0,
+                retry_after_ms: 0,
+            };
+        }
+        let r = self.kv.try_acquire(&nskey, cost, spec, self.now_ms);
         host_ratelimit::Acquire {
             allowed: r.allowed,
             remaining: r.remaining,
@@ -593,6 +780,8 @@ pub struct Host {
     /// is two engines, not one (confirmed wasmtime 45 behaviour).
     untrusted_engine: Engine,
     kv: Arc<dyn KvBackend>,
+    /// Per-namespace host-state accounting + caps, shared into every loaded filter.
+    kv_quota: Arc<KvQuota>,
     /// Public keys this host trusts to sign filters (ADR 000006). Verified at every `load`.
     trust: TrustPolicy,
     /// Where loaded filters emit their per-execution spans (ADR 000009). Default `NoopSink`
@@ -662,6 +851,7 @@ impl Host {
             trusted_engine,
             untrusted_engine,
             kv,
+            kv_quota: Arc::new(KvQuota::new()),
             trust,
             sink: Arc::new(NoopSink),
             _epoch_ticker,
@@ -743,6 +933,7 @@ impl Host {
             request_deadline_ms: opts.request_deadline_ms,
             max_memory_bytes: opts.max_memory_bytes,
             ratelimit_bucket: opts.ratelimit_bucket,
+            kv_quota: self.kv_quota.clone(),
         };
 
         let trusted = match opts.isolation {
@@ -781,6 +972,7 @@ struct LoadedInner {
     request_deadline_ms: u64,
     max_memory_bytes: u64,
     ratelimit_bucket: Option<Bucket>,
+    kv_quota: Arc<KvQuota>,
 }
 
 impl LoadedInner {
@@ -794,6 +986,7 @@ impl LoadedInner {
                 self.kv_prefix.clone(),
                 self.max_memory_bytes,
                 self.ratelimit_bucket,
+                self.kv_quota.clone(),
             ),
         );
         store.limiter(|s| &mut s.limits);
@@ -1308,6 +1501,7 @@ mod tests {
             prefix.to_string(),
             DEFAULT_MAX_MEMORY_BYTES,
             None,
+            Arc::new(KvQuota::new()),
         )
     }
 
@@ -1331,12 +1525,14 @@ mod tests {
             "filter-a\u{1f}".to_string(),
             DEFAULT_MAX_MEMORY_BYTES,
             None,
+            Arc::new(KvQuota::new()),
         );
         let mut b = HostState::new(
             shared.clone(),
             "filter-b\u{1f}".to_string(),
             DEFAULT_MAX_MEMORY_BYTES,
             None,
+            Arc::new(KvQuota::new()),
         );
 
         KvHost::set(&mut a, "count".into(), b"1".to_vec());
@@ -1363,12 +1559,14 @@ mod tests {
             "filter-a\u{1f}".to_string(),
             DEFAULT_MAX_MEMORY_BYTES,
             None,
+            Arc::new(KvQuota::new()),
         );
         let mut b = HostState::new(
             shared.clone(),
             "filter-b\u{1f}".to_string(),
             DEFAULT_MAX_MEMORY_BYTES,
             None,
+            Arc::new(KvQuota::new()),
         );
 
         assert_eq!(CounterHost::increment(&mut a, "hits".into(), 5), 5);
@@ -1410,12 +1608,14 @@ mod tests {
             "filter-a\u{1f}".to_string(),
             DEFAULT_MAX_MEMORY_BYTES,
             Some(one_token_no_refill()),
+            Arc::new(KvQuota::new()),
         );
         let mut b = HostState::new(
             shared.clone(),
             "filter-b\u{1f}".to_string(),
             DEFAULT_MAX_MEMORY_BYTES,
             Some(one_token_no_refill()),
+            Arc::new(KvQuota::new()),
         );
 
         // a drains its single-token bucket on key "k".
@@ -1491,6 +1691,93 @@ mod tests {
             trap.headers
                 .iter()
                 .any(|h| h.name == "x-plecto-fault" && h.value == "trap")
+        );
+    }
+
+    #[test]
+    fn untrusted_init_deadline_is_tight_trusted_is_generous() {
+        // untrusted filters re-run init per request, so their default init budget must be
+        // bounded near the per-request budget, while a trusted filter (init once) keeps the
+        // generous budget.
+        assert_eq!(
+            LoadOptions::untrusted().init_deadline_ms,
+            DEFAULT_UNTRUSTED_INIT_DEADLINE_MS
+        );
+        assert_eq!(
+            LoadOptions::trusted().init_deadline_ms,
+            DEFAULT_INIT_DEADLINE_MS
+        );
+        assert!(
+            LoadOptions::untrusted().init_deadline_ms < LoadOptions::trusted().init_deadline_ms
+        );
+    }
+
+    #[test]
+    fn kv_value_over_cap_is_dropped_fail_closed() {
+        // a value past the per-key cap is dropped, not stored (host-API is infallible from
+        // the filter's view). A within-cap value stores normally.
+        let mut s = state("f\u{1f}");
+        KvHost::set(&mut s, "big".into(), vec![0u8; MAX_KV_VALUE_BYTES + 1]);
+        assert_eq!(
+            KvHost::get(&mut s, "big".into()),
+            None,
+            "an over-cap value is dropped"
+        );
+        KvHost::set(&mut s, "ok".into(), vec![0u8; 128]);
+        assert_eq!(KvHost::get(&mut s, "ok".into()), Some(vec![0u8; 128]));
+    }
+
+    #[test]
+    fn quota_admit_rejects_growth_past_caps_and_allows_shrink() {
+        // KvQuota accounting — a growth past a per-namespace or global cap is rejected; a
+        // shrink (negative delta) always applies and frees the budget for a later growth.
+        let q = KvQuota::new();
+        assert!(q.admit("ns", 1, 100), "a small entry fits");
+        assert!(
+            !q.admit("ns", 1, MAX_NS_BYTES as isize),
+            "a value that would exceed the per-namespace byte cap is rejected"
+        );
+        assert!(
+            !q.admit("ns2", 1, MAX_TOTAL_BYTES as isize),
+            "a value that would exceed the host-wide byte cap is rejected"
+        );
+        // a shrink always applies (release path), and never rejects.
+        q.release("ns", 1, 100);
+        assert!(
+            q.admit("ns", 1, 100),
+            "freed budget is reusable after a release"
+        );
+    }
+
+    #[test]
+    fn host_log_is_capped_and_sanitized() {
+        // control bytes are neutralized (no CRLF log-line injection / ANSI), and
+        // the per-request line count is bounded with a single truncation marker.
+        let mut s = state("f\u{1f}");
+        LogHost::log(&mut s, LogLevel::Info, "a\r\nInjected: x\u{1b}[31m".into());
+        assert!(
+            !s.logs[0].message.contains('\r') && !s.logs[0].message.contains('\n'),
+            "CR/LF are neutralized (no log-line injection)"
+        );
+        assert!(
+            !s.logs[0].message.contains('\u{1b}'),
+            "the ANSI escape is neutralized"
+        );
+
+        // a long message is truncated to the byte cap.
+        let mut s2 = state("f\u{1f}");
+        LogHost::log(&mut s2, LogLevel::Info, "x".repeat(MAX_LOG_MSG_BYTES * 2));
+        assert!(s2.logs[0].message.len() <= MAX_LOG_MSG_BYTES);
+
+        // the per-request line count is bounded, last slot is a truncation marker.
+        let mut s3 = state("f\u{1f}");
+        for i in 0..(MAX_LOG_LINES_PER_REQUEST + 50) {
+            LogHost::log(&mut s3, LogLevel::Info, format!("line {i}"));
+        }
+        assert_eq!(s3.logs.len(), MAX_LOG_LINES_PER_REQUEST);
+        assert!(
+            s3.logs.last().unwrap().message.contains("truncated"),
+            "the final retained line is the truncation marker"
         );
     }
 }

@@ -59,7 +59,81 @@ fn normalize_host(authority: &str) -> String {
     } else {
         authority.split(':').next().unwrap_or(authority)
     };
-    host.to_ascii_lowercase()
+    let lowered = host.to_ascii_lowercase();
+    // Absolute-form hosts carry a trailing dot (`example.com.`); strip a single one so they match
+    // the canonical `example.com` route and cannot silently slip to a wildcard route (/
+    // CWE-644). IPv6 literals (`[...]`) never end in a dot, so this only affects DNS names.
+    match lowered.strip_suffix('.') {
+        Some(stripped) if !lowered.starts_with('[') => stripped.to_string(),
+        _ => lowered,
+    }
+}
+
+/// Normalize a request target's PATH for routing and forwarding so the proxy and the origin agree
+/// on it (CWE-22 Path Traversal / CWE-436 Interpretation Conflict). Per-route filter chains
+/// are an access-control boundary, so route selection IS access control: a `..` segment that selects
+/// a laxer route here but resolves to a stricter path at the upstream would bypass that route's
+/// filters. The fast path normalizes once at ingress and then routes, runs the chain, and forwards
+/// on the SAME normalized path, so the origin cannot re-derive a different path.
+///
+/// Returns the normalized `path[?query]`, or `None` to reject (the server fails closed with 400).
+/// Policy: reject control bytes, backslash, and percent-encoded separators/dots (`%2e`/`%2f`/`%5c`,
+/// ambiguous between front-end and back-end), then lexically remove `.`/`..` segments; a `..` that
+/// escapes the root is rejected. The query string (after `?`) is preserved verbatim.
+pub fn normalize_path(target: &str) -> Option<String> {
+    let (raw, query) = match target.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (target, None),
+    };
+    // A non-origin target (asterisk-form, or no leading `/`) cannot fall under a `/`-prefixed
+    // route, so it needs no traversal handling — pass it through unchanged.
+    if !raw.starts_with('/') {
+        return Some(target.to_string());
+    }
+    // Reject control bytes / backslash and percent-encoded separators or dots: an origin that
+    // decodes `%2f`/`%2e`/`%5c` would re-derive a path different from the one we route on and
+    // forward, re-opening the front-end/back-end normalization gap.
+    if raw.bytes().any(|b| b < 0x20 || b == 0x7f) || raw.contains('\\') {
+        return None;
+    }
+    if contains_encoded_separator(raw) {
+        return None;
+    }
+    // Lexically resolve `.` / `..` over `/`-separated segments. `out` always holds the leading ""
+    // (root); a `..` that would pop past it escapes the root and is rejected (fail-closed).
+    let mut out: Vec<&str> = Vec::new();
+    for seg in raw.split('/') {
+        match seg {
+            "." => {}
+            ".." => {
+                if out.len() <= 1 {
+                    return None;
+                }
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    let mut norm = out.join("/");
+    if norm.is_empty() {
+        norm.push('/');
+    }
+    if let Some(q) = query {
+        norm.push('?');
+        norm.push_str(q);
+    }
+    Some(norm)
+}
+
+/// Does the path contain a percent-encoded separator or dot (`%2e`/`%2f`/`%5c`, any hex case)?
+fn contains_encoded_separator(path: &str) -> bool {
+    path.as_bytes().windows(3).any(|w| {
+        w[0] == b'%'
+            && matches!(
+                (w[1], w[2]),
+                (b'2', b'e' | b'E') | (b'2', b'f' | b'F') | (b'5', b'c' | b'C')
+            )
+    })
 }
 
 /// Does `path` fall under `prefix` on a `/` boundary? `/api` matches `/api` and `/api/x` but not
@@ -261,5 +335,72 @@ mod tests {
         );
         assert_eq!(normalize_host(""), "", "empty authority does not panic");
         assert_eq!(normalize_host("[]:9"), "[]");
+    }
+
+    #[test]
+    fn normalize_host_strips_trailing_dot() {
+        // / CWE-644: an absolute-form host (`example.com.`) must canonicalise to
+        // `example.com` so it matches the host-constrained route instead of slipping to a wildcard.
+        assert_eq!(normalize_host("example.com."), "example.com");
+        assert_eq!(normalize_host("EXAMPLE.COM.:8443"), "example.com");
+        assert_eq!(normalize_host("example.com"), "example.com");
+        // an IPv6 literal is unaffected (never ends in a dot).
+        assert_eq!(normalize_host("[::1]"), "[::1]");
+    }
+
+    #[test]
+    fn normalize_path_resolves_dot_segments_and_preserves_query() {
+        assert_eq!(
+            normalize_path("/public/../admin").as_deref(),
+            Some("/admin")
+        );
+        assert_eq!(normalize_path("/a/./b").as_deref(), Some("/a/b"));
+        assert_eq!(normalize_path("/a/b/../c").as_deref(), Some("/a/c"));
+        assert_eq!(normalize_path("/").as_deref(), Some("/"));
+        assert_eq!(normalize_path("/api/").as_deref(), Some("/api/"));
+        assert_eq!(normalize_path("/api").as_deref(), Some("/api"));
+        // the query is preserved verbatim, dot-resolution applies to the path only.
+        assert_eq!(
+            normalize_path("/x/../y?a=../b").as_deref(),
+            Some("/y?a=../b")
+        );
+        // a non-origin target (asterisk-form) is passed through.
+        assert_eq!(normalize_path("*").as_deref(), Some("*"));
+    }
+
+    #[test]
+    fn normalize_path_rejects_traversal_and_ambiguous_encodings() {
+        // root escape → reject (fail-closed).
+        assert_eq!(normalize_path("/.."), None);
+        assert_eq!(normalize_path("/a/../.."), None);
+        // percent-encoded separators/dots are ambiguous between front-end and back-end → reject.
+        assert_eq!(normalize_path("/public/%2e%2e/admin"), None);
+        assert_eq!(normalize_path("/x%2fy"), None);
+        assert_eq!(normalize_path("/x%2Fy"), None);
+        assert_eq!(normalize_path("/x%5cy"), None);
+        // backslash and control bytes → reject.
+        assert_eq!(normalize_path("/a\\b"), None);
+        assert_eq!(normalize_path("/a\nb"), None);
+    }
+
+    #[test]
+    fn normalize_path_closes_per_route_filter_bypass() {
+        // a request crafted to select the laxer `/public` route while resolving to
+        // `/public/admin` at the upstream must, after ingress normalization, select the stricter
+        // `/public/admin` route (which carries the auth filter) — no bypass.
+        let routes = vec![
+            route(None, "/public", "pub"),
+            route(None, "/public/admin", "admin"),
+        ];
+        let raw = "/public/x/../admin";
+        let norm = normalize_path(raw).expect("normalizes to a clean path");
+        assert_eq!(norm, "/public/admin");
+        assert_eq!(
+            select(&routes, "h", &norm),
+            Some(1),
+            "the normalized path selects the stricter, filtered route"
+        );
+        // (the un-normalized path would have selected the laxer route 0 — the bug.)
+        assert_eq!(select(&routes, "h", raw), Some(0));
     }
 }

@@ -253,6 +253,39 @@ impl Manifest {
 }
 
 impl FilterEntry {
+    /// Reject out-of-range metering / rate-limit values before they reach the host (/
+    /// CWE-20): a zero deadline would make every call instantly time out, a zero memory cap is
+    /// unusable, and a rate-limit bucket with `capacity == 0` or `refill_interval_ms == 0`
+    /// (with refills) can never serve a token — a config typo, not an intended state. Fail-closed.
+    pub(crate) fn validate(&self) -> Result<(), ControlError> {
+        let bad = |reason: &str| ControlError::InvalidFilterConfig {
+            id: self.id.clone(),
+            reason: reason.to_string(),
+        };
+        if self.init_deadline_ms == Some(0) {
+            return Err(bad("init_deadline_ms must be non-zero"));
+        }
+        if self.request_deadline_ms == Some(0) {
+            return Err(bad("request_deadline_ms must be non-zero"));
+        }
+        if self.max_memory_bytes == Some(0) {
+            return Err(bad("max_memory_bytes must be non-zero"));
+        }
+        if let Some(rl) = self.ratelimit {
+            if rl.capacity == 0 {
+                return Err(bad("ratelimit.capacity must be non-zero"));
+            }
+            // refill_tokens == 0 is a valid one-shot (no-refill) bucket; but a positive refill with
+            // a zero interval can never advance — reject that typo.
+            if rl.refill_tokens > 0 && rl.refill_interval_ms == 0 {
+                return Err(bad(
+                    "ratelimit.refill_interval_ms must be non-zero when refill_tokens > 0",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// The host `LoadOptions` for this entry: isolation plus any metering overrides
     /// (ADR 000006). Unset knobs keep the host defaults.
     pub(crate) fn load_options(&self) -> LoadOptions {
@@ -633,5 +666,66 @@ typo_field = true
         assert_eq!(bucket.capacity, 100);
         assert_eq!(bucket.refill_tokens, 10);
         assert_eq!(bucket.refill_interval_ms, 1000);
+    }
+
+    #[test]
+    fn invalid_filter_metering_is_rejected() {
+        // out-of-range metering / rate-limit values are rejected fail-closed at build.
+        let base = FilterEntry {
+            id: "x".to_string(),
+            source: "s".to_string(),
+            digest: "sha256:abc".to_string(),
+            isolation: IsolationKind::Untrusted,
+            init_deadline_ms: None,
+            request_deadline_ms: None,
+            max_memory_bytes: None,
+            ratelimit: None,
+        };
+        assert!(base.validate().is_ok(), "defaults are valid");
+
+        assert!(
+            FilterEntry {
+                request_deadline_ms: Some(0),
+                ..base.clone()
+            }
+            .validate()
+            .is_err(),
+            "a zero request deadline is rejected"
+        );
+        assert!(
+            FilterEntry {
+                max_memory_bytes: Some(0),
+                ..base.clone()
+            }
+            .validate()
+            .is_err(),
+            "a zero memory cap is rejected"
+        );
+        assert!(
+            FilterEntry {
+                ratelimit: Some(RateLimitConfig {
+                    capacity: 10,
+                    refill_tokens: 1,
+                    refill_interval_ms: 0,
+                }),
+                ..base.clone()
+            }
+            .validate()
+            .is_err(),
+            "a refilling bucket with a zero interval is rejected"
+        );
+        assert!(
+            FilterEntry {
+                ratelimit: Some(RateLimitConfig {
+                    capacity: 10,
+                    refill_tokens: 0,
+                    refill_interval_ms: 0,
+                }),
+                ..base.clone()
+            }
+            .validate()
+            .is_ok(),
+            "a one-shot (no-refill) bucket is valid"
+        );
     }
 }

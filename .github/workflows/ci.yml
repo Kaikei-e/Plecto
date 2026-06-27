@@ -40,9 +40,11 @@ jobs:
     name: rustfmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: dtolnay/rust-toolchain@6190aa5fb88a88ee71c12769924bbe63a9ab152e # 1.96.0
         with:
+          # SHA-pinned (A08): the action selects the toolchain from its ref name, so pin it back here.
+          toolchain: "1.96.0"
           components: rustfmt
       - run: cargo fmt --all -- --check
       # filter-hello is a separate workspace, formatted on its own.
@@ -55,7 +57,7 @@ jobs:
     name: clippy + test + build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
       # wasmtime 46 / cranelift (ADR 000021) is a large build, and this job holds BOTH the
       # debug target/ (cargo test --all) and the release target/ (cargo build --release) at
       # once. Free the runner's preinstalled bloat (~14GB: Android SDK / .NET / GHC) so both
@@ -64,11 +66,12 @@ jobs:
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc || true
           df -h /
-      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: dtolnay/rust-toolchain@6190aa5fb88a88ee71c12769924bbe63a9ab152e # 1.96.0
         with:
+          toolchain: "1.96.0" # SHA-pinned (A08): re-state the toolchain the ref no longer encodes.
           components: clippy
           targets: wasm32-unknown-unknown # REQUIRED: build.rs builds the guest
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: plecto
           cache-on-failure: true
@@ -88,12 +91,13 @@ jobs:
       run:
         working-directory: plecto/examples/filters/filter-hello
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: dtolnay/rust-toolchain@6190aa5fb88a88ee71c12769924bbe63a9ab152e # 1.96.0
         with:
+          toolchain: "1.96.0" # SHA-pinned (A08): re-state the toolchain the ref no longer encodes.
           components: clippy
           targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: plecto-guest
           workspaces: plecto/examples/filters/filter-hello
@@ -108,8 +112,10 @@ jobs:
     name: cargo-deny (supply-chain)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2
         with:
           manifest-path: plecto/Cargo.toml
-          command: check advisories bans
+          # `sources` also gates crate origin (only crates.io), catching a typosquat / unexpected
+          # registry or git source early (A03). `licenses` stays out until an allow-list lands.
+          command: check advisories bans sources
