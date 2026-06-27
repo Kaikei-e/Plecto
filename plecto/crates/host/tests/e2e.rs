@@ -142,8 +142,9 @@ fn untrusted_filter_reinitializes_each_request() {
 #[test]
 fn rate_limit_short_circuits_after_capacity() {
     // Host-native token bucket (ADR 000005): capacity 2 → first two pass, third is denied
-    // with a synthesised 429. State lives host-side, so it persists across requests.
-    let (_host, filter) = signed_load(LoadOptions::trusted());
+    // with a synthesised 429. State lives host-side, so it persists across requests. The spec is
+    // host-configured (ADR 000026), not filter-supplied.
+    let (_host, filter) = signed_load(LoadOptions::trusted().with_ratelimit_bucket(2, 1, 60_000));
 
     let limited = request(&[("x-plecto-ratelimit", "1")]);
 
@@ -177,8 +178,9 @@ fn rate_limit_counting_is_host_native_across_fresh_untrusted_instances() {
     // memory (init re-runs, so `init-calls` climbs 1→2→3). If counting lived in WASM memory
     // it would reset each request and the bucket would never drain; because it is host-native,
     // the same capacity-2 bucket still drains across those fresh instances and the third
-    // request is denied 429.
-    let (_host, filter) = signed_load(LoadOptions::untrusted());
+    // request is denied 429. The spec (capacity 2) is now HOST-configured (ADR 000026), not
+    // filter-supplied — the filter only passes (key, cost), so it cannot widen its own limit.
+    let (_host, filter) = signed_load(LoadOptions::untrusted().with_ratelimit_bucket(2, 1, 60_000));
 
     let limited = request(&[("x-plecto-ratelimit", "1")]);
 
@@ -204,6 +206,21 @@ fn rate_limit_counting_is_host_native_across_fresh_untrusted_instances() {
     assert!(
         matches!(decision, RequestDecision::ShortCircuit(resp) if resp.status == 429),
         "host-native bucket drains across fresh instances → third request denied 429"
+    );
+}
+
+#[test]
+fn ratelimit_without_a_host_bucket_fails_closed() {
+    // ADR 000026: the bucket spec is host-configured per filter; a filter with NO configured
+    // bucket cannot get a free pass. Loaded without `with_ratelimit_bucket`, the filter's
+    // `try-acquire` denies — so an untrusted filter cannot bypass rate limiting by simply lacking
+    // a host limit. The first request that consults the limiter is short-circuited 429.
+    let (_host, filter) = signed_load(LoadOptions::untrusted());
+
+    let (decision, _logs) = on_req(&filter, &request(&[("x-plecto-ratelimit", "1")])).unwrap();
+    assert!(
+        matches!(decision, RequestDecision::ShortCircuit(resp) if resp.status == 429),
+        "a filter with no host-configured bucket must fail closed (denied), not bypass the limiter"
     );
 }
 

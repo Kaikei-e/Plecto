@@ -117,21 +117,6 @@ interface host-counter {
 // --- consult the limiter and on what key. This is the fast-path/extension-plane
 // --- split applied to rate limiting.
 interface host-ratelimit {
-    // A token-bucket specification. In v0.1.0 the filter supplies it per call because
-    // Plecto has no declarative manifest yet (ADR 000007); once the manifest lands the
-    // spec moves host-side and `try-acquire` slims to (key, cost). Trust caveat: while the
-    // spec is filter-supplied it is the filter's *claim*, not a host-enforced limit — an
-    // untrusted filter could pass a huge `capacity` to neuter its own limiter. Fine for
-    // trusted (operator-authored) filters; the manifest closes this for untrusted ones.
-    record bucket {
-        // maximum tokens the bucket can hold
-        capacity: u64,
-        // tokens added each refill interval
-        refill-tokens: u64,
-        // refill interval in milliseconds (host advances by whole intervals)
-        refill-interval-ms: u64,
-    }
-
     // The outcome of a token-bucket acquire.
     record acquire {
         // whether `cost` tokens were granted
@@ -142,10 +127,13 @@ interface host-ratelimit {
         retry-after-ms: u64,
     }
 
-    // Try to take `cost` tokens from the bucket at `key` (host-namespaced per filter).
-    // Refill is computed against the per-request clock snapshot (host-clock), so the
-    // result is deterministic within a request. Fail-closed: a backend error denies.
-    try-acquire: func(key: string, cost: u64, spec: bucket) -> acquire;
+    // Try to take `cost` tokens from THIS filter's bucket at `key` (host-namespaced per
+    // filter). The bucket spec (capacity / refill) is configured HOST-SIDE in the manifest
+    // (`[filter.ratelimit]`, ADR 000026), NOT supplied by the filter — so an untrusted filter
+    // cannot neuter its own limiter by claiming a huge capacity. A filter with no host-
+    // configured bucket is denied (fail-closed). Refill uses the per-request clock snapshot
+    // (host-clock), deterministic within a request; a backend error also denies.
+    try-acquire: func(key: string, cost: u64) -> acquire;
 }
 
 world filter {

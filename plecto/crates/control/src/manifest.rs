@@ -170,6 +170,21 @@ pub struct Trust {
     pub keys: Vec<String>,
 }
 
+/// Host-side token-bucket spec for a filter's `host-ratelimit` (ADR 000026), set in the manifest
+/// as an inline table `ratelimit = { capacity = .., refill_tokens = .., refill_interval_ms = .. }`.
+/// The operator owns it, so an untrusted filter cannot supply or override its own limit (the WIT
+/// `try-acquire` carries only `key` + `cost`).
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RateLimitConfig {
+    /// Maximum tokens the bucket can hold.
+    pub capacity: u64,
+    /// Tokens added each refill interval.
+    pub refill_tokens: u64,
+    /// Refill interval in milliseconds (the host advances by whole intervals).
+    pub refill_interval_ms: u64,
+}
+
 /// One filter to load, pinned by OCI digest.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -191,6 +206,10 @@ pub struct FilterEntry {
     pub init_deadline_ms: Option<u64>,
     pub request_deadline_ms: Option<u64>,
     pub max_memory_bytes: Option<u64>,
+    /// Host-side token bucket for this filter's `host-ratelimit` (ADR 000026). Absent = the filter
+    /// has no limiter (its `try-acquire` fails closed). Operator-configured so an untrusted filter
+    /// cannot override its own limit.
+    pub ratelimit: Option<RateLimitConfig>,
 }
 
 /// Manifest spelling of the host's `Isolation`. Defaults to `untrusted` (fail-closed).
@@ -249,6 +268,9 @@ impl FilterEntry {
         }
         if let Some(bytes) = self.max_memory_bytes {
             opts = opts.with_max_memory_bytes(bytes);
+        }
+        if let Some(rl) = self.ratelimit {
+            opts = opts.with_ratelimit_bucket(rl.capacity, rl.refill_tokens, rl.refill_interval_ms);
         }
         opts
     }
@@ -587,6 +609,11 @@ typo_field = true
             init_deadline_ms: None,
             request_deadline_ms: Some(40),
             max_memory_bytes: Some(1024),
+            ratelimit: Some(RateLimitConfig {
+                capacity: 100,
+                refill_tokens: 10,
+                refill_interval_ms: 1000,
+            }),
         };
         let opts = entry.load_options();
 
@@ -598,5 +625,13 @@ typo_field = true
             opts.init_deadline_ms,
             LoadOptions::trusted().init_deadline_ms
         );
+        // the per-filter manifest bucket maps to the host-side spec (ADR 000026) — the filter
+        // cannot supply or override it.
+        let bucket = opts
+            .ratelimit_bucket
+            .expect("a manifest ratelimit maps to the host bucket");
+        assert_eq!(bucket.capacity, 100);
+        assert_eq!(bucket.refill_tokens, 10);
+        assert_eq!(bucket.refill_interval_ms, 1000);
     }
 }

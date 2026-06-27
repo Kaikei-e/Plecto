@@ -154,6 +154,10 @@ pub struct LoadOptions {
     /// Trusted pool: recycle an instance (discard + rebuild) after this many requests, bounding
     /// linear-memory state accumulation (§6.6). Ignored for `Untrusted`.
     pub max_requests_per_instance: u64,
+    /// This filter's host-side token-bucket spec for `host-ratelimit` (manifest
+    /// `[filter.ratelimit]`, ADR 000026). `None` = the filter has no limiter (its `try-acquire`
+    /// fails closed). Host-configured so an untrusted filter cannot override its own limit.
+    pub ratelimit_bucket: Option<Bucket>,
 }
 
 impl Default for LoadOptions {
@@ -166,6 +170,7 @@ impl Default for LoadOptions {
             trusted_pool_size: default_trusted_pool_size(),
             checkout_timeout_ms: DEFAULT_CHECKOUT_TIMEOUT_MS,
             max_requests_per_instance: DEFAULT_MAX_REQUESTS_PER_INSTANCE,
+            ratelimit_bucket: None,
         }
     }
 }
@@ -208,6 +213,21 @@ impl LoadOptions {
     /// Override how many requests a trusted instance serves before it is recycled.
     pub fn with_max_requests_per_instance(mut self, n: u64) -> Self {
         self.max_requests_per_instance = n;
+        self
+    }
+    /// Configure this filter's host-side `host-ratelimit` token bucket (ADR 000026). Without it,
+    /// the filter's `try-acquire` fails closed. The filter cannot supply or override these.
+    pub fn with_ratelimit_bucket(
+        mut self,
+        capacity: u64,
+        refill_tokens: u64,
+        refill_interval_ms: u64,
+    ) -> Self {
+        self.ratelimit_bucket = Some(Bucket {
+            capacity,
+            refill_tokens,
+            refill_interval_ms,
+        });
         self
     }
 }
@@ -416,10 +436,19 @@ pub struct HostState {
     /// `Store::limiter`; a grow past the cap is denied, bounding mis-allocation and runaway
     /// growth even on the untrusted on-demand engine (which has no pooling reservation).
     limits: StoreLimits,
+    /// This filter's host-configured token-bucket spec (manifest `[filter.ratelimit]`, ADR
+    /// 000026). `None` = no bucket configured → `host-ratelimit/try-acquire` fails closed. The
+    /// filter cannot supply or override it, so an untrusted filter cannot neuter its own limiter.
+    ratelimit_bucket: Option<Bucket>,
 }
 
 impl HostState {
-    fn new(kv: Arc<dyn KvBackend>, kv_prefix: String, max_memory_bytes: u64) -> Self {
+    fn new(
+        kv: Arc<dyn KvBackend>,
+        kv_prefix: String,
+        max_memory_bytes: u64,
+        ratelimit_bucket: Option<Bucket>,
+    ) -> Self {
         Self {
             kv,
             kv_prefix,
@@ -429,6 +458,7 @@ impl HostState {
                 .memory_size(max_memory_bytes as usize)
                 .table_elements(MAX_TABLE_ELEMENTS)
                 .build(),
+            ratelimit_bucket,
         }
     }
 
@@ -491,22 +521,20 @@ impl host_counter::Host for HostState {
 }
 
 impl host_ratelimit::Host for HostState {
-    fn try_acquire(
-        &mut self,
-        key: String,
-        cost: u64,
-        spec: host_ratelimit::Bucket,
-    ) -> host_ratelimit::Acquire {
-        let r = self.kv.try_acquire(
-            &self.ns_key(TAG_RATELIMIT, &key),
-            cost,
-            Bucket {
-                capacity: spec.capacity,
-                refill_tokens: spec.refill_tokens,
-                refill_interval_ms: spec.refill_interval_ms,
-            },
-            self.now_ms,
-        );
+    fn try_acquire(&mut self, key: String, cost: u64) -> host_ratelimit::Acquire {
+        // The bucket spec is host-configured per filter (manifest, ADR 000026); the filter cannot
+        // supply or override it. A filter with no configured bucket is denied (fail-closed) — it
+        // cannot opt out of its limiter.
+        let Some(spec) = self.ratelimit_bucket else {
+            return host_ratelimit::Acquire {
+                allowed: false,
+                remaining: 0,
+                retry_after_ms: 0,
+            };
+        };
+        let r = self
+            .kv
+            .try_acquire(&self.ns_key(TAG_RATELIMIT, &key), cost, spec, self.now_ms);
         host_ratelimit::Acquire {
             allowed: r.allowed,
             remaining: r.remaining,
@@ -714,6 +742,7 @@ impl Host {
             init_deadline_ms: opts.init_deadline_ms,
             request_deadline_ms: opts.request_deadline_ms,
             max_memory_bytes: opts.max_memory_bytes,
+            ratelimit_bucket: opts.ratelimit_bucket,
         };
 
         let trusted = match opts.isolation {
@@ -751,6 +780,7 @@ struct LoadedInner {
     init_deadline_ms: u64,
     request_deadline_ms: u64,
     max_memory_bytes: u64,
+    ratelimit_bucket: Option<Bucket>,
 }
 
 impl LoadedInner {
@@ -763,6 +793,7 @@ impl LoadedInner {
                 self.kv.clone(),
                 self.kv_prefix.clone(),
                 self.max_memory_bytes,
+                self.ratelimit_bucket,
             ),
         );
         store.limiter(|s| &mut s.limits);
@@ -1276,6 +1307,7 @@ mod tests {
             Arc::new(MemoryBackend::default()),
             prefix.to_string(),
             DEFAULT_MAX_MEMORY_BYTES,
+            None,
         )
     }
 
@@ -1298,11 +1330,13 @@ mod tests {
             shared.clone(),
             "filter-a\u{1f}".to_string(),
             DEFAULT_MAX_MEMORY_BYTES,
+            None,
         );
         let mut b = HostState::new(
             shared.clone(),
             "filter-b\u{1f}".to_string(),
             DEFAULT_MAX_MEMORY_BYTES,
+            None,
         );
 
         KvHost::set(&mut a, "count".into(), b"1".to_vec());
@@ -1328,11 +1362,13 @@ mod tests {
             shared.clone(),
             "filter-a\u{1f}".to_string(),
             DEFAULT_MAX_MEMORY_BYTES,
+            None,
         );
         let mut b = HostState::new(
             shared.clone(),
             "filter-b\u{1f}".to_string(),
             DEFAULT_MAX_MEMORY_BYTES,
+            None,
         );
 
         assert_eq!(CounterHost::increment(&mut a, "hits".into(), 5), 5);
@@ -1359,35 +1395,38 @@ mod tests {
         // by — another filter's bucket under the same key. The token bucket lives in the shared
         // backend under a per-filter namespace; prove two filters' identical keys are independent.
         use host_ratelimit::Host as RateLimitHost;
-        fn one_token_no_refill() -> host_ratelimit::Bucket {
-            host_ratelimit::Bucket {
+        fn one_token_no_refill() -> Bucket {
+            Bucket {
                 capacity: 1,
                 refill_tokens: 0,
                 refill_interval_ms: 0,
             }
         }
 
+        // The bucket spec is host-configured (ADR 000026), so each filter's HostState carries it.
         let shared: Arc<dyn KvBackend> = Arc::new(MemoryBackend::default());
         let mut a = HostState::new(
             shared.clone(),
             "filter-a\u{1f}".to_string(),
             DEFAULT_MAX_MEMORY_BYTES,
+            Some(one_token_no_refill()),
         );
         let mut b = HostState::new(
             shared.clone(),
             "filter-b\u{1f}".to_string(),
             DEFAULT_MAX_MEMORY_BYTES,
+            Some(one_token_no_refill()),
         );
 
         // a drains its single-token bucket on key "k".
-        assert!(RateLimitHost::try_acquire(&mut a, "k".into(), 1, one_token_no_refill()).allowed);
+        assert!(RateLimitHost::try_acquire(&mut a, "k".into(), 1).allowed);
         assert!(
-            !RateLimitHost::try_acquire(&mut a, "k".into(), 1, one_token_no_refill()).allowed,
+            !RateLimitHost::try_acquire(&mut a, "k".into(), 1).allowed,
             "a's bucket is now empty"
         );
         // b's bucket under the SAME key is a different namespace → still full.
         assert!(
-            RateLimitHost::try_acquire(&mut b, "k".into(), 1, one_token_no_refill()).allowed,
+            RateLimitHost::try_acquire(&mut b, "k".into(), 1).allowed,
             "b's limiter must not share a's drained bucket"
         );
     }

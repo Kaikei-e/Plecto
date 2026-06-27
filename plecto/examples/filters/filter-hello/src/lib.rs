@@ -25,7 +25,7 @@ wit_bindgen::generate!({
 
 use crate::plecto::filter::host_counter;
 use crate::plecto::filter::host_log;
-use crate::plecto::filter::host_ratelimit::{self, Bucket};
+use crate::plecto::filter::host_ratelimit;
 use crate::plecto::filter::types::{Header, RequestEdit, ResponseEdit};
 
 struct FilterHello;
@@ -112,15 +112,9 @@ impl Guest for FilterHello {
         }
 
         if has_header(&req, "x-plecto-ratelimit") {
-            let outcome = host_ratelimit::try_acquire(
-                "default",
-                1,
-                Bucket {
-                    capacity: 2,
-                    refill_tokens: 1,
-                    refill_interval_ms: 60_000,
-                },
-            );
+            // The bucket spec is host-configured in the manifest (ADR 000026); the filter only
+            // decides to consult the limiter and on what key. No spec to pass (and none to forge).
+            let outcome = host_ratelimit::try_acquire("default", 1);
             if !outcome.allowed {
                 return RequestDecision::ShortCircuit(HttpResponse {
                     status: 429,
