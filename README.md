@@ -23,7 +23,7 @@ Plecto pairs **two complementary halves** through a typed [WIT](https://componen
 The speed-critical path stays native Rust. Your request logic runs as a sandboxed WASM component that can touch **only** the capabilities the host explicitly lends it — enforced by the sandbox, not by convention.
 
 > [!WARNING]
-> **Status: early development.** The design is settled (25 ADRs) and the foundation runs end to end: the `plecto:filter` contract, a wasmtime host that loads and runs filters, and a **fast path** that terminates **HTTP/1.1, HTTP/2 (ALPN), HTTP/3 (QUIC)** and **TLS**, routes by host + path prefix, propagates the client IP in an edge model, and **load-balances across healthy upstream instances** (round-robin + active/passive health, per-upstream timeout, request-level retry). The full suite is green on CI — a foundation you can read, run, and build filters against. See the [Roadmap](#roadmap).
+> **Status: early development.** The design is settled (26 ADRs) and the foundation runs end to end: the `plecto:filter` contract, a wasmtime host that loads and runs filters, and a **fast path** that terminates **HTTP/1.1, HTTP/2 (ALPN), HTTP/3 (QUIC)** and **TLS**, routes by host + path prefix, propagates the client IP in an edge model, and **load-balances across healthy upstream instances** (round-robin + active/passive health, per-upstream timeout, request-level retry). The full suite is green on CI — a foundation you can read, run, and build filters against. See the [Roadmap](#roadmap).
 
 ## Why Plecto?
 
@@ -183,30 +183,42 @@ export!(FilterHello);
 
 Because the contract is WIT, **any language that compiles to a WASM component can write a filter** — Rust, Go (TinyGo), JavaScript/TypeScript (`jco`), or Python (`componentize-py`). Polyglot filter SDKs are on the [roadmap](#roadmap).
 
+A complete how-to — scaffold, build, the manifest field reference, signing, and local testing — is in [**Writing a filter**](docs/writing-a-filter.md). A copy-ready starting point with the contract already vendored lives in [`examples/filters/filter-template`](plecto/examples/filters/filter-template).
+
 ## Try it
 
-```bash
-# Prerequisites: Rust 1.96+ (edition 2024) and the wasm32-unknown-unknown target.
-rustup target add wasm32-unknown-unknown
+The repository pins its toolchain and WASM target in
+[`plecto/rust-toolchain.toml`](plecto/rust-toolchain.toml), so [`rustup`](https://rustup.rs/) sets
+up the right Rust (edition 2024) and the `wasm32-unknown-unknown` target on your first build — no
+manual `rustup target add` step.
 
+```bash
 # Build and test everything. The host build script compiles the example filter to a
 # WASM component and the tests load it into the wasmtime host and exercise the contract.
 cd plecto
 cargo test --all
 ```
 
+(Building outside that toolchain? Add the target once: `rustup target add wasm32-unknown-unknown`.)
+
 The suite proves the slice end-to-end: a request flows through the host into a real filter component, the typed `decision` round-trips, and the filter reaches **only** the capabilities it was lent (the example component imports `plecto:filter/*` and nothing else — zero WASI, network, or filesystem access).
 
 ### Run the demos
 
-Five self-contained, use-case-focused examples live under `examples/<name>/`. Each wires the **production load path** (sign + offline OCI layout + verify + load, all fail-closed), starts a tiny upstream, serves a real proxy, and prints copy-paste `curl` commands on startup. Run one with:
+Five self-contained, use-case-focused demos live under `examples/<name>/`. Each wires the **production load path** (sign + offline OCI layout + verify + load, all fail-closed), starts a tiny upstream, serves a real proxy, and prints copy-paste `curl` commands on startup.
+
+The quickest way to see one work end to end is the guided tour — it starts the demo, waits for it, runs the `curl` commands, visualizes the output, and cleans up:
 
 ```bash
 cd plecto
-cargo run -p plecto-server --example <name>   # Ctrl-C to stop
+./examples/try.sh <name>      # or `all`; or `just demo <name>` from the repo root
 ```
 
-Or take a guided tour: `./examples/try.sh <name>` (or `all`) starts the example, waits for it, runs the `curl` commands, visualizes the output, and cleans up — no manual orchestration.
+Prefer to drive it yourself? Run the server directly and use the `curl` recipes it prints on startup:
+
+```bash
+cargo run -p plecto-server --example <name>   # Ctrl-C to stop
+```
 
 | `<name>` | What it shows |
 | --- | --- |
@@ -217,6 +229,8 @@ Or take a guided tour: `./examples/try.sh <name>` (or `all`) starts the example,
 | `hot-reload` | Edit the manifest, `kill -HUP <pid>`, and watch the config swap atomically with zero downtime (a broken edit is fail-closed). |
 
 Read `wasm-auth` first: it shows custom request logic running as a sandboxed component that can touch only the host-API it was lent — cosign-style signature + SBOM verification, the typed `decision`, and host-held state, end to end.
+
+Two more examples under `examples/` are micro-benchmarks rather than demos — `wasm-bench` and `edge-bench` — and produce the numbers in [performance](performance/README.md).
 
 ## Roadmap
 
@@ -252,19 +266,20 @@ Plecto is built ADR-first; each milestone realizes specific design decisions in 
 │       ├── <use-case>/        # five demos: cargo run -p plecto-server --example <name>
 │       └── filters/           # example plecto:filter guests (own workspace, componentized by build.rs)
 │           ├── filter-hello/  # conformance-fixture filter (wasm32-unknown-unknown guest)
-│           └── filter-apikey/ # real-world example filter: API-key auth gate (WASM component)
-├── docs/ADR/                  # Architecture Decision Records (000001–000025)
+│           ├── filter-apikey/ # real-world example filter: API-key auth gate (WASM component)
+│           └── filter-template/ # copy-ready starting point for your own filter (vendored WIT)
+├── docs/ADR/                  # Architecture Decision Records (000001–000026)
 ├── CLAUDE.md                  # project conventions & design summary
 └── CONTEXT-MAP.md             # domain glossary map (split per context)
 ```
 
 ## Design decisions
 
-Plecto records every load-bearing decision as an ADR in the Fork form (*decision / rationale / re-examination condition*). All 24 live in [`docs/ADR/`](docs/ADR/) — start at [ADR 000001](docs/ADR/000001.md) (the two complementary halves); each cross-links the decisions it builds on.
+Plecto records every load-bearing decision as an ADR in the Fork form (*decision / rationale / re-examination condition*). All 26 live in [`docs/ADR/`](docs/ADR/) — start at [ADR 000001](docs/ADR/000001.md) (the two complementary halves); each cross-links the decisions it builds on.
 
 ## Contributing
 
-Plecto follows outside-in TDD (E2E → WIT-conformance → unit) and records load-bearing decisions as ADRs. See [CLAUDE.md](CLAUDE.md) for conventions. Local CI parity before a PR:
+Contributions are deliberate: please **agree an approach in an issue or [Discussion](https://github.com/Kaikei-e/Plecto/discussions) before opening a PR** (unsolicited PRs may be closed). Plecto follows outside-in TDD (E2E → WIT-conformance → unit) and records load-bearing decisions as ADRs. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full guide — including the areas that need extra care and DCO sign-off — and [CLAUDE.md](CLAUDE.md) for conventions. Local CI parity before a PR:
 
 ```bash
 cd plecto
@@ -272,6 +287,8 @@ cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all
 ```
+
+(or just `just check` from the repository root.)
 
 ## License
 

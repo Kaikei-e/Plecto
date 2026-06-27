@@ -1,9 +1,14 @@
 [package]
 name = "plecto-server"
+description = "Plecto's fast path: an L7 reverse proxy / API gateway data plane (HTTP/1.1, HTTP/2, HTTP/3, TLS, routing, load balancing)."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish.workspace = true
 
 # The M2 fast path: a listener that drives requests through the control plane's routed filter
 # chains and forwards to upstreams — HTTP/1.1 + HTTP/2 over TCP and HTTP/3 over QUIC (ADR 000013 /

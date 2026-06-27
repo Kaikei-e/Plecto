@@ -11,6 +11,11 @@ version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/Kaikei-e/Plecto"
+homepage = "https://github.com/Kaikei-e/Plecto"
+keywords = ["proxy", "gateway", "wasm", "webassembly", "http"]
+categories = ["network-programming", "web-programming", "wasm"]
+# Not published to crates.io yet (early development). Flip per-crate when distribution begins.
+publish = false
 
 [workspace.dependencies]
 # Pinned to 46.0.0 exactly for the M3 Stage 1 host async migration (ADR 000021): wasmtime 46

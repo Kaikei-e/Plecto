@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions & ideas
+    url: https://github.com/Kaikei-e/Plecto/discussions
+    about: Ask questions, float ideas, and discuss design in GitHub Discussions.
+  - name: Report a security vulnerability
+    url: https://github.com/Kaikei-e/Plecto/security/advisories/new
+    about: Please report vulnerabilities privately — do not open a public issue.

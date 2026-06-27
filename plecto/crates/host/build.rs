@@ -67,11 +67,15 @@ fn build_component(cargo: &str, guest: &Path, out_dir: &Path, stem: &str, env_va
         .arg(&target_dir)
         .status()
         .unwrap_or_else(|e| panic!("failed to spawn cargo to build {}: {e}", guest.display()));
-    assert!(
-        status.success(),
-        "building {} (core module) failed",
-        guest.display()
-    );
+    if !status.success() {
+        panic!(
+            "building {} for wasm32-unknown-unknown failed.\n\
+             The usual cause is a missing WASM target. It is installed automatically by \
+             plecto/rust-toolchain.toml; if you build outside that toolchain, run:\n    \
+             rustup target add wasm32-unknown-unknown",
+            guest.display()
+        );
+    }
 
     let core = target_dir.join(format!("wasm32-unknown-unknown/release/{stem}.wasm"));
     assert!(

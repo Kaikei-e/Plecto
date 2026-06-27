@@ -1,0 +1,18 @@
+[package]
+name = "my-filter"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+# A WASM Component Model guest implementing the plecto:filter contract. Built for
+# wasm32-unknown-unknown and turned into a component with wit-component (ADR 000010).
+# The WIT contract is vendored under wit/ (not referenced by a relative path into the
+# Plecto repo), so this crate is self-contained and builds anywhere you copy it.
+# It declares its own [workspace] so a parent Cargo workspace never absorbs it.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.58"
+
+[workspace]

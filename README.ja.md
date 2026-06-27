@@ -23,7 +23,7 @@ Plecto は、**相補関係にある二つの構成要素**を型付き [WIT](ht
 速度が要となる経路は native Rust のまま。リクエストのロジックはサンドボックス化された WASM コンポーネントとして走り、**ホストが明示的に貸した能力以外には何も触れられない** —— それを強制するのは規約ではなくサンドボックスである。
 
 > [!WARNING]
-> **現状: 初期開発段階。** 設計は確定済み（25 本の ADR）で、基盤は end-to-end で動く: `plecto:filter` 契約・フィルタをロードして実行する wasmtime ホスト・そして **fast path** —— **HTTP/1.1・HTTP/2（ALPN）・HTTP/3（QUIC）** と **TLS** を終端し、host＋path-prefix で routing し、クライアント IP を edge モデルで伝播し、**healthy な upstream instance へロードバランシングする**（round-robin ＋ active/passive health・per-upstream timeout・request-level retry）。テスト一式は green で CI に載っている —— 読める・動かせる・フィルタを書ける基盤である。[ロードマップ](#ロードマップ)参照。
+> **現状: 初期開発段階。** 設計は確定済み（26 本の ADR）で、基盤は end-to-end で動く: `plecto:filter` 契約・フィルタをロードして実行する wasmtime ホスト・そして **fast path** —— **HTTP/1.1・HTTP/2（ALPN）・HTTP/3（QUIC）** と **TLS** を終端し、host＋path-prefix で routing し、クライアント IP を edge モデルで伝播し、**healthy な upstream instance へロードバランシングする**（round-robin ＋ active/passive health・per-upstream timeout・request-level retry）。テスト一式は green で CI に載っている —— 読める・動かせる・フィルタを書ける基盤である。[ロードマップ](#ロードマップ)参照。
 
 ## なぜ Plecto か
 
@@ -181,30 +181,41 @@ export!(FilterHello);
 
 契約が WIT なので、**WASM コンポーネントへコンパイルできる言語ならどれでもフィルタを書ける** — Rust・Go（TinyGo）・JavaScript/TypeScript（`jco`）・Python（`componentize-py`）。polyglot フィルタ SDK は[ロードマップ](#ロードマップ)に載っている。
 
+scaffold・ビルド・manifest フィールドリファレンス・署名・ローカルテストまでの完全な手引きは [**フィルタを書く（Writing a filter）**](docs/writing-a-filter.md) にある。契約を vendor 済みで、コピーしてすぐ使える雛形は [`examples/filters/filter-template`](plecto/examples/filters/filter-template)。
+
 ## 試す
 
-```bash
-# 前提: Rust 1.96+（edition 2024）と wasm32-unknown-unknown ターゲット。
-rustup target add wasm32-unknown-unknown
+ツールチェーンと WASM ターゲットは [`plecto/rust-toolchain.toml`](plecto/rust-toolchain.toml) に
+ピン留めしてあるので、[`rustup`](https://rustup.rs/) が初回ビルド時に適切な Rust（edition 2024）と
+`wasm32-unknown-unknown` ターゲットを自動で用意する —— 手動の `rustup target add` は不要。
 
+```bash
 # 全ビルド + テスト。host の build script が例フィルタを WASM コンポーネントへ
 # コンパイルし、テストがそれを wasmtime ホストにロードして契約を検証する。
 cd plecto
 cargo test --all
 ```
 
+（このツールチェーン外でビルドする場合は一度だけ: `rustup target add wasm32-unknown-unknown`。）
+
 テストはスライスを end-to-end で実証する: リクエストがホストを通って実フィルタ・コンポーネントへ流れ、型付き `decision` が往復し、フィルタは**貸与された能力だけ**に到達する（例コンポーネントは `plecto:filter/*` のみを import し、WASI・network・filesystem には一切アクセスしない）。
 
 ### デモを動かす
 
-ユースケース別の自己完結 example が `examples/<name>/` に 5 つある。どれも**本番ロードパス**（署名＋オフライン OCI レイアウト＋検証＋ロード、すべて fail-closed）を組み、小さな upstream を立て、実プロキシを serve し、起動時に貼り付け用の `curl` コマンドを表示する。実行:
+ユースケース別の自己完結デモが `examples/<name>/` に 5 つある。どれも**本番ロードパス**（署名＋オフライン OCI レイアウト＋検証＋ロード、すべて fail-closed）を組み、小さな upstream を立て、実プロキシを serve し、起動時に貼り付け用の `curl` コマンドを表示する。
+
+手早く end-to-end で見るならガイド付きツアー —— デモを起動し、readiness を待ち、`curl` を流し、結果を可視化して、後片付けまで自動でやる:
 
 ```bash
 cd plecto
-cargo run -p plecto-server --example <name>   # Ctrl-C で停止
+./examples/try.sh <name>      # または `all`。リポジトリ root からは `just demo <name>` でも可
 ```
 
-手早く全部見るなら `./examples/try.sh <name>`（または `all`）: example を起動し、readiness を待ち、`curl` を流し、結果を可視化して、後片付けまで自動でやる。
+自分で叩きたいなら、サーバを直接起動して、起動時に表示される `curl` レシピを使う:
+
+```bash
+cargo run -p plecto-server --example <name>   # Ctrl-C で停止
+```
 
 | `<name>` | 見せるもの |
 | --- | --- |
@@ -215,6 +226,8 @@ cargo run -p plecto-server --example <name>   # Ctrl-C で停止
 | `hot-reload` | manifest を編集して `kill -HUP <pid>`、無停止で設定をアトミックに差し替え（壊れた編集は fail-closed）。 |
 
 まず読むなら `wasm-auth`: 貸与された host-API だけに触れるサンドボックス・コンポーネントとしてカスタムなリクエスト処理が走る様子 —— cosign 風署名＋SBOM 検証・型付き `decision`・host 保持の状態 —— が端から端まで見える。
+
+`examples/` にはデモではない micro-benchmark が 2 つ（`wasm-bench` と `edge-bench`）あり、[performance](performance/README.md) の数値を生む。
 
 ## ロードマップ
 
@@ -250,19 +263,20 @@ Plecto は ADR ファーストで作る。各マイルストーンは `docs/ADR/
 │       ├── <use-case>/        # デモ 5 種: cargo run -p plecto-server --example <name>
 │       └── filters/           # 例 plecto:filter guest（独立 workspace・build.rs が component 化）
 │           ├── filter-hello/  # conformance 用の例フィルタ（wasm32-unknown-unknown ゲスト）
-│           └── filter-apikey/ # 実用例フィルタ: API キー認証ゲート（WASM コンポーネント）
-├── docs/ADR/                  # Architecture Decision Records（000001–000025）
+│           ├── filter-apikey/ # 実用例フィルタ: API キー認証ゲート（WASM コンポーネント）
+│           └── filter-template/ # 自作フィルタのコピー雛形（WIT を vendor 済み）
+├── docs/ADR/                  # Architecture Decision Records（000001–000026）
 ├── CLAUDE.md                  # プロジェクト規約・設計要約
 └── CONTEXT-MAP.md             # ドメイン用語集の地図（コンテキスト分割）
 ```
 
 ## 設計判断（ADR）
 
-Plecto は重要な設計判断をすべて ADR に、Fork 形式（*判断 / 根拠 / 再検討条件*）で記録している。25 本すべては [`docs/ADR/`](docs/ADR/) にあり、起点は [ADR 000001](docs/ADR/000001.md)（相補的な二つの構成要素）。各 ADR は土台にした判断へ相互リンクしている。
+Plecto は重要な設計判断をすべて ADR に、Fork 形式（*判断 / 根拠 / 再検討条件*）で記録している。26 本すべては [`docs/ADR/`](docs/ADR/) にあり、起点は [ADR 000001](docs/ADR/000001.md)（相補的な二つの構成要素）。各 ADR は土台にした判断へ相互リンクしている。
 
 ## コントリビュート
 
-Plecto は outside-in TDD（E2E → WIT-conformance → unit）に従い、load-bearing な判断を ADR に記録する。規約は [CLAUDE.md](CLAUDE.md) 参照。PR 前のローカル CI パリティ:
+コントリビュートは deliberate に扱う: **PR を出す前に issue か [Discussion](https://github.com/Kaikei-e/Plecto/discussions) で方針を合意してほしい**（事前合意のない PR は close されることがある）。Plecto は outside-in TDD（E2E → WIT-conformance → unit）に従い、load-bearing な判断を ADR に記録する。完全な手引き（注意を要する領域・DCO sign-off を含む）は [CONTRIBUTING.md](CONTRIBUTING.md)（規約は [CLAUDE.md](CLAUDE.md)）参照。PR 前のローカル CI パリティ:
 
 ```bash
 cd plecto
@@ -270,6 +284,8 @@ cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all
 ```
+
+（リポジトリ root からは `just check` でも可。）
 
 ## ライセンス
 

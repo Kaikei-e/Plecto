@@ -1,9 +1,14 @@
 [package]
 name = "plecto-control"
+description = "Plecto's control plane: declarative manifest, OCI artifact loading, filter-chain dispatch, and atomic hot reload."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish.workspace = true
 
 # plecto-control — the control plane (ADR 000007 / 000008): a single declarative TOML
 # manifest pins filters by OCI digest, an offline OCI image-layout store resolves them,

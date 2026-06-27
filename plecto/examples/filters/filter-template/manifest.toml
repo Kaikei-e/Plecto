@@ -1,0 +1,37 @@
+# A minimal Plecto manifest that loads this filter and runs it in front of one upstream.
+# The manifest is the static source of truth for which filters load, with which trust roots,
+# in what order (ADR 000007 / 000008). See docs/writing-a-filter.md for the full field reference.
+
+# Trusted signer public keys (PEM, manifest-relative). A filter must be signed by one of these.
+[trust]
+keys = ["keys/signer.pub"]
+
+# The filter to load, pinned by OCI digest.
+[[filter]]
+id = "my-filter"                  # host-assigned identity; namespaces this filter's KV
+source = "artifacts/my-filter"    # manifest-relative path to the local OCI image-layout
+digest = "sha256:REPLACE_ME"      # the pinned OCI image-manifest digest
+isolation = "untrusted"           # "untrusted" (default: fresh per request) | "trusted" (pooled)
+# Optional metering overrides (unset = host defaults):
+# init_deadline_ms = 200
+# request_deadline_ms = 25
+# max_memory_bytes = 16777216
+# Optional host-side token bucket for this filter's host-ratelimit (ADR 000026). The operator
+# owns it, so an untrusted filter cannot widen its own limit:
+# ratelimit = { capacity = 100, refill_tokens = 10, refill_interval_ms = 1000 }
+
+# A backend to forward passing requests to. Every upstream requires a health-check policy:
+# instances start unhealthy and only a passing probe puts one into rotation (ADR 000017).
+[[upstream]]
+name = "app"
+addresses = ["127.0.0.1:9000"]    # one or more host:port instances (round-robin over the healthy set)
+[upstream.health]
+path = "/healthz"                 # only `path` is required; interval/timeout/thresholds default
+
+# Route: match a path prefix, run the filter chain, forward to the upstream.
+[[route]]
+path_prefix = "/"
+filters = ["my-filter"]
+upstream = "app"
+# host = "example.com"            # optional: match only this authority
+# strip_prefix = "/api"          # optional: strip a prefix before forwarding (chain sees the original)

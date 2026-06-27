@@ -1,0 +1,9 @@
+# Lets this directory be used as a `cargo generate` template:
+#
+#   cargo generate --git https://github.com/Kaikei-e/Plecto.git \
+#     examples/filters/filter-template --name my-cool-filter
+#
+# After generating (or just copying the directory), set the package `name` in Cargo.toml.
+# The template is also a valid, buildable crate as-is.
+[template]
+ignore = ["target", "README.md"]

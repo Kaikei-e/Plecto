@@ -1,0 +1,8 @@
+# Pins the toolchain so a fresh clone builds with no manual setup, and matches CI
+# (.github/workflows/ci.yml pins dtolnay/rust-toolchain@1.96.0). `targets` makes rustup
+# install the WASM target on the first `cargo` invocation, so the example filters
+# (componentized by crates/host/build.rs) build without a separate `rustup target add`.
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]
+targets = ["wasm32-unknown-unknown"]

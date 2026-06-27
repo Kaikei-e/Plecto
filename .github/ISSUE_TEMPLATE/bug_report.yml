@@ -1,0 +1,64 @@
+name: Bug report
+description: Something in Plecto behaves incorrectly
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug. For **security vulnerabilities**, do not use this
+        form — follow [SECURITY.md](https://github.com/Kaikei-e/Plecto/blob/main/SECURITY.md) and
+        report privately instead.
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      description: Which part of Plecto is affected?
+      options:
+        - Fast path (plecto-server — routing, LB, TLS, HTTP)
+        - Extension plane / host (plecto-host — wasmtime, capabilities, pooling)
+        - Control plane (plecto-control — manifest, OCI load, reload)
+        - WIT contract (plecto:filter)
+        - Examples / demos
+        - Build, toolchain, or CI
+        - Docs
+        - Not sure
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the bug, including the impact.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: The smallest sequence that triggers the bug. Include the manifest, the request, or the command if relevant.
+      placeholder: |
+        1. `just example filter-chain`
+        2. `curl -s -H 'x-plecto-block: 1' http://localhost:8081/api/hello`
+        3. Observe …
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Output of `rustc --version`, your OS, and the Plecto commit (`git rev-parse HEAD`).
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or output
+      description: Relevant logs, a backtrace, or terminal output. This is automatically formatted.
+      render: shell
