@@ -525,7 +525,10 @@ async fn proxy_core(
         };
         let uri = format!("http://{}{}", instance.address(), upstream_path);
         let mut builder = Request::builder().method(forward.method.as_str()).uri(uri);
-        copy_headers(builder.headers_mut(), &forward.headers);
+        // Forward the chain's headers, restoring byte-equivalence for any the filters left untouched
+        // (P3#6): the contract's `string` values are lossy, but the original inbound bytes are still
+        // here in `parts.headers`, so a pass-through header reaches the upstream byte-for-byte.
+        copy_headers_preserving(builder.headers_mut(), &forward.headers, &parts.headers);
         // continue the trace into the upstream (ADR 000009 W3C propagation).
         if let Some(h) = builder.headers_mut()
             && let Ok(v) = HeaderValue::from_str(&snapshot.traceparent())
@@ -606,7 +609,12 @@ async fn proxy_core(
     // non-empty body means "use the synthetic response, drop the upstream stream"; an empty body
     // means "send the edited status + headers and stream the upstream body through".
     if edited.body.is_empty() {
-        Ok(stream_response(edited.status, &edited.headers, ubody))
+        Ok(stream_response(
+            edited.status,
+            &edited.headers,
+            &uparts.headers,
+            ubody,
+        ))
     } else {
         Ok(http_response(edited))
     }
@@ -681,6 +689,53 @@ fn copy_headers(dst: Option<&mut hyper::HeaderMap>, headers: &[Header]) {
     }
 }
 
+/// Like [`copy_headers`], but restores byte-equivalence for headers a filter never touched (P3#6).
+/// The contract carries each header value as a lossy-UTF-8 `string`, so a value holding non-UTF-8
+/// bytes (HTTP permits them) reaches the chain `U+FFFD`-mangled and would be re-encoded from that
+/// mangled form — or dropped entirely by `HeaderValue::from_str`. For every contract header whose
+/// `(name, value)` still matches an `original` inbound header's lossy projection (i.e. the filter
+/// passed it through unchanged), the ORIGINAL bytes are forwarded verbatim; a value a filter set or
+/// changed no longer matches and is encoded from the contract string exactly as `copy_headers` does.
+/// This keeps pass-through headers byte-exact WITHOUT widening the WIT contract — the typed
+/// `wasi:http` byte distinction is the eventual M3-convergence form (ADR 000020); this is the
+/// host-side interim that needs no contract churn. It can only forward bytes the peer actually sent
+/// under that name, and never resurrects a header the chain removed or replaced (we iterate the
+/// chain's output), so it carries no smuggling/spoofing regression over `copy_headers`.
+fn copy_headers_preserving(
+    dst: Option<&mut hyper::HeaderMap>,
+    headers: &[Header],
+    original: &hyper::HeaderMap,
+) {
+    let Some(dst) = dst else { return };
+    for h in headers {
+        if is_hop_by_hop(&h.name) {
+            continue;
+        }
+        let Ok(name) = HeaderName::from_bytes(h.name.as_bytes()) else {
+            continue;
+        };
+        // Prefer the original bytes when the chain left this header untouched: find an inbound value
+        // under the same name whose lossy decoding equals the contract string. A match means the
+        // filter passed it through, so forward the bytes verbatim; otherwise the filter set or
+        // changed it and we encode from the contract string (dropping a value hyper rejects).
+        let preserved = original
+            .get_all(&name)
+            .iter()
+            .find(|v| String::from_utf8_lossy(v.as_bytes()) == h.value)
+            .cloned();
+        match preserved {
+            Some(value) => {
+                dst.append(name, value);
+            }
+            None => {
+                if let Ok(value) = HeaderValue::from_str(&h.value) {
+                    dst.append(name, value);
+                }
+            }
+        }
+    }
+}
+
 /// A synthesised response (short-circuit / fail-closed) → a hyper `Response` with a buffered body.
 fn http_response(resp: HttpResponse) -> Response<ResponseBody> {
     let status = StatusCode::from_u16(resp.status).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -693,10 +748,17 @@ fn http_response(resp: HttpResponse) -> Response<ResponseBody> {
 }
 
 /// A forwarded response: the chain-edited status + headers, with the upstream body streamed.
-fn stream_response(status: u16, headers: &[Header], body: Incoming) -> Response<ResponseBody> {
+/// `original` is the upstream's inbound header map, so headers a response filter left untouched
+/// stream back to the client byte-for-byte (P3#6), not via a lossy `string` round-trip.
+fn stream_response(
+    status: u16,
+    headers: &[Header],
+    original: &hyper::HeaderMap,
+    body: Incoming,
+) -> Response<ResponseBody> {
     let status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut builder = Response::builder().status(status);
-    copy_headers(builder.headers_mut(), headers);
+    copy_headers_preserving(builder.headers_mut(), headers, original);
     builder
         .body(stream(body))
         .unwrap_or_else(|_| Response::new(full(b"response build error".to_vec())))
@@ -1131,6 +1193,76 @@ mod tests {
             out.iter().any(|h| h.name == "x-keep"),
             "an unrelated end-to-end header survives"
         );
+    }
+
+    #[test]
+    fn copy_headers_preserving_keeps_untouched_non_utf8_bytes() {
+        // P3#6: a header value with non-UTF-8 bytes reaches the chain as a lossy `string`. When the
+        // filter passes it through unchanged, the upstream must still receive the ORIGINAL bytes —
+        // not the `U+FFFD`-mangled re-encoding, and not a drop (which is what `from_str` would do).
+        let raw: &[u8] = &[0xC3, 0x28]; // invalid UTF-8
+        let mut original = hyper::HeaderMap::new();
+        original.insert("x-blob", HeaderValue::from_bytes(raw).unwrap());
+
+        // the chain's view of that header == the lossy projection `headers_to_vec` produced.
+        let contract = vec![header("x-blob", &String::from_utf8_lossy(raw))];
+
+        let mut dst = hyper::HeaderMap::new();
+        copy_headers_preserving(Some(&mut dst), &contract, &original);
+
+        assert_eq!(
+            dst.get("x-blob").map(|v| v.as_bytes()),
+            Some(raw),
+            "an untouched header forwards byte-for-byte, not via the lossy string"
+        );
+    }
+
+    #[test]
+    fn copy_headers_preserving_uses_the_filter_value_when_changed() {
+        // A header the filter REWROTE no longer matches the original's lossy projection, so the
+        // chain's new value must win — preservation must never shadow an intentional edit.
+        let mut original = hyper::HeaderMap::new();
+        original.insert("x-user", HeaderValue::from_static("client-claim"));
+        let contract = vec![header("x-user", "real-user")];
+
+        let mut dst = hyper::HeaderMap::new();
+        copy_headers_preserving(Some(&mut dst), &contract, &original);
+
+        assert_eq!(
+            dst.get("x-user").and_then(|v| v.to_str().ok()),
+            Some("real-user"),
+            "a rewritten header forwards the chain's value, not the original"
+        );
+    }
+
+    #[test]
+    fn copy_headers_preserving_does_not_resurrect_a_removed_header() {
+        // A header the chain dropped is absent from its output, so it must not reappear from
+        // `original` — the reconciliation iterates the chain's output, never the original map.
+        let mut original = hyper::HeaderMap::new();
+        original.insert("x-secret", HeaderValue::from_static("leak"));
+        let contract: Vec<Header> = vec![]; // filter removed it
+
+        let mut dst = hyper::HeaderMap::new();
+        copy_headers_preserving(Some(&mut dst), &contract, &original);
+
+        assert!(
+            !dst.contains_key("x-secret"),
+            "a removed header is never resurrected from the original map"
+        );
+    }
+
+    #[test]
+    fn copy_headers_preserving_still_skips_hop_by_hop() {
+        // The smuggling defence in `copy_headers` (CWE-444) must hold on this path too.
+        let original = hyper::HeaderMap::new();
+        let contract = vec![header("connection", "keep-alive"), header("x-keep", "1")];
+
+        let mut dst = hyper::HeaderMap::new();
+        copy_headers_preserving(Some(&mut dst), &contract, &original);
+
+        assert!(!dst.contains_key("connection"), "hop-by-hop is dropped");
+        assert!(dst.contains_key("x-keep"), "an end-to-end header survives");
     }
 
     #[test]

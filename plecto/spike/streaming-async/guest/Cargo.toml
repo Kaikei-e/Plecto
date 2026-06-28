@@ -1,0 +1,15 @@
+# SPIKE guest (throwaway). Builds for wasm32-wasip2 and exports an ASYNC `stream<u8>` consumer to
+# probe the gate-1/2 toolchain. Its own [workspace] so the native plecto/ workspace never absorbs it.
+[package]
+name = "streaming-guest"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.58"
+
+[workspace]
