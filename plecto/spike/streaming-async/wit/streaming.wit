@@ -1,0 +1,19 @@
+// SPIKE — NOT the production contract. This is the throwaway experiment behind direction_0003
+// Part B.1 gates 1+2: prove whether a guest filter can consume a `stream<u8>` body LAZILY (async,
+// no whole-body buffer) on the toolchain actually available today (wasm32-wasip2 + wit-bindgen 0.58
+// + wasmtime 46 component-model-async). The shipped `plecto:filter@0.1.0` stays buffered `list<u8>`
+// until wasm32-wasip3 reaches Tier 2 (ADR 000010/000003/000021/000025). See host/src/main.rs for
+// the recorded findings.
+package plecto:streaming-spike@0.1.0;
+
+interface body-filter {
+    // Read the request body as a stream and return how many bytes flowed through. Returning a
+    // scalar (not another stream) keeps the spike focused on the ONE question that gates the
+    // contract: can the guest pull a large body lazily without the host buffering it whole?
+    // A flat host RSS across body sizes = true streaming; RSS linear in body size = buffering.
+    process-body: async func(input: stream<u8>) -> u64;
+}
+
+world streaming-filter {
+    export body-filter;
+}

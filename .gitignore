@@ -2,6 +2,8 @@
 plecto/target
 plecto/examples/filters/filter-hello/target
 plecto/examples/filters/filter-apikey/target
+plecto/spike/streaming-async/guest/target
+plecto/spike/streaming-async/host/target
 docs/feedback
 docs/plans
 docs/servey
