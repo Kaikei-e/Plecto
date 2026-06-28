@@ -714,9 +714,24 @@ fn copy_headers_preserving(
         let Ok(name) = HeaderName::from_bytes(h.name.as_bytes()) else {
             continue;
         };
-        // STUB (RED): ignores `original` and re-encodes from the lossy string, dropping non-UTF-8.
-        if let Ok(value) = HeaderValue::from_str(&h.value) {
-            dst.append(name, value);
+        // Prefer the original bytes when the chain left this header untouched: find an inbound value
+        // under the same name whose lossy decoding equals the contract string. A match means the
+        // filter passed it through, so forward the bytes verbatim; otherwise the filter set or
+        // changed it and we encode from the contract string (dropping a value hyper rejects).
+        let preserved = original
+            .get_all(&name)
+            .iter()
+            .find(|v| String::from_utf8_lossy(v.as_bytes()) == h.value)
+            .cloned();
+        match preserved {
+            Some(value) => {
+                dst.append(name, value);
+            }
+            None => {
+                if let Ok(value) = HeaderValue::from_str(&h.value) {
+                    dst.append(name, value);
+                }
+            }
         }
     }
 }
