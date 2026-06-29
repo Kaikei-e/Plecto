@@ -23,7 +23,7 @@ wasmtime = { workspace = true }
 # Streaming-body only: a MINIMAL WASI slice (proxy interfaces — no fs/sockets/env) for the async
 # stream<u8> guest, which unlike the no-WASI header-only filters imports wasi:io. Optional, so the
 # default build never sees it.
-wasmtime-wasi = { version = "46.0.0", optional = true }
+wasmtime-wasi = { version = "46.0.1", optional = true }
 # M3 Stage 1 (ADR 000021): a minimal `block_on` to drive wasmtime's now-async `call_async` /
 # `instantiate_async` from the host's still-sync public API. The guest runs to completion on a
 # fiber without suspending (epoch is trap-mode, host-API imports never block), so a no-reactor
