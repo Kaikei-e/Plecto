@@ -34,7 +34,8 @@ pub use artifact::{ArtifactStore, MemoryStore, ResolvedArtifact};
 pub use chain::{ChainOutcome, RequestBodyOutcome};
 pub use error::ControlError;
 pub use manifest::{
-    Chain, FilterEntry, HealthConfig, IsolationKind, Manifest, Route, TlsCert, Trust, Upstream,
+    Chain, FilterEntry, HealthConfig, IsolationKind, Manifest, Observability, Route, TlsCert,
+    Trust, Upstream,
 };
 #[cfg(unix)]
 pub use reload::SignalReloadSource;
@@ -96,6 +97,12 @@ pub struct Control {
     /// resolve against (ADR 000014). Captured at construction so a reload re-reads certs from the
     /// same root. `"."` for the in-memory `load` core (tests use absolute cert paths).
     base_dir: PathBuf,
+    /// Host-aggregated filter-execution metrics (ADR 000009): the `MetricsSink` wired into the
+    /// `Host` at construction, snapshotted by the fast path's admin `/metrics` endpoint.
+    filter_metrics: Arc<MetricsSink>,
+    /// Operational observability config (`[observability]`, ADR 000009), captured at construction:
+    /// the admin endpoint bind address and the access-log toggle. Not part of the config version.
+    observability: Observability,
 }
 
 impl Control {
@@ -105,7 +112,7 @@ impl Control {
     /// path in the manifest (`trust.keys`, each filter `source`) is resolved relative to
     /// `base_dir`. Remote fetch (`wkg`) is an out-of-band step that populates those layouts.
     pub fn from_manifest(manifest: &Manifest, base_dir: &Path) -> Result<Self, ControlError> {
-        let (host, store) = build_host_and_store(manifest, base_dir)?;
+        let (host, store, filter_metrics) = build_host_and_store(manifest, base_dir)?;
         let upstreams = Arc::new(UpstreamRegistry::new());
         let active = build_active(&host, manifest, &store, base_dir, &upstreams)?;
         Ok(Self {
@@ -116,6 +123,8 @@ impl Control {
             manifest_path: None,
             trust: manifest.trust.clone(),
             base_dir: base_dir.to_path_buf(),
+            filter_metrics,
+            observability: manifest.observability.clone(),
         })
     }
 
@@ -142,6 +151,10 @@ impl Control {
             manifest_path: None,
             trust: manifest.trust.clone(),
             base_dir: base_dir.to_path_buf(),
+            // The caller supplied the `Host`, so its sink is the caller's (or `NoopSink`); this
+            // testable core keeps its own empty tally rather than reaching into that host.
+            filter_metrics: Arc::new(MetricsSink::new()),
+            observability: manifest.observability.clone(),
         })
     }
 
@@ -153,7 +166,7 @@ impl Control {
     pub fn from_manifest_path(manifest_path: &Path) -> Result<Self, ControlError> {
         let base_dir = manifest_path.parent().unwrap_or_else(|| Path::new("."));
         let manifest = read_manifest(manifest_path)?;
-        let (host, store) = build_host_and_store(&manifest, base_dir)?;
+        let (host, store, filter_metrics) = build_host_and_store(&manifest, base_dir)?;
         let upstreams = Arc::new(UpstreamRegistry::new());
         let active = build_active(&host, &manifest, &store, base_dir, &upstreams)?;
         Ok(Self {
@@ -164,6 +177,8 @@ impl Control {
             manifest_path: Some(manifest_path.to_path_buf()),
             trust: manifest.trust.clone(),
             base_dir: base_dir.to_path_buf(),
+            filter_metrics,
+            observability: manifest.observability.clone(),
         })
     }
 
@@ -191,6 +206,8 @@ impl Control {
             manifest_path: Some(manifest_path.to_path_buf()),
             trust: manifest.trust.clone(),
             base_dir,
+            filter_metrics: Arc::new(MetricsSink::new()),
+            observability: manifest.observability.clone(),
         })
     }
 
@@ -263,6 +280,25 @@ impl Control {
         self.active.load().hash.clone()
     }
 
+    /// A snapshot of the host-aggregated filter-execution metrics (ADR 000009): the tally the
+    /// `MetricsSink` wired at construction has accumulated. The fast path's admin `/metrics`
+    /// endpoint renders this alongside its native RED metrics.
+    pub fn filter_metrics(&self) -> MetricsSnapshot {
+        self.filter_metrics.snapshot()
+    }
+
+    /// The admin endpoint bind address (`[observability] admin_addr`), or `None` when no admin
+    /// listener is configured (the default). The fast path binds a separate listener there for
+    /// `/metrics` + liveness/readiness (ADR 000009 Stage A).
+    pub fn admin_addr(&self) -> Option<&str> {
+        self.observability.admin_addr.as_deref()
+    }
+
+    /// Whether the structured access log is enabled (`[observability] access_log`, ADR 000009).
+    pub fn access_log_enabled(&self) -> bool {
+        self.observability.access_log
+    }
+
     /// The active TLS server config (ADR 000014), or `None` for plain HTTP/1.1. The fast-path
     /// server reads this per accepted connection, so a reload's new certs apply to new connections
     /// while in-flight ones keep the cert they negotiated with.
@@ -331,16 +367,23 @@ fn read_manifest(path: &Path) -> Result<Manifest, ControlError> {
 fn build_host_and_store(
     manifest: &Manifest,
     base_dir: &Path,
-) -> Result<(Host, oci::OciLayoutStore), ControlError> {
+) -> Result<(Host, oci::OciLayoutStore, Arc<MetricsSink>), ControlError> {
     let mut pems: Vec<Vec<u8>> = Vec::with_capacity(manifest.trust.keys.len());
     for key_path in &manifest.trust.keys {
         pems.push(std::fs::read(base_dir.join(key_path))?);
     }
     let trust =
         TrustPolicy::from_pem_keys(&pems).map_err(|e| ControlError::TrustKey(e.to_string()))?;
-    let host = Host::new(trust).map_err(|e| ControlError::HostInit(e.to_string()))?;
+    // Wire the host-aggregated filter metrics (ADR 000009): a `MetricsSink` tallies every filter
+    // execution. Set BEFORE filters load (the sink is cloned into each at `load`), and retained on
+    // `Control` so the fast path's admin endpoint can snapshot it. The default was `NoopSink`
+    // (observability off) — this is the wiring that makes the M5 span/metrics stage observable.
+    let filter_metrics = Arc::new(MetricsSink::new());
+    let host = Host::new(trust)
+        .map_err(|e| ControlError::HostInit(e.to_string()))?
+        .with_telemetry_sink(filter_metrics.clone());
     let store = oci::OciLayoutStore::new(base_dir);
-    Ok((host, store))
+    Ok((host, store, filter_metrics))
 }
 
 /// Resolve + verify + load every manifest filter into a fresh `ActiveConfig`. Pure w.r.t. the
