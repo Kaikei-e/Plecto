@@ -32,6 +32,11 @@ parking_lot = "0.12"
 # tracing: host-internal diagnostics (never println!, bp-rust). Distinct from the
 # host-log capability, which is the filter-facing log surface.
 tracing = "0.1"
+# tracing-subscriber: the fast-path binary's JSON log + access-log formatter (ADR 000009 Stage A).
+# Minimal features — NO `ansi` (drops nu-ansi-term) and NO `env-filter` (drops the regex pull) —
+# keeps the dependency / supply-chain footprint small (deny.toml). The library never installs a
+# subscriber; only `plecto-server`'s `main` does, so the rest of the workspace stays subscriber-free.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "json", "std"] }
 # sigstore: cosign signature verification at filter load time (ADR 000006 provenance).
 # default-features=false keeps it to the offline `crypto` module — keyed verify with a
 # local public key, NO Fulcio / Rekor / OCI-registry / network (verified footprint). cosign

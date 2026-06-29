@@ -13,6 +13,15 @@ use tokio::net::TcpListener;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // JSON structured logging for the binary (Stage A observability, ADR 000009): the access log
+    // (`plecto::access`) and the host diagnostics render as machine-parseable lines. `try_init` is
+    // idempotent — a failure means a global subscriber is already installed (e.g. a test harness),
+    // which we intentionally keep.
+    let _logging = tracing_subscriber::fmt()
+        .json()
+        .with_target(true)
+        .try_init();
+
     let mut args = std::env::args().skip(1);
     let manifest = args
         .next()
