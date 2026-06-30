@@ -14,12 +14,27 @@
 //! reload, so the per-request hot path never touches the registry lock.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::error::ControlError;
 use crate::manifest::{HealthConfig, Upstream};
+
+/// Upper bound on the outlier ejection-time exponential backoff (ADR 000032): the window is
+/// `base · 2^min(eject_count, cap)`, so the cap bounds it at `base · 2^6` (64×) however many times an
+/// instance flaps.
+const OUTLIER_BACKOFF_SHIFT_CAP: u32 = 6;
+
+/// Wall-clock milliseconds since the epoch, for outlier-ejection windows (ADR 000032). Non-monotonic,
+/// but the windows are coarse (seconds), so a backward clock step merely shortens or lengthens one
+/// window — never a panic on untrusted input.
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 /// One backend instance (`host:port`) of an upstream, with its health state (ADR 000017).
 ///
@@ -35,6 +50,10 @@ pub struct UpstreamInstance {
     counters: Mutex<HealthCounters>,
     healthy_threshold: u32,
     unhealthy_threshold: u32,
+    /// Outlier ejection deadline (ms since epoch, `0` = not ejected); the lock-free read surface for
+    /// `pick` (ADR 000032). Written by `record_outcome` while holding `counters`. Time-based, so it
+    /// auto-expires when the window passes — independent of the `healthy` bit (a separate axis).
+    outlier_ejected_until_ms: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -45,6 +64,12 @@ struct HealthCounters {
     /// promotes it (cold-start fast path, ADR 000017); afterwards the full `healthy_threshold`
     /// applies for re-entry after an eject.
     ever_healthy: bool,
+    /// Consecutive gateway-class 5xx on live traffic, for outlier detection (ADR 000032). Reset by a
+    /// non-failure outcome; reaching the policy threshold ejects the instance.
+    consecutive_gw_fail: u32,
+    /// How many times this instance has been outlier-ejected, for the exponential ejection-time
+    /// backoff (ADR 000032). Reset on a successful outcome.
+    outlier_eject_count: u32,
 }
 
 impl UpstreamInstance {
@@ -57,10 +82,13 @@ impl UpstreamInstance {
                 consecutive_ok: 0,
                 consecutive_fail: 0,
                 ever_healthy: false,
+                consecutive_gw_fail: 0,
+                outlier_eject_count: 0,
             }),
             // a 0 threshold would be a footgun (never promote / instant eject); clamp to >= 1.
             healthy_threshold: health.healthy_threshold.max(1),
             unhealthy_threshold: health.unhealthy_threshold.max(1),
+            outlier_ejected_until_ms: AtomicU64::new(0),
         }
     }
 
@@ -72,6 +100,13 @@ impl UpstreamInstance {
     /// Whether this instance is currently in rotation. Lock-free — the round-robin hot path.
     pub fn is_healthy(&self) -> bool {
         self.healthy.load(Ordering::Acquire)
+    }
+
+    /// Whether this instance is currently outlier-ejected at `now_ms` (ADR 000032). Lock-free — the
+    /// `pick` hot path. The ejection auto-expires when its window passes (no probe needed); this is a
+    /// distinct axis from `is_healthy` (an instance can be probe-healthy yet outlier-ejected).
+    pub fn is_outlier_ejected(&self, now_ms: u64) -> bool {
+        self.outlier_ejected_until_ms.load(Ordering::Acquire) > now_ms
     }
 
     /// Record a successful active probe (a 2xx within the timeout). Promotes a pessimistic / ejected
@@ -158,6 +193,13 @@ pub struct UpstreamGroup {
     /// in-flight requests of a superseded group decrement that group's own counter via their permit,
     /// so a reload never miscounts.
     in_flight: AtomicUsize,
+    /// Outlier-detection policy (ADR 000032), rebuilt from the manifest like the other non-health
+    /// knobs (so an outlier-config change preserves instance health): the consecutive gateway-5xx
+    /// threshold (`0` = disabled), the base ejection window (× exponential backoff), and the cap on
+    /// the fraction of the pool ejectable at once.
+    outlier_consecutive: u32,
+    outlier_base_ejection: Duration,
+    outlier_max_ejection_percent: u32,
 }
 
 /// A held slot in an upstream's circuit-breaker cap (ADR 000028). Decrements the group's in-flight
@@ -201,8 +243,14 @@ impl UpstreamGroup {
     /// only reads the lock-free `is_healthy` bit and never allocates. If an instance flips between
     /// the passes we return the last eligible one seen rather than spuriously `None`.
     fn pick_inner(&self, exclude: Option<&Arc<UpstreamInstance>>) -> Option<Arc<UpstreamInstance>> {
+        // Outlier detection (ADR 000032) gates `pick` on a time-based ejection window, a separate axis
+        // from the health bit. Read the clock once, and only when the policy is enabled, so a disabled
+        // policy keeps the pre-000032 cost (a single lock-free `is_healthy` read).
+        let check_outlier = self.outlier_enabled();
+        let now_ms = if check_outlier { now_millis() } else { 0 };
         let is_eligible = |inst: &Arc<UpstreamInstance>| {
             inst.is_healthy()
+                && (!check_outlier || !inst.is_outlier_ejected(now_ms))
                 && match exclude {
                     Some(ex) => !Arc::ptr_eq(inst, ex),
                     None => true,
@@ -245,6 +293,65 @@ impl UpstreamGroup {
     /// 000023); `0` disables retry.
     pub fn max_retries(&self) -> u64 {
         self.max_retries
+    }
+
+    /// Whether outlier detection is enabled for this upstream (ADR 000032).
+    fn outlier_enabled(&self) -> bool {
+        self.outlier_consecutive > 0
+    }
+
+    /// Record one forward's outcome against `instance` for outlier detection (ADR 000032).
+    /// `gateway_failure` is `true` only for a gateway-class 5xx (502/503/504) the upstream actually
+    /// RETURNED — never a circuit-breaker shed or a per-try timeout (those are other axes). Returns
+    /// `true` iff this call ejected the instance (the caller bumps the ejection metric). A success
+    /// resets the failure streak and ejection backoff; consecutive failures past the threshold eject
+    /// the instance for a backing-off window — unless that would push the pool past
+    /// `max_ejection_percent`, in which case it stays in rotation (fail-closed must not self-DoS).
+    pub fn record_outcome(&self, instance: &Arc<UpstreamInstance>, gateway_failure: bool) -> bool {
+        if !self.outlier_enabled() {
+            return false;
+        }
+        // a poisoned lock means a thread panicked mid-transition; fail safe (no ejection).
+        let Ok(mut c) = instance.counters.lock() else {
+            return false;
+        };
+        if !gateway_failure {
+            c.consecutive_gw_fail = 0;
+            c.outlier_eject_count = 0;
+            return false;
+        }
+        c.consecutive_gw_fail = c.consecutive_gw_fail.saturating_add(1);
+        if c.consecutive_gw_fail < self.outlier_consecutive {
+            return false;
+        }
+
+        // Threshold reached. Honour the ejection cap: never eject so many that the pool drops below
+        // its working minimum (`100 - max_ejection_percent`). Integer math, no float.
+        let now_ms = now_millis();
+        let already_ejected = self
+            .instances
+            .iter()
+            .filter(|i| i.is_outlier_ejected(now_ms))
+            .count();
+        if (already_ejected + 1) * 100
+            > self.outlier_max_ejection_percent as usize * self.instances.len()
+        {
+            // Cap reached — keep this instance in rotation, but reset its streak so it gets a fresh
+            // threshold's worth of chances rather than re-tripping on the very next failure.
+            c.consecutive_gw_fail = 0;
+            return false;
+        }
+
+        // Eject for `base · 2^min(eject_count, cap)` — exponential backoff, bounded.
+        let shift = c.outlier_eject_count.min(OUTLIER_BACKOFF_SHIFT_CAP);
+        let window = self.outlier_base_ejection.saturating_mul(1u32 << shift);
+        instance.outlier_ejected_until_ms.store(
+            now_ms.saturating_add(window.as_millis() as u64),
+            Ordering::Release,
+        );
+        c.outlier_eject_count = c.outlier_eject_count.saturating_add(1);
+        c.consecutive_gw_fail = 0;
+        true
     }
 
     /// Try to take an in-flight slot under the circuit-breaker cap (ADR 000028). `None` means the
@@ -337,6 +444,11 @@ impl UpstreamRegistry {
                     rr: AtomicUsize::new(rr),
                     max_requests: up.circuit_breaker.max_requests as usize,
                     in_flight: AtomicUsize::new(0),
+                    outlier_consecutive: up.outlier_detection.consecutive_gateway_failures,
+                    outlier_base_ejection: Duration::from_millis(
+                        up.outlier_detection.base_ejection_time_ms,
+                    ),
+                    outlier_max_ejection_percent: up.outlier_detection.max_ejection_percent,
                 }),
             );
         }
@@ -361,7 +473,7 @@ impl UpstreamRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::{CircuitBreaker, HealthConfig};
+    use crate::manifest::{CircuitBreaker, HealthConfig, OutlierDetection};
 
     fn health(healthy_threshold: u32, unhealthy_threshold: u32) -> HealthConfig {
         HealthConfig {
@@ -382,6 +494,7 @@ mod tests {
             max_retries: 1,
             overall_timeout_ms: 0,
             circuit_breaker: CircuitBreaker::default(),
+            outlier_detection: OutlierDetection::default(),
         }
     }
 
@@ -675,6 +788,7 @@ mod tests {
             max_retries: 0,
             overall_timeout_ms: 0,
             circuit_breaker: CircuitBreaker { max_requests: 2 },
+            outlier_detection: OutlierDetection::default(),
         }])
         .unwrap();
         let g = reg.group("u").unwrap();
@@ -706,5 +820,118 @@ mod tests {
             .map(|_| g.try_acquire().expect("an unlimited breaker never rejects"))
             .collect();
         assert_eq!(permits.len(), 1000);
+    }
+
+    /// Build a healthy group with outlier detection configured (ADR 000032).
+    fn outlier_group(
+        addrs: &[&str],
+        consecutive: u32,
+        base_ms: u64,
+        max_pct: u32,
+    ) -> Arc<UpstreamGroup> {
+        let reg = UpstreamRegistry::new();
+        reg.reconcile(&[Upstream {
+            name: "u".to_string(),
+            addresses: addrs.iter().map(|s| s.to_string()).collect(),
+            health: health(1, 1),
+            request_timeout_ms: 30_000,
+            max_retries: 0,
+            overall_timeout_ms: 0,
+            circuit_breaker: CircuitBreaker::default(),
+            outlier_detection: OutlierDetection {
+                consecutive_gateway_failures: consecutive,
+                base_ejection_time_ms: base_ms,
+                max_ejection_percent: max_pct,
+            },
+        }])
+        .unwrap();
+        let g = reg.group("u").unwrap();
+        for inst in &g.instances {
+            inst.record_probe_success(); // cold-start: all healthy
+        }
+        g
+    }
+
+    #[test]
+    fn outlier_ejects_after_consecutive_gateway_failures_and_success_resets() {
+        let g = outlier_group(&["a:1", "b:2"], 2, 60_000, 100);
+        let a = g.instances[0].clone();
+        assert!(
+            !g.record_outcome(&a, true),
+            "1st failure is below the threshold"
+        );
+        // a success between failures resets the streak.
+        assert!(!g.record_outcome(&a, false));
+        assert!(
+            !g.record_outcome(&a, true),
+            "streak reset → this is the 1st again"
+        );
+        assert!(
+            g.record_outcome(&a, true),
+            "2nd consecutive failure ejects (returns true)"
+        );
+        assert!(a.is_outlier_ejected(now_millis()), "ejected from rotation");
+        assert!(
+            a.is_healthy(),
+            "but the health bit is untouched — outlier detection is a separate axis (ADR 000032)"
+        );
+    }
+
+    #[test]
+    fn outlier_ejection_window_expires() {
+        let g = outlier_group(&["a:1", "b:2"], 1, 1000, 100);
+        let a = g.instances[0].clone();
+        assert!(
+            g.record_outcome(&a, true),
+            "threshold 1 → one failure ejects"
+        );
+        let now = now_millis();
+        assert!(a.is_outlier_ejected(now), "ejected at `now`");
+        assert!(
+            !a.is_outlier_ejected(now + 2000),
+            "the 1s window has expired 2s later — auto-return, no probe needed"
+        );
+    }
+
+    #[test]
+    fn outlier_max_ejection_percent_keeps_some_in_rotation() {
+        // 3 instances, 50% cap → at most 1 may be ejected; the rest stay in rotation even while
+        // failing, so fail-closed never becomes a self-inflicted total outage.
+        let g = outlier_group(&["a:1", "b:2", "c:3"], 1, 60_000, 50);
+        let a = g.instances[0].clone();
+        let b = g.instances[1].clone();
+        assert!(g.record_outcome(&a, true), "a ejects (1/3 within 50%)");
+        assert!(
+            !g.record_outcome(&b, true),
+            "b is NOT ejected — a 2nd ejection (2/3) would exceed the 50% cap"
+        );
+        assert!(!b.is_outlier_ejected(now_millis()), "b stays in rotation");
+    }
+
+    #[test]
+    fn outlier_disabled_never_ejects() {
+        let g = outlier_group(&["a:1"], 0, 60_000, 100); // consecutive 0 = disabled
+        let a = g.instances[0].clone();
+        for _ in 0..100 {
+            assert!(
+                !g.record_outcome(&a, true),
+                "a disabled policy never ejects"
+            );
+        }
+        assert!(!a.is_outlier_ejected(now_millis()));
+    }
+
+    #[test]
+    fn outlier_ejected_instance_is_skipped_by_pick() {
+        let g = outlier_group(&["a:1", "b:2"], 1, 60_000, 100);
+        let a = g.instances[0].clone();
+        assert!(g.record_outcome(&a, true), "eject a");
+        for _ in 0..6 {
+            assert_eq!(
+                g.pick().unwrap().address(),
+                "b:2",
+                "round-robin skips the outlier-ejected (but still healthy) instance"
+            );
+        }
     }
 }

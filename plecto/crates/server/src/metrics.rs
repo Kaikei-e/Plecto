@@ -62,6 +62,8 @@ pub(crate) struct ServerMetrics {
     retries: AtomicU64,
     /// Requests shed by an upstream circuit breaker (ADR 000028) — a fast-fail 503 at the cap.
     circuit_open: AtomicU64,
+    /// Instances ejected from rotation by outlier detection (ADR 000032).
+    outlier_ejections: AtomicU64,
     duration: Histogram,
 }
 
@@ -72,6 +74,7 @@ impl ServerMetrics {
             in_flight: AtomicI64::new(0),
             retries: AtomicU64::new(0),
             circuit_open: AtomicU64::new(0),
+            outlier_ejections: AtomicU64::new(0),
             duration: Histogram::new(),
         }
     }
@@ -90,6 +93,10 @@ impl ServerMetrics {
 
     pub(crate) fn inc_circuit_open(&self) {
         self.circuit_open.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn inc_outlier_ejection(&self) {
+        self.outlier_ejections.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record one completed request: tally its status class and observe its total duration. The
@@ -164,6 +171,16 @@ impl ServerMetrics {
         out.push(format!(
             "plecto_circuit_open_total {}",
             self.circuit_open.load(Ordering::Relaxed)
+        ));
+
+        out.push(
+            "# HELP plecto_outlier_ejections_total Instances ejected from rotation by outlier detection (ADR 000032)."
+                .to_string(),
+        );
+        out.push("# TYPE plecto_outlier_ejections_total counter".to_string());
+        out.push(format!(
+            "plecto_outlier_ejections_total {}",
+            self.outlier_ejections.load(Ordering::Relaxed)
         ));
 
         // --- extension plane: host-aggregated filter-execution metrics (ADR 000009) ---

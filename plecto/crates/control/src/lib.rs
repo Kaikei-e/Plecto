@@ -35,7 +35,7 @@ pub use chain::{ChainOutcome, RequestBodyOutcome};
 pub use error::ControlError;
 pub use manifest::{
     Chain, CircuitBreaker, FilterEntry, HealthConfig, IsolationKind, Manifest, Observability,
-    Route, TlsCert, Trust, Upstream,
+    OutlierDetection, Route, TlsCert, Trust, Upstream,
 };
 #[cfg(unix)]
 pub use reload::SignalReloadSource;

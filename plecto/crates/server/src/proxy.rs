@@ -355,7 +355,16 @@ async fn proxy_core_inner(
             // it, so idempotent-only, like a timeout. It is NOT a health signal (5xx-driven ejection
             // is outlier detection, ADR 000032). Otherwise the response is taken as-is.
             Some(Ok(resp)) => {
-                if is_retriable_5xx(resp.status())
+                // Feed outlier detection (ADR 000032): a gateway-class 5xx the instance RETURNED is a
+                // misbehaviour signal (a retried-around 5xx still counts); any other status resets its
+                // streak. A circuit-breaker shed / per-try timeout is NOT recorded here (other axes).
+                let gateway_failure = is_retriable_5xx(resp.status());
+                if route.upstream.record_outcome(&instance, gateway_failure) {
+                    state.metrics.inc_outlier_ejection();
+                }
+                // retry-on-5xx (ADR 000030): a retriable gateway 5xx from an idempotent, bodyless
+                // request is retried onto a DIFFERENT instance after backoff. Otherwise take it as-is.
+                if gateway_failure
                     && may_retry(
                         Failure::Timeout,
                         forward.method.as_str(),

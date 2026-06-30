@@ -124,6 +124,55 @@ pub struct Upstream {
     /// Absent = unlimited (the default).
     #[serde(default)]
     pub circuit_breaker: CircuitBreaker,
+    /// Per-upstream outlier detection (ADR 000032): eject an instance from rotation when it
+    /// MISBEHAVES on live traffic (gateway-class 5xx), a third resilience axis distinct from active
+    /// health ("is it reachable?") and the circuit breaker ("is it saturated?"). Absent / threshold
+    /// `0` = disabled (the default).
+    #[serde(default)]
+    pub outlier_detection: OutlierDetection,
+}
+
+/// Per-upstream outlier-detection policy (ADR 000032). A THIRD resilience axis: active health (ADR
+/// 000017) asks "is the instance reachable?", the circuit breaker (ADR 000028) "is the upstream
+/// saturated?", and this "is the instance misbehaving on live traffic?". An ejected instance leaves
+/// the rotation for a (backing-off) ejection window, independent of the health bit; a shed request
+/// (circuit breaker) never feeds it, only real upstream 5xx responses do.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutlierDetection {
+    /// Consecutive gateway-class 5xx (502/503/504) from live forwards to eject an instance; `0` =
+    /// disabled (the default). Counts only real responses — a circuit-breaker 503 or a per-try
+    /// timeout is not an instance-misbehaviour signal.
+    #[serde(default)]
+    pub consecutive_gateway_failures: u32,
+    /// Base ejection duration (ms): an ejected instance is out of rotation this long, doubling per
+    /// consecutive ejection up to a bounded cap, then auto-returns when the window expires (no probe
+    /// needed). Default 30000.
+    #[serde(default = "default_base_ejection_time_ms")]
+    pub base_ejection_time_ms: u64,
+    /// Max % of the pool that may be outlier-ejected at once. The rest stay in rotation even while
+    /// failing — fail-closed must not become a self-inflicted total outage (ejecting every instance).
+    /// Default 10.
+    #[serde(default = "default_max_ejection_percent")]
+    pub max_ejection_percent: u32,
+}
+
+impl Default for OutlierDetection {
+    fn default() -> Self {
+        Self {
+            consecutive_gateway_failures: 0,
+            base_ejection_time_ms: default_base_ejection_time_ms(),
+            max_ejection_percent: default_max_ejection_percent(),
+        }
+    }
+}
+
+fn default_base_ejection_time_ms() -> u64 {
+    30_000
+}
+
+fn default_max_ejection_percent() -> u32 {
+    10
 }
 
 /// Per-upstream circuit-breaker thresholds (ADR 000028). Overload protection that is deliberately
