@@ -24,6 +24,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
 arc-swap = { workspace = true }
+# parking_lot: non-poisoning locks for the native rate limiter's bucket cells (ADR 000033). A
+# data-plane panic must not cascade a poisoned lock across later requests (same rationale as the
+# host's KV backend); the tiny lock also keeps the per-IP fixed table's per-slot guards cheap.
+parking_lot = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 oci-spec = { workspace = true }

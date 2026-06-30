@@ -62,6 +62,10 @@ pub(crate) struct ServerMetrics {
     retries: AtomicU64,
     /// Requests shed by an upstream circuit breaker (ADR 000028) — a fast-fail 503 at the cap.
     circuit_open: AtomicU64,
+    /// Requests rejected by a native route rate limit (ADR 000033) — a fast-fail 429 at the front
+    /// door. Distinct from `circuit_open` (503, upstream saturated): this is the client over its
+    /// inbound rate floor, before the chain or any forward.
+    rate_limited: AtomicU64,
     /// Instances ejected from rotation by outlier detection (ADR 000032).
     outlier_ejections: AtomicU64,
     duration: Histogram,
@@ -74,6 +78,7 @@ impl ServerMetrics {
             in_flight: AtomicI64::new(0),
             retries: AtomicU64::new(0),
             circuit_open: AtomicU64::new(0),
+            rate_limited: AtomicU64::new(0),
             outlier_ejections: AtomicU64::new(0),
             duration: Histogram::new(),
         }
@@ -93,6 +98,10 @@ impl ServerMetrics {
 
     pub(crate) fn inc_circuit_open(&self) {
         self.circuit_open.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn inc_rate_limited(&self) {
+        self.rate_limited.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn inc_outlier_ejection(&self) {
@@ -171,6 +180,16 @@ impl ServerMetrics {
         out.push(format!(
             "plecto_circuit_open_total {}",
             self.circuit_open.load(Ordering::Relaxed)
+        ));
+
+        out.push(
+            "# HELP plecto_rate_limited_total Requests rejected by a native route rate limit (ADR 000033)."
+                .to_string(),
+        );
+        out.push("# TYPE plecto_rate_limited_total counter".to_string());
+        out.push(format!(
+            "plecto_rate_limited_total {}",
+            self.rate_limited.load(Ordering::Relaxed)
         ));
 
         out.push(

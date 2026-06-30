@@ -56,7 +56,13 @@ pub trait KvBackend: Send + Sync {
 /// Refill then consume. State is `(tokens, last_refill_ms)`; the host advances `last`
 /// by whole intervals only, so no fractional tokens are lost between calls. Returns the
 /// new state to persist and the acquire outcome.
-fn apply_bucket(
+///
+/// Pure and storage-agnostic: it owns no state and does no I/O, so the same math drives both
+/// the per-filter `host-ratelimit` capability (this module's backends) and the fast path's
+/// native per-route rate limiter (ADR 000033, `plecto-control`). A zero state `(0, 0)` refills
+/// from epoch and therefore reads as a full bucket on first use — a caller backing the state
+/// with a zero-initialised table needs no separate "first sight" sentinel.
+pub fn apply_bucket(
     state: Option<(u64, u64)>,
     cost: u64,
     spec: Bucket,

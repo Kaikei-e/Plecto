@@ -1959,6 +1959,7 @@ dependencies = [
  "arc-swap",
  "hex",
  "oci-spec",
+ "parking_lot",
  "plecto-host",
  "rcgen",
  "rustls",

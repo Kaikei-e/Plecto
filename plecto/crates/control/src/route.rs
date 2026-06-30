@@ -3,8 +3,10 @@
 //! — no I/O, no wasmtime — so it is unit-tested directly and runs on the async thread (the
 //! blocking work is the chain dispatch, not the match).
 
+use std::net::IpAddr;
 use std::sync::Arc;
 
+use crate::ratelimit::{NativeRateLimit, RateLimitDecision};
 use crate::upstream::UpstreamGroup;
 
 /// A route compiled from a manifest [`crate::Route`] into the live config: the upstream name is
@@ -21,6 +23,10 @@ pub(crate) struct CompiledRoute {
     /// The upstream group this route forwards to; the fast path calls [`UpstreamGroup::pick`] on it.
     pub(crate) upstream: Arc<UpstreamGroup>,
     pub(crate) strip_prefix: Option<String>,
+    /// This route's native rate limiter (ADR 000033), or `None` for unlimited (the default). Shared
+    /// (`Arc`) so every request on the route consults the same token buckets within a config
+    /// generation; a reload builds a fresh limiter (the node-local buckets reset).
+    pub(crate) rate_limit: Option<Arc<NativeRateLimit>>,
 }
 
 /// What [`crate::ConfigSnapshot::find_route`] hands the fast-path server: which route matched
@@ -36,6 +42,9 @@ pub struct RouteInfo {
     /// `on-request-body` hook (ADR 000025) when there is a filter to run; a filterless route keeps
     /// the zero-copy streaming path.
     pub has_filters: bool,
+    /// This route's native rate limiter (ADR 000033), or `None` for unlimited. `Arc`-shared with the
+    /// live config so the per-request `RouteInfo` consults the route's persistent buckets.
+    pub(crate) rate_limit: Option<Arc<NativeRateLimit>>,
 }
 
 impl RouteInfo {
@@ -44,6 +53,17 @@ impl RouteInfo {
     /// upstream sees. No rule (or a non-matching path) leaves the path unchanged.
     pub fn rewrite_path(&self, path: &str) -> String {
         rewrite_path(path, self.strip_prefix.as_deref())
+    }
+
+    /// Consult this route's native rate limiter (ADR 000033) for one request, keyed on the
+    /// connection `peer`. `Allow` when the route has no limiter or a token was available;
+    /// `Limit { retry_after_ms }` when the bucket is empty (the fast path fails closed with 429).
+    /// Called BEFORE the filter chain so a flood is shed without spending WASM CPU.
+    pub fn check_rate_limit(&self, peer: IpAddr) -> RateLimitDecision {
+        match &self.rate_limit {
+            Some(rl) => rl.check(peer),
+            None => RateLimitDecision::Allow,
+        }
     }
 }
 
@@ -228,6 +248,7 @@ mod tests {
             filters: vec![],
             upstream: group(upstream),
             strip_prefix: None,
+            rate_limit: None,
         }
     }
 
