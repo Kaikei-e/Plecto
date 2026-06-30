@@ -110,6 +110,14 @@ pub struct Upstream {
     /// ADR 000013, can't be replayed). Default 1; **`0` disables** retry.
     #[serde(default = "default_max_retries")]
     pub max_retries: u64,
+    /// Overall request timeout (ms) bounding the WHOLE transaction — every attempt PLUS the backoff
+    /// between them (ADR 000031) — whereas `request_timeout_ms` bounds a single attempt (per-try).
+    /// This is the end-to-end deadline across retries; exceeding it fails closed **504**
+    /// (`x-plecto-fault: request-timeout`, distinct from the per-try `upstream-timeout`). Should be
+    /// `>= request_timeout_ms`; the runtime applies the tighter of the two regardless. Default `0` =
+    /// no overall bound (only the per-try timeout applies — the pre-000031 behaviour).
+    #[serde(default)]
+    pub overall_timeout_ms: u64,
     /// Per-upstream circuit breaker (ADR 000028): bounds the load the fast path puts on this
     /// upstream. Distinct from health — `health` ejects *failing* instances, this caps concurrent
     /// work on *healthy* ones so a saturated backend sheds load fast instead of queueing unbounded.

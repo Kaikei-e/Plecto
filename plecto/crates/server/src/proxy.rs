@@ -1,11 +1,11 @@
 //! The transport-agnostic transaction core: route → chain (request side) → forward → chain
 //! (response side). HTTP/1.1, HTTP/2 and HTTP/3 all funnel through `proxy_core`; only the body
-//! adapters differ. Bounded retry onto another instance (ADR 000023) and the `on-request-body`
-//! hook (ADR 000025) live here.
+//! adapters differ. Bounded retry onto another instance (ADR 000023, hardened with jittered
+//! backoff + retriable-5xx retry in ADR 000030) and the `on-request-body` hook (ADR 000025) live here.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use hyper::body::Body;
 use hyper::header::HeaderValue;
@@ -47,6 +47,48 @@ fn may_retry(failure: Failure, method: &str, bodyless: bool, tries_left: u64) ->
             Failure::Timeout => is_idempotent(method),
             Failure::Connect => true,
         }
+}
+
+/// The retriable gateway-class upstream statuses (ADR 000030): 502 / 503 / 504. A 5xx means the
+/// upstream RECEIVED and processed the request, so retrying it is safe only for an idempotent method
+/// (like a timeout) — and it never demotes the instance (5xx-driven ejection is outlier detection,
+/// ADR 000032, a separate axis).
+fn is_retriable_5xx(status: StatusCode) -> bool {
+    // 502 Bad Gateway, 503 Service Unavailable, 504 Gateway Timeout — the gateway-error class.
+    matches!(status.as_u16(), 502..=504)
+}
+
+/// Full-jitter exponential backoff base / cap in milliseconds (ADR 000030). Projected
+/// Envoy-reference defaults, not tuned by measurement: a retry waits a uniform-random delay in
+/// `[0, min(cap, base · 2^attempt)]`, so concurrent clients' retries spread out instead of
+/// thundering onto a recovering upstream in lockstep.
+const RETRY_BACKOFF_BASE_MS: u64 = 25;
+const RETRY_BACKOFF_CAP_MS: u64 = 250;
+
+/// Sleep a full-jitter exponential backoff before retry `attempt` (0-based, ADR 000030). The ceiling
+/// doubles per attempt up to the cap; the actual wait is uniform in `[0, ceiling]`.
+async fn backoff(attempt: u32) {
+    let ceiling = RETRY_BACKOFF_BASE_MS
+        .saturating_mul(1u64 << attempt.min(16))
+        .min(RETRY_BACKOFF_CAP_MS);
+    let delay = jitter(ceiling);
+    if delay > 0 {
+        tokio::time::sleep(Duration::from_millis(delay)).await;
+    }
+}
+
+/// A uniform-ish pseudo-random value in `[0, ceiling]` for retry jitter. Non-cryptographic (retry
+/// timing is not a secret) — seeded from the wall-clock sub-second, which differs per call so
+/// concurrent requests pick different waits. `ceiling == 0` yields 0 (no wait).
+fn jitter(ceiling_ms: u64) -> u64 {
+    if ceiling_ms == 0 {
+        return 0;
+    }
+    let entropy = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| u64::from(d.subsec_nanos()))
+        .unwrap_or(0);
+    entropy % (ceiling_ms + 1)
 }
 
 /// The transport-agnostic transaction core (Stage A observability wrapper, ADR 000009). Every
@@ -170,11 +212,17 @@ async fn proxy_core_inner(
     // failure (ADR 000019 timeout / 000023 retry). The per-attempt invariants are computed once. ---
     let upstream_path = route.rewrite_path(&forward.path);
     let timeout = route.upstream.request_timeout();
+    // Overall request deadline across all attempts + backoff (ADR 000031); `None` = no overall bound
+    // (only the per-try `timeout` applies). Pinned once, so the budget shrinks as retries consume it.
+    let overall = route.upstream.overall_timeout();
+    let overall_deadline = (!overall.is_zero()).then(|| Instant::now() + overall);
     // Only a bodyless request can be retried without buffering: the opaque streamed body
     // (ADR 000013) can't be replayed. `exact() == Some(0)` is hyper's framing-accurate "no body".
     let bodyless = body.size_hint().exact() == Some(0);
     let mut real_body = Some(body);
     let mut tries_left = route.upstream.max_retries();
+    // 0-based retry attempt index, for the jittered exponential backoff between attempts (ADR 000030).
+    let mut attempt: u32 = 0;
 
     // --- request-side body hook (ADR 000025): for a filtered route carrying a body, buffer it
     // (bounded), run the chain's `on-request-body`, and forward the possibly-transformed body — or
@@ -247,6 +295,30 @@ async fn proxy_core_inner(
     };
 
     let upstream_resp = loop {
+        // Overall request deadline (ADR 000031): the whole transaction — every attempt plus the
+        // backoff between them — is bounded. If it elapsed across retries, fail closed 504
+        // `request-timeout` before another attempt; this attempt's effective timeout is the tighter
+        // of the per-try bound and the remaining overall budget.
+        let per_try = match overall_deadline {
+            Some(deadline) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Ok(synth(
+                        StatusCode::GATEWAY_TIMEOUT,
+                        "request-timeout",
+                        b"request timeout",
+                    ));
+                }
+                let remaining = deadline - now;
+                if timeout.is_zero() {
+                    remaining
+                } else {
+                    timeout.min(remaining)
+                }
+            }
+            None => timeout,
+        };
+
         // Build this attempt. A bodyless request re-sends an empty body to each instance; a bodied
         // one moves its single streamed body and (since `may_retry` is false for it) is sent once.
         let attempt_body = if bodyless {
@@ -271,18 +343,51 @@ async fn proxy_core_inner(
         // The timeout (ADR 000019) bounds time-to-response-headers; `Duration::ZERO` opts out. The
         // body then streams without a deadline, so streaming responses are unaffected.
         let send = state.client.request(upstream_req);
-        let outcome = if timeout.is_zero() {
+        let outcome = if per_try.is_zero() {
             Some(send.await)
         } else {
-            tokio::time::timeout(timeout, send).await.ok()
+            tokio::time::timeout(per_try, send).await.ok()
         };
 
         match outcome {
-            Some(Ok(resp)) => break resp,
+            // A retriable gateway-class 5xx (502/503/504) from an idempotent, bodyless request is
+            // retried onto a DIFFERENT instance after backoff (ADR 000030): the upstream processed
+            // it, so idempotent-only, like a timeout. It is NOT a health signal (5xx-driven ejection
+            // is outlier detection, ADR 000032). Otherwise the response is taken as-is.
+            Some(Ok(resp)) => {
+                if is_retriable_5xx(resp.status())
+                    && may_retry(
+                        Failure::Timeout,
+                        forward.method.as_str(),
+                        bodyless,
+                        tries_left,
+                    )
+                    && let Some(next) = route.upstream.pick_excluding(&instance)
+                {
+                    state.metrics.inc_retries();
+                    backoff(attempt).await;
+                    attempt += 1;
+                    tries_left -= 1;
+                    instance = next;
+                    continue;
+                }
+                break resp;
+            }
             // The deadline elapsed before response headers. Not a health signal (ADR 000019) — leave
             // liveness to the active prober. Retry onto a DIFFERENT instance if policy allows and one
             // is available (idempotent-only, ADR 000023), else fail closed 504.
             None => {
+                // If the OVERALL deadline ended the transaction → 504 `request-timeout`, no retry
+                // (ADR 000031). Otherwise it was the per-try timeout (ADR 000019), retryable below.
+                if let Some(deadline) = overall_deadline
+                    && Instant::now() >= deadline
+                {
+                    return Ok(synth(
+                        StatusCode::GATEWAY_TIMEOUT,
+                        "request-timeout",
+                        b"request timeout",
+                    ));
+                }
                 if may_retry(
                     Failure::Timeout,
                     forward.method.as_str(),
@@ -291,6 +396,8 @@ async fn proxy_core_inner(
                 ) && let Some(next) = route.upstream.pick_excluding(&instance)
                 {
                     state.metrics.inc_retries();
+                    backoff(attempt).await;
+                    attempt += 1;
                     tries_left -= 1;
                     instance = next;
                     continue;
@@ -316,6 +423,8 @@ async fn proxy_core_inner(
                     ) && let Some(next) = route.upstream.pick_excluding(&instance)
                     {
                         state.metrics.inc_retries();
+                        backoff(attempt).await;
+                        attempt += 1;
                         tries_left -= 1;
                         instance = next;
                         continue;
@@ -356,6 +465,38 @@ async fn proxy_core_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retriable_5xx_is_the_gateway_class_only() {
+        // ADR 000030: only 502/503/504 (gateway-error class) are retriable; a 500/501 (the origin's
+        // own bug) and non-5xx are taken as-is, so a retry never replays a 500-producing request.
+        for s in [502u16, 503, 504] {
+            assert!(
+                is_retriable_5xx(StatusCode::from_u16(s).unwrap()),
+                "{s} is retriable"
+            );
+        }
+        for s in [500u16, 501, 505, 200, 404, 429] {
+            assert!(
+                !is_retriable_5xx(StatusCode::from_u16(s).unwrap()),
+                "{s} is not retriable"
+            );
+        }
+    }
+
+    #[test]
+    fn jitter_stays_within_the_ceiling() {
+        // Full-jitter (ADR 000030) must never exceed its ceiling; a zero ceiling never waits.
+        assert_eq!(jitter(0), 0, "a zero ceiling yields no wait");
+        for ceiling in [1u64, 25, 250, 1000] {
+            for _ in 0..1000 {
+                assert!(
+                    jitter(ceiling) <= ceiling,
+                    "jitter must stay within ceiling {ceiling}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn idempotent_methods_per_rfc_9110() {

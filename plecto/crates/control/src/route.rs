@@ -213,6 +213,7 @@ mod tests {
             },
             request_timeout_ms: 30_000,
             max_retries: 1,
+            overall_timeout_ms: 0,
             circuit_breaker: CircuitBreaker::default(),
         }])
         .unwrap();

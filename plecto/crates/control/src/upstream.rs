@@ -134,10 +134,15 @@ pub struct UpstreamGroup {
     /// The instances, in manifest address order. Fixed for the life of this group value; a reload
     /// builds a NEW group, reusing unchanged instances' `Arc`s to preserve their health.
     pub instances: Vec<Arc<UpstreamInstance>>,
-    /// End-to-end timeout for forwarding to this upstream (ADR 000019); `Duration::ZERO` disables
-    /// it. The fast path wraps the upstream call in this and fails closed with 504 on overrun. Not
-    /// part of `health`, so a timeout-only change rebuilds the group but preserves instance health.
+    /// Per-try timeout for ONE forward attempt to this upstream (ADR 000019, reframed as the per-try
+    /// bound by ADR 000031); `Duration::ZERO` disables it. Bounds one attempt's time-to-response-
+    /// headers, failing closed 504 on overrun. Not part of `health`, so a timeout-only change
+    /// rebuilds the group but preserves instance health.
     request_timeout: Duration,
+    /// Overall request deadline across the WHOLE transaction — every attempt PLUS the backoff between
+    /// them (ADR 000031); `Duration::ZERO` = no overall bound (only the per-try `request_timeout`
+    /// applies). The runtime applies the tighter of the two; exceeding it fails closed 504.
+    overall_timeout: Duration,
     /// Max retries to a DIFFERENT instance after a retryable forward failure (ADR 000023); `0`
     /// disables retry. Like `request_timeout`, not part of `health`, so a retry-only change rebuilds
     /// the group but preserves instance health.
@@ -222,11 +227,18 @@ impl UpstreamGroup {
         last.cloned()
     }
 
-    /// The end-to-end timeout the fast path applies to a forward to this upstream (ADR 000019).
-    /// `Duration::ZERO` means no timeout (the operator opted out for a streaming / long-poll
-    /// backend); otherwise the call is bounded and overrun fails closed with 504.
+    /// The PER-TRY timeout the fast path applies to one forward attempt (ADR 000019, per-try by ADR
+    /// 000031). `Duration::ZERO` means no per-try bound (e.g. a streaming / long-poll backend);
+    /// otherwise one attempt is bounded and overrun fails closed 504.
     pub fn request_timeout(&self) -> Duration {
         self.request_timeout
+    }
+
+    /// The OVERALL request deadline across all attempts + backoff (ADR 000031); `Duration::ZERO`
+    /// means no overall bound (only the per-try `request_timeout` applies). Exceeding it fails
+    /// closed 504 `request-timeout` with no further retry.
+    pub fn overall_timeout(&self) -> Duration {
+        self.overall_timeout
     }
 
     /// The max number of retries to a different instance on a retryable forward failure (ADR
@@ -320,6 +332,7 @@ impl UpstreamRegistry {
                     health: up.health.clone(),
                     instances,
                     request_timeout: Duration::from_millis(up.request_timeout_ms),
+                    overall_timeout: Duration::from_millis(up.overall_timeout_ms),
                     max_retries: up.max_retries,
                     rr: AtomicUsize::new(rr),
                     max_requests: up.circuit_breaker.max_requests as usize,
@@ -367,6 +380,7 @@ mod tests {
             health: h,
             request_timeout_ms: 30_000,
             max_retries: 1,
+            overall_timeout_ms: 0,
             circuit_breaker: CircuitBreaker::default(),
         }
     }
@@ -659,6 +673,7 @@ mod tests {
             health: health(1, 1),
             request_timeout_ms: 30_000,
             max_retries: 0,
+            overall_timeout_ms: 0,
             circuit_breaker: CircuitBreaker { max_requests: 2 },
         }])
         .unwrap();
