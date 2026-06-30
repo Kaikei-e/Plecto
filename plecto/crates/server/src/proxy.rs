@@ -212,6 +212,10 @@ async fn proxy_core_inner(
     // failure (ADR 000019 timeout / 000023 retry). The per-attempt invariants are computed once. ---
     let upstream_path = route.rewrite_path(&forward.path);
     let timeout = route.upstream.request_timeout();
+    // Overall request deadline across all attempts + backoff (ADR 000031); `None` = no overall bound
+    // (only the per-try `timeout` applies). Pinned once, so the budget shrinks as retries consume it.
+    let overall = route.upstream.overall_timeout();
+    let overall_deadline = (!overall.is_zero()).then(|| Instant::now() + overall);
     // Only a bodyless request can be retried without buffering: the opaque streamed body
     // (ADR 000013) can't be replayed. `exact() == Some(0)` is hyper's framing-accurate "no body".
     let bodyless = body.size_hint().exact() == Some(0);
@@ -291,6 +295,30 @@ async fn proxy_core_inner(
     };
 
     let upstream_resp = loop {
+        // Overall request deadline (ADR 000031): the whole transaction — every attempt plus the
+        // backoff between them — is bounded. If it elapsed across retries, fail closed 504
+        // `request-timeout` before another attempt; this attempt's effective timeout is the tighter
+        // of the per-try bound and the remaining overall budget.
+        let per_try = match overall_deadline {
+            Some(deadline) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Ok(synth(
+                        StatusCode::GATEWAY_TIMEOUT,
+                        "request-timeout",
+                        b"request timeout",
+                    ));
+                }
+                let remaining = deadline - now;
+                if timeout.is_zero() {
+                    remaining
+                } else {
+                    timeout.min(remaining)
+                }
+            }
+            None => timeout,
+        };
+
         // Build this attempt. A bodyless request re-sends an empty body to each instance; a bodied
         // one moves its single streamed body and (since `may_retry` is false for it) is sent once.
         let attempt_body = if bodyless {
@@ -315,10 +343,10 @@ async fn proxy_core_inner(
         // The timeout (ADR 000019) bounds time-to-response-headers; `Duration::ZERO` opts out. The
         // body then streams without a deadline, so streaming responses are unaffected.
         let send = state.client.request(upstream_req);
-        let outcome = if timeout.is_zero() {
+        let outcome = if per_try.is_zero() {
             Some(send.await)
         } else {
-            tokio::time::timeout(timeout, send).await.ok()
+            tokio::time::timeout(per_try, send).await.ok()
         };
 
         match outcome {
@@ -349,6 +377,17 @@ async fn proxy_core_inner(
             // liveness to the active prober. Retry onto a DIFFERENT instance if policy allows and one
             // is available (idempotent-only, ADR 000023), else fail closed 504.
             None => {
+                // If the OVERALL deadline ended the transaction → 504 `request-timeout`, no retry
+                // (ADR 000031). Otherwise it was the per-try timeout (ADR 000019), retryable below.
+                if let Some(deadline) = overall_deadline
+                    && Instant::now() >= deadline
+                {
+                    return Ok(synth(
+                        StatusCode::GATEWAY_TIMEOUT,
+                        "request-timeout",
+                        b"request timeout",
+                    ));
+                }
                 if may_retry(
                     Failure::Timeout,
                     forward.method.as_str(),
