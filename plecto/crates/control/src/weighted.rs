@@ -97,6 +97,11 @@ impl WeightedBackends {
             return None;
         }
         let len = self.table.len();
+        // `new` guarantees a non-empty table (validated), but guard `% len` locally so the data-plane
+        // no-panic property holds without depending on that invariant (CWE-369 defence-in-depth).
+        if len == 0 {
+            return None;
+        }
         let start = self.cursor.fetch_add(1, Ordering::Relaxed) % len;
         // Skip forward over backends with no eligible instance; the early-out above proved one
         // exists, so this terminates with `Some`. Bounded by `len` regardless (data-plane no-panic).

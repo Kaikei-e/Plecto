@@ -232,11 +232,13 @@ fn route_matches(
         return false;
     }
     for (name, value) in &r.headers {
-        if !headers
-            .iter()
-            .any(|h| h.name.eq_ignore_ascii_case(name) && h.value == *value)
-        {
-            return false;
+        // Match the FIRST header with this name (case-insensitive name); a later duplicate must not
+        // flip the decision (CWE-436): the origin receives every copy and may read a different one,
+        // so deciding on the first occurrence keeps our routing aligned with Gateway-API's
+        // "first match entry decides" and mirrors the query rule below.
+        match headers.iter().find(|h| h.name.eq_ignore_ascii_case(name)) {
+            Some(h) if h.value == *value => {}
+            _ => return false,
         }
     }
     for (name, value) in &r.query {
@@ -484,6 +486,26 @@ mod tests {
 
         p.headers = &[];
         assert_eq!(select(&routes, &p), Some(0), "absent header → bare route");
+    }
+
+    #[test]
+    fn header_match_decides_on_the_first_duplicate() {
+        // A duplicate header must not let a later copy flip the routing decision (CWE-436): the
+        // FIRST occurrence of the name decides, like the query rule. Here the first `x-api-version`
+        // is `1`, so the header route (which wants `2`) must NOT be selected even though a later
+        // copy is `2` — otherwise our routing would disagree with an origin that reads the first.
+        let mut v2 = route(None, "/api", "v2");
+        v2.headers = vec![("x-api-version".to_string(), "2".to_string())];
+        let routes = vec![route(None, "/api", "v1"), v2];
+
+        let hdrs = [header("x-api-version", "1"), header("x-api-version", "2")];
+        let mut p = parts("h", "/api");
+        p.headers = &hdrs;
+        assert_eq!(
+            select(&routes, &p),
+            Some(0),
+            "the first duplicate value (1) decides, so the v2 header route does not match"
+        );
     }
 
     #[test]
