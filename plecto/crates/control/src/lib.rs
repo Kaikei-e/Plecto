@@ -17,6 +17,7 @@ mod chain;
 mod error;
 mod manifest;
 pub mod oci;
+mod ratelimit;
 mod reload;
 mod route;
 mod snapshot;
@@ -35,8 +36,9 @@ pub use chain::{ChainOutcome, RequestBodyOutcome};
 pub use error::ControlError;
 pub use manifest::{
     Chain, CircuitBreaker, FilterEntry, HealthConfig, IsolationKind, Manifest, Observability,
-    OutlierDetection, Route, TlsCert, Trust, Upstream,
+    OutlierDetection, RateLimitKeyKind, Route, RouteRateLimit, TlsCert, Trust, Upstream,
 };
+pub use ratelimit::RateLimitDecision;
 #[cfg(unix)]
 pub use reload::SignalReloadSource;
 pub use reload::{ReloadOutcome, ReloadSource, serve_reloads};
@@ -445,6 +447,23 @@ fn build_active(
                 });
             }
         }
+        // Reject a native rate limit that can never serve a token (ADR 000033). A zero `rate` never
+        // refills and a zero `burst` holds nothing — a config typo, fail-closed at build like the
+        // per-filter limiter validation, before the limiter arithmetic ever runs (CWE-20).
+        if let Some(rl) = &r.rate_limit {
+            if rl.rate == 0 {
+                return Err(ControlError::InvalidRouteRateLimit {
+                    path_prefix: r.path_prefix.clone(),
+                    reason: "rate must be non-zero".to_string(),
+                });
+            }
+            if rl.burst == 0 {
+                return Err(ControlError::InvalidRouteRateLimit {
+                    path_prefix: r.path_prefix.clone(),
+                    reason: "burst must be non-zero".to_string(),
+                });
+            }
+        }
     }
 
     // TLS termination config (ADR 000014 TCP / ADR 000016 QUIC): build the rustls ServerConfigs
@@ -482,6 +501,11 @@ fn build_active(
             filters: r.filters.clone(),
             upstream,
             strip_prefix: r.strip_prefix.clone(),
+            // Build the native limiter (ADR 000033) — `rate`/`burst` were validated non-zero above.
+            // A fresh limiter per build means a reload resets the node-local buckets (ephemeral).
+            rate_limit: r
+                .rate_limit
+                .map(|rl| Arc::new(ratelimit::NativeRateLimit::new(rl))),
         });
     }
 

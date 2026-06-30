@@ -51,6 +51,23 @@ pub(crate) fn synth(
         .expect("static synth response is always valid")
 }
 
+/// Like [`synth`] but also carries a `Retry-After` (seconds) hint — for the native rate-limit 429
+/// (ADR 000033), where the limiter knows when a token next frees up. The value is a decimal integer,
+/// always a valid header value, so the builder still cannot fail.
+pub(crate) fn synth_retry_after(
+    status: StatusCode,
+    fault: &str,
+    body: &'static [u8],
+    retry_after_secs: u64,
+) -> Response<ResponseBody> {
+    Response::builder()
+        .status(status)
+        .header("x-plecto-fault", fault)
+        .header("retry-after", retry_after_secs.to_string())
+        .body(full(body.to_vec()))
+        .expect("static synth response is always valid")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

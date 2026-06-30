@@ -10,13 +10,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use hyper::body::Body;
 use hyper::header::HeaderValue;
 use hyper::{Request, Response, StatusCode};
-use plecto_control::{ChainOutcome, HttpResponse, RequestBodyOutcome, RequestTrace};
+use plecto_control::{
+    ChainOutcome, HttpResponse, RateLimitDecision, RequestBodyOutcome, RequestTrace,
+};
 
 use crate::body::{
     INBOUND_BODY_READ_TIMEOUT, MAX_REQUEST_BODY_BUFFER, buffer_request_body, empty_req, req_full,
 };
 use crate::headers::{copy_headers_preserving, headers_to_vec, set_forwarded, to_http_request};
-use crate::respond::{http_response, stream_response, synth};
+use crate::respond::{http_response, stream_response, synth, synth_retry_after};
 use crate::{ReqBody, ResponseBody, ServerState, access_log};
 
 /// A retryable upstream failure (ADR 000023). A timeout may already have been acted on by the
@@ -196,6 +198,22 @@ async fn proxy_core_inner(
         return Ok(synth(StatusCode::NOT_FOUND, "no-route", b"no route"));
     };
     let idx = route.index;
+
+    // Native rate limit (ADR 000033): a coarse token-bucket baseline consulted at the front door —
+    // BEFORE the route's filter chain — so a flood is shed without spending any WASM CPU. The
+    // peer-keyed (or route-keyed) bucket math is host-native and never crosses the WASM boundary.
+    // Over the limit fails closed with 429 + `Retry-After`, distinct from the breaker's 503
+    // (`circuit-open`, upstream saturated): this is the client over its inbound rate floor. The
+    // per-filter `host-ratelimit` capability (ADR 000026) is a separate, policy-shaped limiter.
+    if let RateLimitDecision::Limit { retry_after_ms } = route.check_rate_limit(peer.ip()) {
+        state.metrics.inc_rate_limited();
+        return Ok(synth_retry_after(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate-limited",
+            b"rate limit exceeded",
+            retry_after_ms.div_ceil(1000),
+        ));
+    }
 
     // --- request side: the route's chain on the blocking pool (sync wasmtime, !Send Store) ---
     let snap_req = snapshot.clone();

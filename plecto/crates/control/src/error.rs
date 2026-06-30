@@ -91,6 +91,12 @@ pub enum ControlError {
     #[error("route (prefix {path_prefix:?}) references unknown filter {filter:?}")]
     UnknownRouteFilter { path_prefix: String, filter: String },
 
+    /// A route's native rate limit (ADR 000033) had an out-of-range value (`rate` or `burst` of
+    /// zero — a bucket that can never serve a token). Rejected fail-closed at build, like the
+    /// per-filter rate-limit validation, so a config typo cannot reach the limiter arithmetic.
+    #[error("route (prefix {path_prefix:?}) has invalid rate_limit: {reason}")]
+    InvalidRouteRateLimit { path_prefix: String, reason: String },
+
     /// A TLS cert/key file could not be read, parsed, or built into a usable certificate
     /// (ADR 000014). Fail-closed: a bad cert aborts the build, so reload never swaps in a TLS
     /// config that cannot serve. `host` is the SNI the entry was for (`None` = default cert).

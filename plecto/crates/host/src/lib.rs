@@ -46,7 +46,7 @@ use wasmtime::{
     StoreLimitsBuilder,
 };
 
-pub use backend::{Acquire, Bucket, KvBackend, MemoryBackend, RedbBackend};
+pub use backend::{Acquire, Bucket, KvBackend, MemoryBackend, RedbBackend, apply_bucket};
 pub use observe::{
     FanOutSink, FilterSpan, Hook, InMemorySink, MetricsSink, MetricsSnapshot, NoopSink,
     RequestTrace, SpanOutcome, TelemetrySink,

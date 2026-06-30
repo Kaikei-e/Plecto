@@ -260,6 +260,42 @@ pub struct Route {
     /// (host-native rewrite; the chain saw the original path). E.g. `/api` + `/api/x` → `/x`.
     #[serde(default)]
     pub strip_prefix: Option<String>,
+    /// Native fast-path rate limit (ADR 000033): a coarse token-bucket baseline consulted BEFORE
+    /// this route's filter chain. Absent = unlimited (the default). Distinct from the per-filter
+    /// `host-ratelimit` capability (ADR 000026): this is the operator's native floor on a route
+    /// (or per client-IP), needs no WASM filter, and never crosses the WASM boundary.
+    #[serde(default)]
+    pub rate_limit: Option<RouteRateLimit>,
+}
+
+/// Native per-route rate-limit spec (ADR 000033), declared as `[route.rate_limit]`. A coarse
+/// token bucket the fast path consults before forwarding — the Tier-0 baseline a filterless route
+/// otherwise lacks. `rate`/`burst` map onto the same token-bucket math as `host-ratelimit`
+/// (`capacity = burst`, refill `rate` tokens every second), but the surface is deliberately the
+/// friendlier two-knob (rate + burst) form, since this is a blunt floor, not a policy limiter.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RouteRateLimit {
+    /// Sustained requests per second (tokens added each second). Must be non-zero.
+    pub rate: u64,
+    /// Burst capacity: the most tokens the bucket holds (and starts full with). Must be non-zero.
+    pub burst: u64,
+    /// What the bucket counts against (default `route`). `route` shares one bucket across every
+    /// client of the route (a total floor); `client-ip` gives each client its own bucket (fairness
+    /// between clients), keyed on the connection peer (v4 /32, v6 /64).
+    #[serde(default)]
+    pub key: RateLimitKeyKind,
+}
+
+/// The dimension a native route rate limit counts against (ADR 000033).
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum RateLimitKeyKind {
+    /// One shared bucket for the whole route — a total cap regardless of client.
+    #[default]
+    Route,
+    /// A per-client-IP bucket (peer address, v4 /32 + v6 /64), bounded to a fixed-size table.
+    ClientIp,
 }
 
 /// Trust roots: paths (manifest-relative) to trusted signer public keys, PEM (ADR 000006).
@@ -491,6 +527,58 @@ max_requests = 64
         )
         .unwrap();
         assert_eq!(m2.upstreams[0].circuit_breaker.max_requests, 64);
+    }
+
+    #[test]
+    fn route_rate_limit_defaults_absent_and_parses_with_key() {
+        // Absent `[route.rate_limit]` → no native limiter (unlimited), the default.
+        let m = Manifest::from_toml(
+            r#"
+[[route]]
+path_prefix = "/"
+upstream = "a"
+"#,
+        )
+        .unwrap();
+        assert!(
+            m.routes[0].rate_limit.is_none(),
+            "an absent rate_limit is unlimited"
+        );
+
+        // Present → rate/burst are read; `key` defaults to `route`.
+        let m2 = Manifest::from_toml(
+            r#"
+[[route]]
+path_prefix = "/"
+upstream = "a"
+[route.rate_limit]
+rate = 100
+burst = 200
+"#,
+        )
+        .unwrap();
+        let rl = m2.routes[0].rate_limit.unwrap();
+        assert_eq!(rl.rate, 100);
+        assert_eq!(rl.burst, 200);
+        assert_eq!(rl.key, RateLimitKeyKind::Route, "key defaults to route");
+
+        // `key = "client-ip"` is the kebab-case spelling.
+        let m3 = Manifest::from_toml(
+            r#"
+[[route]]
+path_prefix = "/"
+upstream = "a"
+[route.rate_limit]
+rate = 5
+burst = 5
+key = "client-ip"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            m3.routes[0].rate_limit.unwrap().key,
+            RateLimitKeyKind::ClientIp
+        );
     }
 
     #[test]

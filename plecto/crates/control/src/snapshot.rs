@@ -61,6 +61,7 @@ impl ConfigSnapshot {
             upstream: r.upstream.clone(),
             strip_prefix: r.strip_prefix.clone(),
             has_filters: !r.filters.is_empty(),
+            rate_limit: r.rate_limit.clone(),
         })
     }
 
