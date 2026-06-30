@@ -82,6 +82,14 @@ pub enum ControlError {
     #[error("upstream registry lock poisoned")]
     UpstreamRegistryPoisoned,
 
+    /// An upstream's load-balancing config (ADR 000035) was malformed: a per-instance `weight` of
+    /// zero or over the cap, a `maglev` upstream without (or a non-`maglev` upstream with) a
+    /// `[upstream.hash]` block, a `header` hash key with no header name, a non-prime / out-of-range
+    /// `table_size`, or more instances than the maglev table can index. Rejected fail-closed at
+    /// build, before the persistent registry mutates, so a bad LB config never reaches the hot path.
+    #[error("upstream {name:?} has invalid load-balancing config: {reason}")]
+    InvalidUpstreamLb { name: String, reason: String },
+
     #[error("route (prefix {path_prefix:?}) references unknown upstream {upstream:?}")]
     UnknownRouteUpstream {
         path_prefix: String,

@@ -87,16 +87,29 @@ pub struct TlsCert {
 
 /// A named upstream the fast-path server forwards a matched request to (ADR 000013 / 000017).
 /// One or more `addresses` (plain `host:port`, no scheme; forwarded over plain HTTP/1.1) are the
-/// upstream's instances; the fast path round-robins across the healthy ones. Every upstream
-/// carries an active-health-check policy (`health`) — required, because instances start
+/// upstream's instances; the fast path balances across the healthy ones per `lb_algorithm`. Every
+/// upstream carries an active-health-check policy (`health`) — required, because instances start
 /// pessimistic (unhealthy) and only a passing probe puts one into rotation (ADR 000017).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Upstream {
     pub name: String,
-    /// `host:port` of each backend instance (e.g. `["127.0.0.1:9000", "127.0.0.1:9001"]`). No
-    /// scheme; plain HTTP/1.1. Must be non-empty (validated when the routing table is built).
-    pub addresses: Vec<String>,
+    /// Each backend instance's `host:port` (no scheme; plain HTTP/1.1). Each entry is either a bare
+    /// string (`"127.0.0.1:9000"`, weight 1) or a weighted inline table (`{ address = "...",
+    /// weight = N }`) for heterogeneous instances (ADR 000035). Must be non-empty (validated at
+    /// build). The two forms mix in one list; a bare string and an explicit `weight = 1` are
+    /// equivalent (same content hash).
+    pub addresses: Vec<AddressSpec>,
+    /// Per-upstream load-balancing algorithm (ADR 000035): `round_robin` (default), `least_request`
+    /// (power-of-two-choices over per-instance active requests), or `maglev` (consistent hashing for
+    /// session affinity). The chosen algorithm selects an instance from the healthy set; default
+    /// `round_robin` keeps the pre-000035 behaviour with no per-request cost change.
+    #[serde(default)]
+    pub lb_algorithm: LbAlgorithm,
+    /// Maglev hash config (ADR 000035), `[upstream.hash]`. Required iff `lb_algorithm = "maglev"`
+    /// (a `maglev` upstream needs a hash key; any other algorithm must not set it). Absent otherwise.
+    #[serde(default)]
+    pub hash: Option<HashConfig>,
     /// Active-health-check policy for this upstream's instances (ADR 000017).
     pub health: HealthConfig,
     /// End-to-end timeout (ms) for forwarding a request to this upstream (ADR 000019 / review
@@ -132,6 +145,232 @@ pub struct Upstream {
     /// `0` = disabled (the default).
     #[serde(default)]
     pub outlier_detection: OutlierDetection,
+}
+
+/// Per-upstream load-balancing algorithm (ADR 000035). `round_robin` is the default and keeps the
+/// pre-000035 healthy-set rotation (ADR 000024); the others are opt-in. This selects an INSTANCE
+/// within a chosen upstream group — a layer below the route→group weighted split (ADR 000034).
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LbAlgorithm {
+    /// Healthy-set round-robin (ADR 000017 / 000024) — the default.
+    #[default]
+    RoundRobin,
+    /// Weighted least-request via power-of-two-choices: sample two healthy instances, forward to the
+    /// one with the smaller `(active_requests + 1) / weight` (ADR 000035).
+    LeastRequest,
+    /// Consistent hashing via a (weighted) Maglev lookup table: a request's hash key maps to a
+    /// stable instance for session affinity / cache locality (ADR 000035). Needs `[upstream.hash]`.
+    Maglev,
+}
+
+/// One instance of an upstream (ADR 000035): a bare `host:port` string (weight 1) or a weighted
+/// inline table `{ address = "host:port", weight = N }`. The bare form preserves the pre-000035
+/// `addresses = ["h:p", ...]` manifest verbatim. A custom `Serialize` canonicalises a `weight = 1`
+/// table back to the bare string, so an explicitly-written default weight does not change the
+/// content hash (the manifest determinism invariant — same spirit as an explicit `isolation =
+/// "untrusted"`).
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum AddressSpec {
+    /// A bare `host:port` — weight 1.
+    Bare(String),
+    /// A weighted instance `{ address, weight }`.
+    Weighted(WeightedAddress),
+}
+
+/// The weighted form of an [`AddressSpec`]: an instance `host:port` plus its integer `weight`
+/// (ADR 000035). Weight biases both the least-request comparison and the Maglev table share toward
+/// higher-capacity instances; `1` is the default, `0` is rejected at build (drain an instance by
+/// removing its address, not by zeroing its weight).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WeightedAddress {
+    pub address: String,
+    #[serde(default = "default_instance_weight")]
+    pub weight: u32,
+}
+
+impl AddressSpec {
+    /// This instance's `host:port`.
+    pub fn address(&self) -> &str {
+        match self {
+            AddressSpec::Bare(a) => a,
+            AddressSpec::Weighted(w) => &w.address,
+        }
+    }
+
+    /// This instance's load-balancing weight (bare form is 1).
+    pub fn weight(&self) -> u32 {
+        match self {
+            AddressSpec::Bare(_) => default_instance_weight(),
+            AddressSpec::Weighted(w) => w.weight,
+        }
+    }
+}
+
+impl Serialize for AddressSpec {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // Canonicalise a default `weight = 1` (whether bare or written-out) to the bare-string form
+        // so it does not perturb the semantic content hash (manifest determinism invariant, like an
+        // explicit `isolation = "untrusted"`). A non-default weight serialises as the table.
+        match self {
+            AddressSpec::Bare(addr) => serializer.serialize_str(addr),
+            AddressSpec::Weighted(w) if w.weight == default_instance_weight() => {
+                serializer.serialize_str(&w.address)
+            }
+            AddressSpec::Weighted(w) => w.serialize(serializer),
+        }
+    }
+}
+
+fn default_instance_weight() -> u32 {
+    1
+}
+
+/// Upper bound on a per-instance weight (ADR 000035). Keeps the least-request cross-product and the
+/// Maglev populate (which interleaves a backend every `max_weight / weight` rounds) bounded; mirrors
+/// Google's documented per-instance weight range (0–1000) for weighted Maglev. Drain via address
+/// removal, not weight 0, so the floor is 1.
+pub(crate) const MAX_INSTANCE_WEIGHT: u32 = 1000;
+
+/// The Maglev consistent-hashing config (ADR 000035), `[upstream.hash]`. Only valid when
+/// `lb_algorithm = "maglev"`. Names the request attribute hashed for affinity and the lookup-table
+/// size.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HashConfig {
+    /// Which request attribute is the hash key.
+    pub key: HashKeyKind,
+    /// The header name to hash, required iff `key = "header"` (matched case-insensitively). Ignored
+    /// for `source_ip`.
+    #[serde(default)]
+    pub header: Option<String>,
+    /// Maglev lookup-table size `M` — must be PRIME (the permutation's `skip` is coprime to `M` only
+    /// then) and `>= instance count`. Default 65537. Larger `M` reduces disruption on instance
+    /// change at the cost of `M × 2` bytes per upstream; validated prime / in range at build.
+    #[serde(default = "default_hash_table_size")]
+    pub table_size: u32,
+}
+
+/// The request attribute a Maglev upstream hashes for affinity (ADR 000035).
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HashKeyKind {
+    /// The value of a named request header (requires `header`).
+    Header,
+    /// The connection peer's IP address (NOT a spoofable forwarding header).
+    SourceIp,
+}
+
+fn default_hash_table_size() -> u32 {
+    65537
+}
+
+/// Upper bound on the Maglev `table_size` (ADR 000035), matching Envoy's documented cap. Bounds the
+/// per-upstream table memory (`table_size × 2` bytes); the operator must opt into anything this
+/// large explicitly. The default (65537) is two orders of magnitude below it.
+pub(crate) const MAX_HASH_TABLE_SIZE: u32 = 5_000_011;
+
+impl Upstream {
+    /// Validate this upstream's load-balancing config (ADR 000035) fail-closed at build, before the
+    /// persistent registry reconciles. Checks per-instance weights, the `lb_algorithm` ↔
+    /// `[upstream.hash]` correspondence, and (for Maglev) the hash key and table size. Returns the
+    /// reason a caller wraps with the upstream name.
+    pub(crate) fn validate_lb(&self) -> Result<(), String> {
+        for spec in &self.addresses {
+            let w = spec.weight();
+            if w == 0 {
+                return Err(format!(
+                    "instance {:?} has weight 0; drain an instance by removing its address, not by zeroing weight",
+                    spec.address()
+                ));
+            }
+            if w > MAX_INSTANCE_WEIGHT {
+                return Err(format!(
+                    "instance {:?} weight {w} exceeds the maximum {MAX_INSTANCE_WEIGHT}",
+                    spec.address()
+                ));
+            }
+        }
+
+        match (self.lb_algorithm, &self.hash) {
+            // Maglev needs a hash key; a key with no algorithm to use it is a config mistake.
+            (LbAlgorithm::Maglev, None) => {
+                return Err(
+                    "lb_algorithm = \"maglev\" requires a [upstream.hash] block".to_string()
+                );
+            }
+            (algo, Some(_)) if algo != LbAlgorithm::Maglev => {
+                return Err(
+                    "[upstream.hash] is only valid with lb_algorithm = \"maglev\"".to_string(),
+                );
+            }
+            _ => {}
+        }
+
+        if let Some(hash) = &self.hash {
+            if hash.key == HashKeyKind::Header
+                && hash
+                    .header
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or("")
+                    .is_empty()
+            {
+                return Err(
+                    "[upstream.hash] key = \"header\" requires a non-empty header name".to_string(),
+                );
+            }
+            let m = hash.table_size;
+            if m > MAX_HASH_TABLE_SIZE {
+                return Err(format!(
+                    "[upstream.hash] table_size {m} exceeds the maximum {MAX_HASH_TABLE_SIZE}"
+                ));
+            }
+            if !is_prime(m) {
+                return Err(format!(
+                    "[upstream.hash] table_size {m} must be prime (the Maglev permutation needs skip coprime to M)"
+                ));
+            }
+            // Each instance needs at least one table entry, and the table indexes instances with a
+            // u16, so the pool must fit both bounds.
+            let n = self.addresses.len();
+            if n > m as usize {
+                return Err(format!(
+                    "[upstream.hash] table_size {m} is smaller than the {n} instances"
+                ));
+            }
+            if n > u16::MAX as usize {
+                return Err(format!(
+                    "maglev supports at most {} instances, got {n}",
+                    u16::MAX
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Trial-division primality test for the Maglev `table_size` (ADR 000035). Build-time only and `M`
+/// is capped at a few million, so trial division to `√M` (~2236 iterations at the cap) is trivial;
+/// no need for a probabilistic test or a dependency.
+fn is_prime(n: u32) -> bool {
+    if n < 2 {
+        return false;
+    }
+    if n.is_multiple_of(2) {
+        return n == 2;
+    }
+    let mut d = 3u64;
+    let n = n as u64;
+    while d * d <= n {
+        if n.is_multiple_of(d) {
+            return false;
+        }
+        d += 2;
+    }
+    true
 }
 
 /// Per-upstream outlier-detection policy (ADR 000032). A THIRD resilience axis: active health (ADR
@@ -796,9 +1035,15 @@ path_prefix = "/api"
         .unwrap();
 
         assert_eq!(m.upstreams.len(), 1);
-        assert_eq!(
-            m.upstreams[0].addresses,
-            vec!["127.0.0.1:9000".to_string(), "127.0.0.1:9001".to_string()]
+        let addrs: Vec<&str> = m.upstreams[0]
+            .addresses
+            .iter()
+            .map(|a| a.address())
+            .collect();
+        assert_eq!(addrs, vec!["127.0.0.1:9000", "127.0.0.1:9001"]);
+        assert!(
+            m.upstreams[0].addresses.iter().all(|a| a.weight() == 1),
+            "bare addresses default to weight 1"
         );
         // health is required; the unspecified knobs take their defaults
         assert_eq!(m.upstreams[0].health.path, "/healthz");
@@ -1080,5 +1325,174 @@ typo_field = true
             .is_ok(),
             "a one-shot (no-refill) bucket is valid"
         );
+    }
+
+    // ----- ADR 000035: lb_algorithm, per-instance weight, maglev hash config -----
+
+    fn upstream_toml(body: &str) -> Result<Manifest, ControlError> {
+        Manifest::from_toml(&format!(
+            "[[upstream]]\nname = \"u\"\n{body}\n[upstream.health]\npath = \"/healthz\"\n"
+        ))
+    }
+
+    #[test]
+    fn lb_algorithm_defaults_round_robin_and_parses() {
+        // Absent → round_robin (the pre-000035 default).
+        let m = upstream_toml("addresses = [\"a:1\"]").unwrap();
+        assert_eq!(m.upstreams[0].lb_algorithm, LbAlgorithm::RoundRobin);
+
+        let lr = upstream_toml("addresses = [\"a:1\"]\nlb_algorithm = \"least_request\"").unwrap();
+        assert_eq!(lr.upstreams[0].lb_algorithm, LbAlgorithm::LeastRequest);
+
+        // a non-default algorithm flips the content hash (it is part of config identity).
+        assert_ne!(
+            m.content_hash().unwrap(),
+            lr.content_hash().unwrap(),
+            "changing lb_algorithm must flip the config version"
+        );
+    }
+
+    #[test]
+    fn addresses_parse_bare_and_weighted_mixed() {
+        // A bare string and a weighted inline table coexist in one list (ADR 000035).
+        let m = upstream_toml(
+            "addresses = [\"a:1\", { address = \"b:2\", weight = 5 }, { address = \"c:3\" }]",
+        )
+        .unwrap();
+        let a = &m.upstreams[0].addresses;
+        assert_eq!(a[0].address(), "a:1");
+        assert_eq!(a[0].weight(), 1, "bare = weight 1");
+        assert_eq!(a[1].address(), "b:2");
+        assert_eq!(a[1].weight(), 5);
+        assert_eq!(a[2].address(), "c:3");
+        assert_eq!(a[2].weight(), 1, "weighted form defaults weight to 1");
+    }
+
+    #[test]
+    fn explicit_weight_one_hashes_like_a_bare_address() {
+        // The determinism invariant: an explicit `weight = 1` is representation noise vs a bare
+        // string, so the two must share a content hash (like an explicit `isolation = "untrusted"`).
+        let bare = upstream_toml("addresses = [\"a:1\"]").unwrap();
+        let explicit = upstream_toml("addresses = [{ address = \"a:1\", weight = 1 }]").unwrap();
+        assert_eq!(
+            bare.content_hash().unwrap(),
+            explicit.content_hash().unwrap(),
+            "an explicit default weight must not change the config version"
+        );
+
+        // …but a non-default weight DOES change it.
+        let weighted = upstream_toml("addresses = [{ address = \"a:1\", weight = 3 }]").unwrap();
+        assert_ne!(
+            bare.content_hash().unwrap(),
+            weighted.content_hash().unwrap()
+        );
+    }
+
+    #[test]
+    fn maglev_hash_config_parses() {
+        let m = upstream_toml(
+            "addresses = [\"a:1\", \"b:2\"]\nlb_algorithm = \"maglev\"\n[upstream.hash]\nkey = \"header\"\nheader = \"x-user\"\ntable_size = 1009",
+        )
+        .unwrap();
+        let up = &m.upstreams[0];
+        assert_eq!(up.lb_algorithm, LbAlgorithm::Maglev);
+        let hash = up.hash.as_ref().unwrap();
+        assert_eq!(hash.key, HashKeyKind::Header);
+        assert_eq!(hash.header.as_deref(), Some("x-user"));
+        assert_eq!(hash.table_size, 1009);
+        assert!(up.validate_lb().is_ok());
+    }
+
+    #[test]
+    fn hash_table_size_defaults_to_65537() {
+        let m = upstream_toml(
+            "addresses = [\"a:1\"]\nlb_algorithm = \"maglev\"\n[upstream.hash]\nkey = \"source_ip\"",
+        )
+        .unwrap();
+        assert_eq!(m.upstreams[0].hash.as_ref().unwrap().table_size, 65537);
+        assert_eq!(
+            m.upstreams[0].hash.as_ref().unwrap().key,
+            HashKeyKind::SourceIp
+        );
+    }
+
+    #[test]
+    fn validate_lb_rejects_bad_configs() {
+        // weight 0 (drain via address removal, not weight 0)
+        let w0 = upstream_toml("addresses = [{ address = \"a:1\", weight = 0 }]").unwrap();
+        assert!(w0.upstreams[0].validate_lb().is_err(), "weight 0 rejected");
+
+        // weight over the cap
+        let wbig = upstream_toml(&format!(
+            "addresses = [{{ address = \"a:1\", weight = {} }}]",
+            MAX_INSTANCE_WEIGHT + 1
+        ))
+        .unwrap();
+        assert!(
+            wbig.upstreams[0].validate_lb().is_err(),
+            "over-cap weight rejected"
+        );
+
+        // maglev without a hash block
+        let no_hash = upstream_toml("addresses = [\"a:1\"]\nlb_algorithm = \"maglev\"").unwrap();
+        assert!(
+            no_hash.upstreams[0].validate_lb().is_err(),
+            "maglev needs [upstream.hash]"
+        );
+
+        // hash block on a non-maglev algorithm
+        let stray_hash =
+            upstream_toml("addresses = [\"a:1\"]\n[upstream.hash]\nkey = \"source_ip\"").unwrap();
+        assert!(
+            stray_hash.upstreams[0].validate_lb().is_err(),
+            "[upstream.hash] only valid with maglev"
+        );
+
+        // header key with no header name
+        let no_header = upstream_toml(
+            "addresses = [\"a:1\"]\nlb_algorithm = \"maglev\"\n[upstream.hash]\nkey = \"header\"",
+        )
+        .unwrap();
+        assert!(
+            no_header.upstreams[0].validate_lb().is_err(),
+            "header key needs a name"
+        );
+
+        // non-prime table size
+        let nonprime = upstream_toml(
+            "addresses = [\"a:1\"]\nlb_algorithm = \"maglev\"\n[upstream.hash]\nkey = \"source_ip\"\ntable_size = 1000",
+        )
+        .unwrap();
+        assert!(
+            nonprime.upstreams[0].validate_lb().is_err(),
+            "table_size must be prime"
+        );
+
+        // table smaller than the instance count
+        let too_small = upstream_toml(
+            "addresses = [\"a:1\", \"b:2\", \"c:3\"]\nlb_algorithm = \"maglev\"\n[upstream.hash]\nkey = \"source_ip\"\ntable_size = 2",
+        )
+        .unwrap();
+        assert!(
+            too_small.upstreams[0].validate_lb().is_err(),
+            "M must be >= instance count"
+        );
+
+        // a valid maglev config passes
+        let ok = upstream_toml(
+            "addresses = [\"a:1\", \"b:2\"]\nlb_algorithm = \"maglev\"\n[upstream.hash]\nkey = \"source_ip\"\ntable_size = 97",
+        )
+        .unwrap();
+        assert!(ok.upstreams[0].validate_lb().is_ok());
+    }
+
+    #[test]
+    fn is_prime_is_correct() {
+        for p in [2u32, 3, 5, 97, 1009, 65537, 5_000_011] {
+            assert!(is_prime(p), "{p} is prime");
+        }
+        for c in [0u32, 1, 4, 9, 100, 1000, 65536] {
+            assert!(!is_prime(c), "{c} is not prime");
+        }
     }
 }
