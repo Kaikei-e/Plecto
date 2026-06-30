@@ -11,7 +11,8 @@ use hyper::body::Body;
 use hyper::header::HeaderValue;
 use hyper::{Request, Response, StatusCode};
 use plecto_control::{
-    ChainOutcome, HttpResponse, RateLimitDecision, RequestBodyOutcome, RequestTrace,
+    ChainOutcome, HashInput, HashKeySource, HttpResponse, RateLimitDecision, RequestBodyOutcome,
+    RequestTrace,
 };
 
 use crate::body::{
@@ -241,6 +242,19 @@ async fn proxy_core_inner(
         ));
     };
 
+    // Maglev consistent-hashing key (ADR 000035): for a `maglev` upstream, project the request's
+    // hash key — a named header's value (borrowed bytes) or the connection peer's IP (hashed as
+    // canonical octets, NOT a spoofable forwarding header). `None` for the other algorithms, or when
+    // the configured header is absent (the group then falls back to round-robin). Borrowed from
+    // `parts`, which outlives the retry loop, and `Copy`, so each attempt reuses it unchanged.
+    let hash_key: Option<HashInput> = group.hash_key_source().and_then(|src| match src {
+        HashKeySource::Header(name) => parts
+            .headers
+            .get(name)
+            .map(|v| HashInput::Bytes(v.as_bytes())),
+        HashKeySource::SourceIp => Some(HashInput::Ip(peer.ip())),
+    });
+
     // --- forward to a healthy instance, with bounded retry onto ANOTHER instance on a retryable
     // failure (ADR 000019 timeout / 000023 retry). The per-attempt invariants are computed once. ---
     let upstream_path = route.rewrite_path(&forward.path);
@@ -318,8 +332,11 @@ async fn proxy_core_inner(
         }
     };
 
-    // First pick by round-robin; fail closed (503) if no instance is healthy (ADR 000017).
-    let Some(mut instance) = group.pick() else {
+    // First pick per the upstream's LB algorithm (ADR 000035): round-robin, least-request (P2C), or
+    // maglev (by `hash_key`). Fail closed (503) if no instance is eligible (ADR 000017). The `Pick`
+    // carries the least-request load guard (a no-op otherwise) and is held across the retry loop, so
+    // an instance's active-request count is decremented on every exit and on each retry hand-off.
+    let Some(mut pick) = group.pick(hash_key) else {
         return Ok(synth(
             StatusCode::SERVICE_UNAVAILABLE,
             "no-healthy-upstream",
@@ -359,7 +376,7 @@ async fn proxy_core_inner(
         } else {
             real_body.take().unwrap_or_else(empty_req)
         };
-        let uri = format!("http://{}{}", instance.address(), upstream_path);
+        let uri = format!("http://{}{}", pick.address(), upstream_path);
         let mut builder = Request::builder().method(forward.method.as_str()).uri(uri);
         // Forward the chain's headers, restoring byte-equivalence for any the filters left untouched
         // (P3#6): the contract's `string` values are lossy, but the original inbound bytes are still
@@ -392,7 +409,7 @@ async fn proxy_core_inner(
                 // misbehaviour signal (a retried-around 5xx still counts); any other status resets its
                 // streak. A circuit-breaker shed / per-try timeout is NOT recorded here (other axes).
                 let gateway_failure = is_retriable_5xx(resp.status());
-                if group.record_outcome(&instance, gateway_failure) {
+                if group.record_outcome(pick.instance(), gateway_failure) {
                     state.metrics.inc_outlier_ejection();
                 }
                 // retry-on-5xx (ADR 000030): a retriable gateway 5xx from an idempotent, bodyless
@@ -404,13 +421,13 @@ async fn proxy_core_inner(
                         bodyless,
                         tries_left,
                     )
-                    && let Some(next) = group.pick_excluding(&instance)
+                    && let Some(next) = group.pick_excluding(pick.instance(), hash_key)
                 {
                     state.metrics.inc_retries();
                     backoff(attempt).await;
                     attempt += 1;
                     tries_left -= 1;
-                    instance = next;
+                    pick = next;
                     continue;
                 }
                 break resp;
@@ -435,13 +452,13 @@ async fn proxy_core_inner(
                     forward.method.as_str(),
                     bodyless,
                     tries_left,
-                ) && let Some(next) = group.pick_excluding(&instance)
+                ) && let Some(next) = group.pick_excluding(pick.instance(), hash_key)
                 {
                     state.metrics.inc_retries();
                     backoff(attempt).await;
                     attempt += 1;
                     tries_left -= 1;
-                    instance = next;
+                    pick = next;
                     continue;
                 }
                 return Ok(synth(
@@ -456,19 +473,19 @@ async fn proxy_core_inner(
                 // fault is neither a health signal nor retried — only the active prober governs
                 // health then; the request fails closed (the caller maps the error to 502).
                 if e.is_connect() {
-                    instance.record_passive_failure();
+                    pick.record_passive_failure();
                     if may_retry(
                         Failure::Connect,
                         forward.method.as_str(),
                         bodyless,
                         tries_left,
-                    ) && let Some(next) = group.pick_excluding(&instance)
+                    ) && let Some(next) = group.pick_excluding(pick.instance(), hash_key)
                     {
                         state.metrics.inc_retries();
                         backoff(attempt).await;
                         attempt += 1;
                         tries_left -= 1;
-                        instance = next;
+                        pick = next;
                         continue;
                     }
                 }

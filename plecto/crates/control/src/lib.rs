@@ -15,10 +15,13 @@
 mod artifact;
 mod chain;
 mod error;
+mod hash;
+mod maglev;
 mod manifest;
 pub mod oci;
 mod ratelimit;
 mod reload;
+mod rng;
 mod route;
 mod snapshot;
 mod tls;
@@ -48,7 +51,9 @@ pub use route::{RouteInfo, normalize_path};
 /// `plecto-server` names the same `rustls` type the control plane built.
 pub use rustls::ServerConfig as TlsServerConfig;
 pub use snapshot::ConfigSnapshot;
-pub use upstream::{UpstreamGroup, UpstreamInstance, UpstreamRegistry};
+pub use upstream::{
+    HashInput, HashKeySource, Pick, UpstreamGroup, UpstreamInstance, UpstreamRegistry,
+};
 
 // Re-export the host surface a caller drives the control plane with, so they need not depend
 // on `plecto-host` directly for the common path — including the ADR 000009 observability

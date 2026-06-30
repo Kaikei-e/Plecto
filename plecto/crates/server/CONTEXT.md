@@ -50,7 +50,7 @@ route が宣言する path 書き換え。fast path が**転送直前**に適用
 書き換え後を受ける。フィルタ駆動の path 書き換え（WIT `set-path`）とは別物で、契約変更を要さない。
 _Avoid_: filter rewrite（フィルタ駆動の書換は別レイヤ・後続）
 
-## ロードバランシング / health（ADR 000017）
+## ロードバランシング / health（ADR 000017 / 000035）
 
 **Upstream instance**:
 upstream を構成する 1 つの `host:port`。active health check が healthy / unhealthy を切り替え、unhealthy な
@@ -68,9 +68,48 @@ _Avoid_: liveness probe（k8s 用語）, ping（多義）
 信号。active が先回り検知、passive が取りこぼしを拾う。引き金になったリクエスト自体は救済しない（retry しない）。
 _Avoid_: outlier detection（独立サブシステムを含意。ここでは active と単一状態機を共有）
 
+**LB algorithm（per-upstream 選択則）**:
+upstream ごとに選ぶ instance 選択則（ADR 000035）。`round_robin`（既定）・`least_request`（P2C）・`maglev`
+（consistent hashing）の三択。route→group の weighted split（**Weighted apportionment split**）とは**別層**で、
+これは選ばれた group の中でどの instance に流すかを決める。
+_Avoid_: balancing strategy（曖昧）, scheduler（async ランタイム側と紛らわしい）
+
 **Round-robin LB**:
-healthy な upstream instance 集合を巡回選択する分配。eject された instance は集合から外れ、復帰（restore）で戻る。
+healthy な upstream instance 集合を巡回選択する既定の分配（LB algorithm の `round_robin`）。eject された instance
+は集合から外れ、復帰（restore）で戻る。
 _Avoid_: balancing pool（曖昧）
+
+**Least-request LB（P2C）**:
+eligible な instance 集合から 2 つを一様乱択し、**active-request count** の少ない方（per-instance weight で
+正規化した `(active+1)/weight` の小さい方）へ流す選択則（ADR 000035）。全走査せず O(1) 近傍で「ほぼ最小」を選ぶ
+power-of-two-choices。不均一コスト / long-lived なリクエストで round-robin より in-flight を均す。
+_Avoid_: least-connection（数えるのは TCP 接続ではなく in-flight な HTTP リクエスト）, least-loaded（全走査を含意）
+
+**Active-request count（per-instance 選択信号）**:
+ある instance へ現在 forward 中（in-flight）の HTTP リクエスト数。least-request LB が読む per-instance の信号で、
+forward 開始で increment・応答到達 / 失敗で decrement する。circuit breaker（ADR 000028）の **per-group** in-flight
+（飽和保護の cap）とは別フィールド・別関心事——同じ「active 数」を別粒度で読む。
+_Avoid_: connection count（接続ではなくリクエスト）, load（曖昧）, in-flight cap（circuit breaker 側の語）
+
+**Consistent hashing LB（maglev / affinity）**:
+request の **hash key** を安定した instance へ写して同一キーを同一 instance へ固定する選択則（ADR 000035）。
+session affinity / backend キャッシュの locality 向け。Plecto は v1 で **maglev**（素数 M の lookup table、
+near-perfect な均一性 ＋ O(1) lookup）を採り、table は instance 集合上で固定して health flip では作り直さない。
+primary が ineligible / key 欠落のときは round-robin へ fallback する。
+_Avoid_: sticky session（成果であって機構名でない）, ring hash / ketama（別の consistent-hashing 変種。v1 は不採用）,
+session pinning（曖昧）
+
+**Hash key（affinity の投影）**:
+consistent hashing LB が同一 instance へ固定する根拠にする request 属性——`header` の値か **source-IP**（peer socket
+address の octets。spoofable な forwarding header は使わない）。untrusted（クライアントが付けられる）なので affinity
+は性能最適化であって権限境界ではない。欠落時は round-robin へ fallback。
+_Avoid_: routing key（route 照合は match dimension で別軸）, session id（用途が狭い）
+
+**Per-instance weight**:
+upstream instance に付ける整数 weight（既定 1）。least-request の比較と maglev の table 配分の双方を heterogeneous
+（容量差のある）instance 向けに偏らせる。route→group split の **backend weight**（ADR 000034、どの group へ何 % か）
+とは**別層の別 weight**——こちらは group 内でどの instance を選ぶかを偏らせる。
+_Avoid_: backend weight（route→group split の重み。層が違う）, capacity（実装語）
 
 **No-healthy fail-closed**:
 ある upstream の全 instance が unhealthy のとき、upstream に流さず 503 を返す挙動。fail-closed テネットの upstream

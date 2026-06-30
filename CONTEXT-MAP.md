@@ -31,8 +31,9 @@ _Avoid_: 二つの半身（身体比喩で生硬・"two halves" の直訳調）,
   M2 slice 1–5 着地（host＋path-prefix routing・host-native prefix strip・rustls TLS 終端 SNI 込み
   ADR 000014／TLS+ALPN 上の HTTP/2 終端 ADR 000015、h2c は不採用／quinn+h3 の独立 UDP listener で HTTP/3 終端・
   Alt-Svc 広告 ADR 000016、0-RTT 無効／複数 upstream instance を round-robin LB ＋ active/passive health check で
-  分散・全 unhealthy は 503 fail-closed ADR 000017）。upstream への h2/h3・least-conn/EWMA・request-level retry・
-  ノード横断 health は後続スライス。
+  分散・全 unhealthy は 503 fail-closed ADR 000017、LB algorithm を weighted least-request P2C ＋ weighted maglev
+  consistent hashing へ拡張 ADR 000035）。upstream への h2/h3・EWMA/latency-based LB・ring hash・ノード横断 health
+  は後続スライス。
 
 ## Relationships
 

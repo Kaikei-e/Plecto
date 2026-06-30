@@ -14,12 +14,15 @@
 //! reload, so the per-request hot path never touches the registry lock.
 
 use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::error::ControlError;
-use crate::manifest::{HealthConfig, Upstream};
+use crate::maglev::MaglevTable;
+use crate::manifest::{HashKeyKind, HealthConfig, LbAlgorithm, Upstream};
+use crate::rng;
 
 /// Upper bound on the outlier ejection-time exponential backoff (ADR 000032): the window is
 /// `base · 2^min(eject_count, cap)`, so the cap bounds it at `base · 2^6` (64×) however many times an
@@ -36,6 +39,15 @@ fn now_millis() -> u64 {
         .unwrap_or(0)
 }
 
+/// Whether instance `a` has the lower `(in_flight + 1) / weight` than `b` (ADR 000035) — the
+/// weighted least-request comparison, by integer cross-product so there is no float, and a tie keeps
+/// `a` (the first sampled). `u128` keeps the product overflow-free for any `in_flight` / `weight`.
+fn lower_load(a: &Arc<UpstreamInstance>, b: &Arc<UpstreamInstance>) -> bool {
+    let la = (a.in_flight() as u128 + 1) * b.weight() as u128;
+    let lb = (b.in_flight() as u128 + 1) * a.weight() as u128;
+    la <= lb
+}
+
 /// One backend instance (`host:port`) of an upstream, with its health state (ADR 000017).
 ///
 /// The hot path (`pick` → [`UpstreamInstance::is_healthy`]) reads a lock-free `AtomicBool`. State
@@ -45,8 +57,18 @@ fn now_millis() -> u64 {
 #[derive(Debug)]
 pub struct UpstreamInstance {
     address: String,
+    /// Load-balancing weight (ADR 000035): biases the least-request comparison and the Maglev table
+    /// share toward higher-capacity instances. `1` for a bare address. Immutable for the instance's
+    /// life; a weight change builds a fresh instance on reconcile (like a health-policy change).
+    weight: u32,
     /// The lock-free read surface for `pick`. Written only while holding `counters`.
     healthy: AtomicBool,
+    /// Active forwarded-request count to THIS instance (ADR 000035), the least-request load signal.
+    /// Incremented when an attempt selects this instance and decremented when the attempt ends (RAII,
+    /// across retries). Distinct from the per-group circuit-breaker in-flight (ADR 000028): that caps
+    /// the upstream's saturation, this drives per-instance selection. Only touched under
+    /// `least_request`; round-robin / maglev leave it at 0.
+    in_flight: AtomicUsize,
     counters: Mutex<HealthCounters>,
     healthy_threshold: u32,
     unhealthy_threshold: u32,
@@ -73,11 +95,15 @@ struct HealthCounters {
 }
 
 impl UpstreamInstance {
-    fn new(address: String, health: &HealthConfig) -> Self {
+    fn new(address: String, weight: u32, health: &HealthConfig) -> Self {
         Self {
             address,
+            // a 0 weight would divide by zero in the least-request ratio; validation rejects it, but
+            // clamp to >= 1 as defence in depth (data-plane no-panic).
+            weight: weight.max(1),
             // pessimistic: a fresh instance is out of rotation until a probe passes (ADR 000017).
             healthy: AtomicBool::new(false),
+            in_flight: AtomicUsize::new(0),
             counters: Mutex::new(HealthCounters {
                 consecutive_ok: 0,
                 consecutive_fail: 0,
@@ -95,6 +121,17 @@ impl UpstreamInstance {
     /// This instance's `host:port`.
     pub fn address(&self) -> &str {
         &self.address
+    }
+
+    /// This instance's load-balancing weight (ADR 000035), `>= 1`.
+    pub fn weight(&self) -> u32 {
+        self.weight
+    }
+
+    /// Current active forwarded-request count to this instance (ADR 000035) — the least-request load
+    /// signal. Lock-free read.
+    pub fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::Relaxed)
     }
 
     /// Whether this instance is currently in rotation. Lock-free — the round-robin hot path.
@@ -200,6 +237,94 @@ pub struct UpstreamGroup {
     outlier_consecutive: u32,
     outlier_base_ejection: Duration,
     outlier_max_ejection_percent: u32,
+    /// The per-instance load-balancing algorithm (ADR 000035): `RoundRobin` (the default, uses `rr`),
+    /// `LeastRequest` (power-of-two-choices over `in_flight`/`weight`), or `Maglev` (consistent
+    /// hashing via the precomputed table). Rebuilt from the manifest on reconcile, so an
+    /// algorithm/weight change rebuilds the table but is not part of `health`.
+    lb: LbState,
+    /// The request attribute a `Maglev` upstream hashes for affinity (ADR 000035); `None` for the
+    /// other algorithms. The fast path reads this to project the hash key from a request.
+    hash_key: Option<HashKeySource>,
+}
+
+/// The request attribute a Maglev upstream hashes for affinity (ADR 000035), resolved from the
+/// manifest `[upstream.hash]`. The fast path turns this into a [`HashInput`] per request.
+#[derive(Debug, Clone)]
+pub enum HashKeySource {
+    /// Hash a named request header's value (the name is stored lower-cased for case-insensitive lookup).
+    Header(String),
+    /// Hash the connection peer's IP address.
+    SourceIp,
+}
+
+/// A request attribute to hash for Maglev affinity (ADR 000035), borrowed so the hot path allocates
+/// nothing: a header value's bytes (borrowed from the request) or the peer IP (hashed as its
+/// canonical octets, not a string). The fast path builds this from a group's [`HashKeySource`].
+/// `Copy` so it can be passed to the initial `pick` and each retry's `pick_excluding` unchanged.
+#[derive(Debug, Clone, Copy)]
+pub enum HashInput<'a> {
+    Bytes(&'a [u8]),
+    Ip(IpAddr),
+}
+
+impl HashInput<'_> {
+    /// The stable 64-bit hash of this key, fed to the Maglev table lookup.
+    fn hash(&self) -> u64 {
+        match self {
+            HashInput::Bytes(b) => crate::hash::hash64(b),
+            HashInput::Ip(IpAddr::V4(a)) => crate::hash::hash64(&a.octets()),
+            HashInput::Ip(IpAddr::V6(a)) => crate::hash::hash64(&a.octets()),
+        }
+    }
+}
+
+/// The compiled per-instance load-balancing state of a group (ADR 000035). `Maglev` carries its
+/// precomputed lookup table; the other two need no extra state (round-robin uses the group's `rr`
+/// cursor, least-request reads the per-instance `in_flight`).
+#[derive(Debug)]
+enum LbState {
+    RoundRobin,
+    LeastRequest,
+    Maglev(MaglevTable),
+}
+
+/// A chosen instance plus a guard tracking its load (ADR 000035). For `least_request` the guard
+/// holds the selected instance's incremented active-request count and decrements it on drop — on
+/// EVERY forward return path (success, retry, transport error) and on each retry hand-off, because
+/// replacing the `Pick` drops the previous guard. For round-robin / maglev the guard is a no-op.
+/// `Deref`s to the instance so callers read `address()` / `is_healthy()` directly.
+pub struct Pick {
+    instance: Arc<UpstreamInstance>,
+    _load: InstanceLoad,
+}
+
+impl Pick {
+    /// The chosen instance (for `pick_excluding` / `record_outcome` / passive-failure book-keeping).
+    pub fn instance(&self) -> &Arc<UpstreamInstance> {
+        &self.instance
+    }
+}
+
+impl std::ops::Deref for Pick {
+    type Target = UpstreamInstance;
+    fn deref(&self) -> &UpstreamInstance {
+        &self.instance
+    }
+}
+
+/// RAII guard decrementing an instance's active-request count on drop (ADR 000035). `None` for
+/// algorithms that do not track per-instance load (round-robin / maglev): a zero-cost no-op, so the
+/// default RR hot path gains no atomic.
+pub struct InstanceLoad {
+    instance: Option<Arc<UpstreamInstance>>,
+}
+
+impl Drop for InstanceLoad {
+    fn drop(&mut self) {
+        if let Some(inst) = &self.instance {
+            inst.in_flight.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
 }
 
 /// A held slot in an upstream's circuit-breaker cap (ADR 000028). Decrements the group's in-flight
@@ -220,43 +345,77 @@ impl Drop for RequestPermit {
 }
 
 impl UpstreamGroup {
-    /// Pick the next healthy instance by round-robin, or `None` when every instance is unhealthy
-    /// (the fast path then fails closed with 503 — ADR 000017).
-    pub fn pick(&self) -> Option<Arc<UpstreamInstance>> {
-        self.pick_inner(None)
+    /// Pick an instance per the upstream's LB algorithm (ADR 000035), or `None` when nothing is
+    /// eligible (the fast path then fails closed 503 — ADR 000017). `key` is the request's hash key
+    /// for `maglev`; round-robin / least-request ignore it, and `None` (no key) falls back to
+    /// round-robin.
+    pub fn pick(&self, key: Option<HashInput>) -> Option<Pick> {
+        self.pick_dispatch(None, key)
     }
 
-    /// Pick the next healthy instance OTHER than `exclude` (round-robin), or `None` when `exclude`
-    /// is the only healthy one. Used to retry a failed forward on a different instance (ADR 000023).
-    pub fn pick_excluding(&self, exclude: &Arc<UpstreamInstance>) -> Option<Arc<UpstreamInstance>> {
-        self.pick_inner(Some(exclude))
+    /// Pick an instance OTHER than `exclude`, to retry a failed forward on a different instance (ADR
+    /// 000023). Same algorithm dispatch as `pick`; for `maglev` the affinity target is excluded, so
+    /// it falls back to round-robin over the remaining eligible set.
+    pub fn pick_excluding(
+        &self,
+        exclude: &Arc<UpstreamInstance>,
+        key: Option<HashInput>,
+    ) -> Option<Pick> {
+        self.pick_dispatch(Some(exclude), key)
     }
 
-    /// Round-robin over the *eligible set* — the instances that are healthy and, for a retry, not
-    /// `exclude`. The cursor advances over only that set, so an ejected (or excluded) instance's
-    /// slot is never absorbed by its neighbour: degraded distribution stays even instead of skewing
-    /// ~1:2 toward each dead instance's successor, which the old forward-scan produced (ADR 000024,
-    /// refining ADR 000017). Returns `None` only when nothing is eligible (the fast path then fails
-    /// closed — ADR 000017).
-    ///
-    /// Two allocation-free passes — count the eligible, then index into them — so the hot path still
-    /// only reads the lock-free `is_healthy` bit and never allocates. If an instance flips between
-    /// the passes we return the last eligible one seen rather than spuriously `None`.
-    fn pick_inner(&self, exclude: Option<&Arc<UpstreamInstance>>) -> Option<Arc<UpstreamInstance>> {
-        // Outlier detection (ADR 000032) gates `pick` on a time-based ejection window, a separate axis
-        // from the health bit. Read the clock once, and only when the policy is enabled, so a disabled
-        // policy keeps the pre-000032 cost (a single lock-free `is_healthy` read).
+    fn pick_dispatch(
+        &self,
+        exclude: Option<&Arc<UpstreamInstance>>,
+        key: Option<HashInput>,
+    ) -> Option<Pick> {
+        match &self.lb {
+            LbState::RoundRobin => self.round_robin_pick(exclude),
+            LbState::LeastRequest => self.least_request_pick(exclude),
+            LbState::Maglev(table) => self.maglev_pick(table, exclude, key),
+        }
+    }
+
+    /// The hash-key source for a `maglev` upstream (ADR 000035), or `None` for the other algorithms.
+    /// The fast path reads this to project a [`HashInput`] from the request.
+    pub fn hash_key_source(&self) -> Option<&HashKeySource> {
+        self.hash_key.as_ref()
+    }
+
+    /// The clock context for eligibility: whether outlier detection is on and, if so, `now` in ms.
+    /// Read once per pick, and the clock only when the policy is enabled, so a disabled policy keeps
+    /// the pre-000032 cost (a single lock-free `is_healthy` read).
+    fn eligibility_ctx(&self) -> (bool, u64) {
         let check_outlier = self.outlier_enabled();
         let now_ms = if check_outlier { now_millis() } else { 0 };
-        let is_eligible = |inst: &Arc<UpstreamInstance>| {
-            inst.is_healthy()
-                && (!check_outlier || !inst.is_outlier_ejected(now_ms))
-                && match exclude {
-                    Some(ex) => !Arc::ptr_eq(inst, ex),
-                    None => true,
-                }
-        };
-        let eligible = self.instances.iter().filter(|&i| is_eligible(i)).count();
+        (check_outlier, now_ms)
+    }
+
+    /// Whether `inst` may serve this request: healthy, not outlier-ejected, and not the retry
+    /// `exclude`.
+    fn is_eligible(
+        &self,
+        inst: &Arc<UpstreamInstance>,
+        exclude: Option<&Arc<UpstreamInstance>>,
+        (check_outlier, now_ms): (bool, u64),
+    ) -> bool {
+        inst.is_healthy()
+            && (!check_outlier || !inst.is_outlier_ejected(now_ms))
+            && exclude.is_none_or(|ex| !Arc::ptr_eq(inst, ex))
+    }
+
+    /// Round-robin over the *eligible set* (ADR 000024): count the eligible, advance the cursor mod
+    /// that count, index into them. An ejected/excluded instance's slot is never absorbed by its
+    /// neighbour (degraded distribution stays even instead of skewing ~1:2). Two allocation-free
+    /// passes; if an instance flips between them we return the last eligible seen rather than a
+    /// spurious `None`. No per-instance load is metered — round-robin is the zero-overhead default.
+    fn round_robin_pick(&self, exclude: Option<&Arc<UpstreamInstance>>) -> Option<Pick> {
+        let ctx = self.eligibility_ctx();
+        let eligible = self
+            .instances
+            .iter()
+            .filter(|i| self.is_eligible(i, exclude, ctx))
+            .count();
         if eligible == 0 {
             return None;
         }
@@ -264,24 +423,110 @@ impl UpstreamGroup {
         let mut seen = 0;
         let mut last = None;
         for inst in &self.instances {
-            if is_eligible(inst) {
+            if self.is_eligible(inst, exclude, ctx) {
                 last = Some(inst);
                 if seen == target {
-                    return Some(inst.clone());
+                    return Some(self.unmetered_pick(inst.clone()));
                 }
                 seen += 1;
             }
         }
-        last.cloned()
+        last.cloned().map(|i| self.unmetered_pick(i))
+    }
+
+    /// Weighted least-request via power-of-two-choices (ADR 000035): sample two distinct eligible
+    /// instances and forward to the one with the smaller `(in_flight + 1) / weight` (compared by
+    /// integer cross-product, no float; `+1` lets weight bias even idle instances). Two passes over
+    /// the small instance list. The selected instance's load is metered (incremented now, decremented
+    /// when the returned `Pick` drops — across the retry hand-off too).
+    fn least_request_pick(&self, exclude: Option<&Arc<UpstreamInstance>>) -> Option<Pick> {
+        let ctx = self.eligibility_ctx();
+        let n = self
+            .instances
+            .iter()
+            .filter(|i| self.is_eligible(i, exclude, ctx))
+            .count();
+        if n == 0 {
+            return None;
+        }
+        if n == 1 {
+            let only = self
+                .instances
+                .iter()
+                .find(|i| self.is_eligible(i, exclude, ctx))?;
+            return Some(self.metered_pick(only.clone()));
+        }
+        let (a, b) = rng::two_distinct_below(n as u32);
+        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+        // One pass capturing the lo-th and hi-th eligible instances by ordinal.
+        let mut cand_lo = None;
+        let mut cand_hi = None;
+        let mut seen = 0u32;
+        for inst in &self.instances {
+            if self.is_eligible(inst, exclude, ctx) {
+                if seen == lo {
+                    cand_lo = Some(inst);
+                }
+                if seen == hi {
+                    cand_hi = Some(inst);
+                }
+                seen += 1;
+            }
+        }
+        let (x, y) = (cand_lo?, cand_hi?);
+        let chosen = if lower_load(x, y) { x } else { y };
+        Some(self.metered_pick(chosen.clone()))
+    }
+
+    /// Consistent hashing via the Maglev table (ADR 000035): map the request key to a stable instance
+    /// for affinity. When the primary is ineligible (unhealthy / outlier-ejected / the retry
+    /// `exclude`) or there is no key, fall back to the eligible-set round-robin (best-effort affinity,
+    /// fail-soft). No per-instance load is metered (selection is by hash, not load).
+    fn maglev_pick(
+        &self,
+        table: &MaglevTable,
+        exclude: Option<&Arc<UpstreamInstance>>,
+        key: Option<HashInput>,
+    ) -> Option<Pick> {
+        if let Some(k) = key {
+            let ctx = self.eligibility_ctx();
+            if let Some(idx) = table.lookup(k.hash())
+                && let Some(inst) = self.instances.get(idx)
+                && self.is_eligible(inst, exclude, ctx)
+            {
+                return Some(self.unmetered_pick(inst.clone()));
+            }
+        }
+        // No key, or the affinity target can't serve → fall back to round-robin over the eligible set.
+        self.round_robin_pick(exclude)
+    }
+
+    /// Wrap an instance in a `Pick` with NO load metering (round-robin / maglev).
+    fn unmetered_pick(&self, instance: Arc<UpstreamInstance>) -> Pick {
+        Pick {
+            instance,
+            _load: InstanceLoad { instance: None },
+        }
+    }
+
+    /// Wrap an instance in a `Pick` that meters its load (least-request): increment its active-request
+    /// count now and hand back a guard that decrements it on drop.
+    fn metered_pick(&self, instance: Arc<UpstreamInstance>) -> Pick {
+        instance.in_flight.fetch_add(1, Ordering::Relaxed);
+        Pick {
+            instance: instance.clone(),
+            _load: InstanceLoad {
+                instance: Some(instance),
+            },
+        }
     }
 
     /// Whether this upstream has at least one eligible instance (healthy and not outlier-ejected).
     /// A cursor-free, allocation-free probe the weighted traffic split (ADR 000034) uses to skip a
-    /// backend whose group can serve nothing (renormalize over healthy). Same eligibility as
-    /// `pick_inner` minus the retry `exclude`; a `false` here means a `pick` would return `None`.
+    /// backend whose group can serve nothing (renormalize over healthy). Same eligibility as the
+    /// pick path minus the retry `exclude`; a `false` here means a `pick` would return `None`.
     pub fn has_eligible(&self) -> bool {
-        let check_outlier = self.outlier_enabled();
-        let now_ms = if check_outlier { now_millis() } else { 0 };
+        let (check_outlier, now_ms) = self.eligibility_ctx();
         self.instances
             .iter()
             .any(|inst| inst.is_healthy() && (!check_outlier || !inst.is_outlier_ejected(now_ms)))
@@ -404,11 +649,12 @@ impl UpstreamRegistry {
     }
 
     /// Reconcile the registry to `upstreams` (ADR 000017). Validation (duplicate name, empty
-    /// addresses) runs FIRST against the whole list, so a bad manifest leaves the running set
-    /// untouched (all-or-nothing, like the rest of a reload). Then, per upstream: build a new group
-    /// whose instances reuse the existing `Arc<UpstreamInstance>` for any unchanged `(name,
-    /// address)` *when the health policy is unchanged* (preserving health), create a fresh
-    /// pessimistic instance otherwise, and drop upstreams no longer present.
+    /// addresses, and the LB config — ADR 000035) runs FIRST against the whole list, so a bad
+    /// manifest leaves the running set untouched (all-or-nothing, like the rest of a reload). Then,
+    /// per upstream: build a new group whose instances reuse the existing `Arc<UpstreamInstance>` for
+    /// any unchanged `(name, address, weight)` *when the health policy is unchanged* (preserving
+    /// health), create a fresh pessimistic instance otherwise, build the LB state (a Maglev upstream
+    /// recomputes its table from the instance set), and drop upstreams no longer present.
     pub fn reconcile(&self, upstreams: &[Upstream]) -> Result<(), ControlError> {
         let mut seen = HashSet::new();
         for up in upstreams {
@@ -418,6 +664,11 @@ impl UpstreamRegistry {
             if !seen.insert(up.name.as_str()) {
                 return Err(ControlError::DuplicateUpstream(up.name.clone()));
             }
+            up.validate_lb()
+                .map_err(|reason| ControlError::InvalidUpstreamLb {
+                    name: up.name.clone(),
+                    reason,
+                })?;
         }
 
         let mut groups = self
@@ -430,20 +681,50 @@ impl UpstreamRegistry {
             // reuse the prior group's instances only if the health policy is identical; a policy
             // change re-probes the upstream from pessimistic (so new thresholds actually apply).
             let prev = prev_any.filter(|g| g.health == up.health);
-            let instances = up
+            let instances: Vec<Arc<UpstreamInstance>> = up
                 .addresses
                 .iter()
-                .map(|addr| {
-                    prev.and_then(|g| g.instances.iter().find(|i| i.address() == addr).cloned())
-                        .unwrap_or_else(|| {
-                            Arc::new(UpstreamInstance::new(addr.clone(), &up.health))
-                        })
+                .map(|spec| {
+                    let addr = spec.address();
+                    let weight = spec.weight();
+                    // reuse only when address AND weight are unchanged; a weight edit (LB capacity)
+                    // builds a fresh instance, like a health-policy change.
+                    prev.and_then(|g| {
+                        g.instances
+                            .iter()
+                            .find(|i| i.address() == addr && i.weight() == weight)
+                            .cloned()
+                    })
+                    .unwrap_or_else(|| {
+                        Arc::new(UpstreamInstance::new(addr.to_string(), weight, &up.health))
+                    })
                 })
                 .collect();
             // carry the round-robin cursor across the reload (independent of which instances or the
             // health policy changed — it is only a rotation counter) so the first post-reload pick
             // continues the rotation instead of restarting at the eligible set's head (ADR 000024).
             let rr = prev_any.map(|g| g.rr.load(Ordering::Relaxed)).unwrap_or(0);
+            // Build the LB state from the manifest (ADR 000035). Maglev recomputes its lookup table
+            // from the instance set + weights; validation above guaranteed a hash block and a valid
+            // (prime, in-range) table size.
+            let lb = match up.lb_algorithm {
+                LbAlgorithm::RoundRobin => LbState::RoundRobin,
+                LbAlgorithm::LeastRequest => LbState::LeastRequest,
+                LbAlgorithm::Maglev => {
+                    let entries: Vec<(&str, u32)> = instances
+                        .iter()
+                        .map(|i| (i.address(), i.weight()))
+                        .collect();
+                    let m = up.hash.as_ref().map(|h| h.table_size).unwrap_or(65537) as usize;
+                    LbState::Maglev(MaglevTable::build(&entries, m))
+                }
+            };
+            let hash_key = up.hash.as_ref().map(|h| match h.key {
+                HashKeyKind::Header => {
+                    HashKeySource::Header(h.header.clone().unwrap_or_default().to_ascii_lowercase())
+                }
+                HashKeyKind::SourceIp => HashKeySource::SourceIp,
+            });
             next.insert(
                 up.name.clone(),
                 Arc::new(UpstreamGroup {
@@ -461,6 +742,8 @@ impl UpstreamRegistry {
                         up.outlier_detection.base_ejection_time_ms,
                     ),
                     outlier_max_ejection_percent: up.outlier_detection.max_ejection_percent,
+                    lb,
+                    hash_key,
                 }),
             );
         }
@@ -485,7 +768,9 @@ impl UpstreamRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::{CircuitBreaker, HealthConfig, OutlierDetection};
+    use crate::manifest::{
+        AddressSpec, CircuitBreaker, HashConfig, HashKeyKind, HealthConfig, OutlierDetection,
+    };
 
     fn health(healthy_threshold: u32, unhealthy_threshold: u32) -> HealthConfig {
         HealthConfig {
@@ -500,7 +785,12 @@ mod tests {
     fn upstream(name: &str, addrs: &[&str], h: HealthConfig) -> Upstream {
         Upstream {
             name: name.to_string(),
-            addresses: addrs.iter().map(|s| s.to_string()).collect(),
+            addresses: addrs
+                .iter()
+                .map(|s| AddressSpec::Bare(s.to_string()))
+                .collect(),
+            lb_algorithm: LbAlgorithm::RoundRobin,
+            hash: None,
             health: h,
             request_timeout_ms: 30_000,
             max_retries: 1,
@@ -511,7 +801,12 @@ mod tests {
     }
 
     fn instance(h: &HealthConfig) -> UpstreamInstance {
-        UpstreamInstance::new("127.0.0.1:9000".to_string(), h)
+        UpstreamInstance::new("127.0.0.1:9000".to_string(), 1, h)
+    }
+
+    /// Resolve a `Pick`'s address (the common assertion after the `Pick` return type, ADR 000035).
+    fn addr_of(p: &Pick) -> String {
+        p.address().to_string()
     }
 
     #[test]
@@ -585,10 +880,10 @@ mod tests {
 
         let a = group.instances[0].clone();
         let other = group
-            .pick_excluding(&a)
+            .pick_excluding(&a, None)
             .expect("a different healthy instance exists");
         assert!(
-            Arc::ptr_eq(&other, &group.instances[1]),
+            Arc::ptr_eq(other.instance(), &group.instances[1]),
             "pick_excluding skips the excluded instance"
         );
 
@@ -598,7 +893,7 @@ mod tests {
         }
         assert!(!group.instances[1].is_healthy(), "instance[1] is ejected");
         assert!(
-            group.pick_excluding(&a).is_none(),
+            group.pick_excluding(&a, None).is_none(),
             "the only healthy instance can't be retried around"
         );
     }
@@ -626,7 +921,7 @@ mod tests {
         let g = reg.group("u").unwrap();
 
         assert!(
-            g.pick().is_none(),
+            g.pick(None).is_none(),
             "all pessimistic → no pick (fail-closed)"
         );
 
@@ -636,7 +931,7 @@ mod tests {
 
         let mut seen = HashSet::new();
         for _ in 0..6 {
-            seen.insert(g.pick().unwrap().address().to_string());
+            seen.insert(g.pick(None).unwrap().address().to_string());
         }
         assert_eq!(
             seen,
@@ -745,7 +1040,7 @@ mod tests {
         let mut a = 0u32;
         let mut c = 0u32;
         for _ in 0..600 {
-            match g.pick().unwrap().address() {
+            match g.pick(None).unwrap().address() {
                 "a:1" => a += 1,
                 "c:3" => c += 1,
                 other => panic!("picked a down/unknown instance: {other}"),
@@ -769,8 +1064,8 @@ mod tests {
             g0.instances[i].record_probe_success(); // all three healthy
         }
         // advance the cursor two steps: a:1, b:2 (cursor now at 2)
-        assert_eq!(g0.pick().unwrap().address(), "a:1");
-        assert_eq!(g0.pick().unwrap().address(), "b:2");
+        assert_eq!(g0.pick(None).unwrap().address(), "a:1");
+        assert_eq!(g0.pick(None).unwrap().address(), "b:2");
 
         // reload with the SAME upstream + health policy → instances and health are preserved
         reg.reconcile(&[upstream("u", &["a:1", "b:2", "c:3"], health(1, 3))])
@@ -781,7 +1076,7 @@ mod tests {
             "health survives an unchanged-policy reload (ADR 000017)"
         );
         assert_eq!(
-            g1.pick().unwrap().address(),
+            g1.pick(None).unwrap().address(),
             "c:3",
             "the cursor carried across reload (would be a:1 if reset to 0)"
         );
@@ -794,7 +1089,9 @@ mod tests {
         let reg = UpstreamRegistry::new();
         reg.reconcile(&[Upstream {
             name: "u".to_string(),
-            addresses: vec!["a:1".to_string()],
+            addresses: vec![AddressSpec::Bare("a:1".to_string())],
+            lb_algorithm: LbAlgorithm::RoundRobin,
+            hash: None,
             health: health(1, 1),
             request_timeout_ms: 30_000,
             max_retries: 0,
@@ -844,7 +1141,12 @@ mod tests {
         let reg = UpstreamRegistry::new();
         reg.reconcile(&[Upstream {
             name: "u".to_string(),
-            addresses: addrs.iter().map(|s| s.to_string()).collect(),
+            addresses: addrs
+                .iter()
+                .map(|s| AddressSpec::Bare(s.to_string()))
+                .collect(),
+            lb_algorithm: LbAlgorithm::RoundRobin,
+            hash: None,
             health: health(1, 1),
             request_timeout_ms: 30_000,
             max_retries: 0,
@@ -940,10 +1242,213 @@ mod tests {
         assert!(g.record_outcome(&a, true), "eject a");
         for _ in 0..6 {
             assert_eq!(
-                g.pick().unwrap().address(),
+                g.pick(None).unwrap().address(),
                 "b:2",
                 "round-robin skips the outlier-ejected (but still healthy) instance"
             );
         }
+    }
+
+    // ----- ADR 000035: weighted least-request (P2C) and weighted maglev -----
+
+    /// A healthy upstream group with the given instances and LB config (ADR 000035).
+    fn lb_group(
+        addresses: Vec<AddressSpec>,
+        algo: LbAlgorithm,
+        hash: Option<HashConfig>,
+    ) -> Arc<UpstreamGroup> {
+        let reg = UpstreamRegistry::new();
+        reg.reconcile(&[Upstream {
+            name: "u".to_string(),
+            addresses,
+            lb_algorithm: algo,
+            hash,
+            health: health(1, 1),
+            request_timeout_ms: 30_000,
+            max_retries: 0,
+            overall_timeout_ms: 0,
+            circuit_breaker: CircuitBreaker::default(),
+            outlier_detection: OutlierDetection::default(),
+        }])
+        .unwrap();
+        let g = reg.group("u").unwrap();
+        for inst in &g.instances {
+            inst.record_probe_success(); // cold-start: all healthy
+        }
+        g
+    }
+
+    fn bare(addrs: &[&str]) -> Vec<AddressSpec> {
+        addrs
+            .iter()
+            .map(|s| AddressSpec::Bare(s.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn least_request_avoids_the_busier_instance() {
+        // With two instances, P2C compares both, so it deterministically routes to the one with the
+        // lower (in_flight + 1) / weight. Holding a pick inflates its in-flight; the next pick must
+        // then avoid it.
+        let g = lb_group(bare(&["a:1", "b:2"]), LbAlgorithm::LeastRequest, None);
+        let p1 = g.pick(None).unwrap();
+        let busy = addr_of(&p1);
+        let p2 = g.pick(None).unwrap();
+        assert_ne!(
+            addr_of(&p2),
+            busy,
+            "least-request must avoid the instance already carrying a request"
+        );
+    }
+
+    #[test]
+    fn least_request_weight_biases_toward_higher_capacity() {
+        // Both idle, so (0+1)/weight decides: the weight-3 instance (ratio 1/3) beats the weight-1
+        // (ratio 1/1). With two instances P2C compares both, so the idle pick is deterministic.
+        let g = lb_group(
+            vec![
+                AddressSpec::Bare("small".to_string()),
+                AddressSpec::Weighted(crate::manifest::WeightedAddress {
+                    address: "big".to_string(),
+                    weight: 3,
+                }),
+            ],
+            LbAlgorithm::LeastRequest,
+            None,
+        );
+        assert_eq!(
+            addr_of(&g.pick(None).unwrap()),
+            "big",
+            "a higher-weight idle instance is preferred"
+        );
+    }
+
+    #[test]
+    fn least_request_meters_in_flight_and_releases_on_drop() {
+        let g = lb_group(bare(&["a:1", "b:2"]), LbAlgorithm::LeastRequest, None);
+        let total =
+            |g: &UpstreamGroup| -> usize { g.instances.iter().map(|i| i.in_flight()).sum() };
+        assert_eq!(total(&g), 0);
+        {
+            let _p = g.pick(None).unwrap();
+            assert_eq!(total(&g), 1, "one in-flight while the Pick is held");
+            let _q = g.pick(None).unwrap();
+            assert_eq!(total(&g), 2, "two in-flight while both Picks are held");
+        }
+        assert_eq!(
+            total(&g),
+            0,
+            "active-request counts released when the Picks drop"
+        );
+    }
+
+    #[test]
+    fn least_request_fails_closed_when_all_unhealthy() {
+        let g = lb_group(bare(&["a:1", "b:2"]), LbAlgorithm::LeastRequest, None);
+        for inst in &g.instances {
+            inst.record_probe_failure(); // unhealthy_threshold = 1 → ejected
+        }
+        assert!(g.pick(None).is_none(), "no eligible instance → None → 503");
+    }
+
+    fn header_hash(m: u32) -> Option<HashConfig> {
+        Some(HashConfig {
+            key: HashKeyKind::Header,
+            header: Some("x-user".to_string()),
+            table_size: m,
+        })
+    }
+
+    #[test]
+    fn maglev_pins_a_key_to_one_instance() {
+        let g = lb_group(
+            bare(&["a:1", "b:2", "c:3"]),
+            LbAlgorithm::Maglev,
+            header_hash(97),
+        );
+        let key = HashInput::Bytes(b"session-42");
+        let pinned = addr_of(&g.pick(Some(key)).unwrap());
+        for _ in 0..30 {
+            assert_eq!(
+                addr_of(&g.pick(Some(key)).unwrap()),
+                pinned,
+                "the same key always resolves to the same instance (affinity)"
+            );
+        }
+    }
+
+    #[test]
+    fn maglev_spreads_distinct_keys() {
+        let g = lb_group(
+            bare(&["a:1", "b:2", "c:3"]),
+            LbAlgorithm::Maglev,
+            header_hash(97),
+        );
+        let mut seen = HashSet::new();
+        for i in 0..300 {
+            let key = format!("user-{i}");
+            seen.insert(addr_of(
+                &g.pick(Some(HashInput::Bytes(key.as_bytes()))).unwrap(),
+            ));
+        }
+        assert_eq!(seen.len(), 3, "distinct keys reach every instance");
+    }
+
+    #[test]
+    fn maglev_falls_back_to_round_robin_without_a_key() {
+        // No key (e.g. the configured header is absent) → round-robin over the eligible set, never None
+        // while one is up.
+        let g = lb_group(bare(&["a:1", "b:2"]), LbAlgorithm::Maglev, header_hash(97));
+        let mut seen = HashSet::new();
+        for _ in 0..10 {
+            seen.insert(addr_of(&g.pick(None).unwrap()));
+        }
+        assert_eq!(
+            seen.len(),
+            2,
+            "keyless maglev round-robins across instances"
+        );
+    }
+
+    #[test]
+    fn maglev_falls_back_when_the_primary_is_unhealthy() {
+        let g = lb_group(
+            bare(&["a:1", "b:2", "c:3"]),
+            LbAlgorithm::Maglev,
+            header_hash(97),
+        );
+        let key = HashInput::Bytes(b"sticky-key");
+        let primary = addr_of(&g.pick(Some(key)).unwrap());
+        // eject the affinity target (unhealthy_threshold = 1).
+        g.instances
+            .iter()
+            .find(|i| i.address() == primary)
+            .unwrap()
+            .record_probe_failure();
+        let alt = g.pick(Some(key)).unwrap();
+        assert_ne!(
+            addr_of(&alt),
+            primary,
+            "a down primary falls back to another healthy instance"
+        );
+        assert!(alt.is_healthy());
+    }
+
+    #[test]
+    fn maglev_excludes_on_retry() {
+        // A retry must land elsewhere even for the affinity target (ADR 000023 semantics preserved).
+        let g = lb_group(
+            bare(&["a:1", "b:2", "c:3"]),
+            LbAlgorithm::Maglev,
+            header_hash(97),
+        );
+        let key = HashInput::Bytes(b"retry-key");
+        let first = g.pick(Some(key)).unwrap();
+        let retried = g.pick_excluding(first.instance(), Some(key)).unwrap();
+        assert_ne!(
+            addr_of(&retried),
+            addr_of(&first),
+            "retry skips the just-tried instance"
+        );
     }
 }

@@ -312,7 +312,9 @@ pub(crate) fn rewrite_path(path: &str, strip: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::{CircuitBreaker, HealthConfig, OutlierDetection, Upstream};
+    use crate::manifest::{
+        AddressSpec, CircuitBreaker, HealthConfig, LbAlgorithm, OutlierDetection, Upstream,
+    };
     use crate::upstream::UpstreamRegistry;
 
     /// A throwaway upstream group named after `upstream` — these tests exercise `select` /
@@ -321,7 +323,9 @@ mod tests {
         let reg = UpstreamRegistry::new();
         reg.reconcile(&[Upstream {
             name: upstream.to_string(),
-            addresses: vec!["127.0.0.1:9000".to_string()],
+            addresses: vec![AddressSpec::Bare("127.0.0.1:9000".to_string())],
+            lb_algorithm: LbAlgorithm::RoundRobin,
+            hash: None,
             health: HealthConfig {
                 path: "/healthz".to_string(),
                 interval_ms: 1000,
