@@ -90,6 +90,9 @@ impl WeightedBackends {
     /// eligible instance, skipping forward past any with none (renormalize over healthy). `None`
     /// when no backend is eligible (the fast path then fails closed 503). Lock-free: one atomic
     /// `fetch_add` plus a read-only table scan and the lock-free `has_eligible` probe.
+    // INVARIANT: every entry in `table` is an index into `groups` (both built together in `new`
+    // from the same reduced-weight list), so `backend < self.groups.len()` always — checked below.
+    #[allow(clippy::indexing_slicing)]
     pub(crate) fn pick(&self) -> Option<Arc<UpstreamGroup>> {
         // Fast-out of a full outage: if nothing is eligible, fail closed without scanning the
         // (possibly large) table. O(backends) — backends are few.
@@ -107,6 +110,7 @@ impl WeightedBackends {
         // exists, so this terminates with `Some`. Bounded by `len` regardless (data-plane no-panic).
         for off in 0..len {
             let backend = self.table[(start + off) % len] as usize;
+            debug_assert!(backend < self.groups.len());
             if self.groups[backend].has_eligible() {
                 return Some(self.groups[backend].clone());
             }
@@ -159,9 +163,13 @@ fn gcd(a: u32, b: u32) -> u32 {
 /// The result is the evenly-interleaved sequence with `< 1` deviation from each backend's ideal
 /// count, and it returns to the zero state after one period — so this one period is the exact,
 /// repeating schedule. `weights` is non-empty with a positive sum (validated upstream).
+// INVARIANT: `deficit` is built with the same length as `weights` just below, and `best` is only
+// ever set to an `i < weights.len()` from the loop right above it — so every index is in bounds.
+#[allow(clippy::indexing_slicing)]
 fn weighted_schedule(weights: &[u32]) -> Box<[u16]> {
     let total: i64 = weights.iter().map(|&w| w as i64).sum();
     let mut deficit = vec![0i64; weights.len()];
+    debug_assert_eq!(deficit.len(), weights.len());
     let mut schedule: Vec<u16> = Vec::with_capacity(total as usize);
     for _ in 0..total {
         let mut best = 0usize;

@@ -5,14 +5,17 @@
 //! dispatch, not the match). Matching is allocation-free: the compiled dimensions are pre-normalised
 //! at build, and per request we only scan and compare borrowed slices.
 
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::Arc;
 
-use plecto_host::Header;
+use plecto_host::{Header, LoadedFilter};
 
+use crate::error::ControlError;
+use crate::manifest::Route;
 use crate::ratelimit::{NativeRateLimit, RateLimitDecision};
 use crate::upstream::UpstreamGroup;
-use crate::weighted::WeightedBackends;
+use crate::weighted::{self, WeightedBackends};
 
 /// A route compiled from a manifest [`crate::Route`] into the live config: the match dimensions are
 /// pre-normalised (host + header names lower-cased, method upper-cased), and the forwarding target —
@@ -48,6 +51,79 @@ pub(crate) struct CompiledRoute {
     /// (`Arc`) so every request on the route consults the same token buckets within a config
     /// generation; a reload builds a fresh limiter (the node-local buckets reset).
     pub(crate) rate_limit: Option<Arc<NativeRateLimit>>,
+}
+
+/// A manifest route validated against the (already-loaded) filter set and upstream names, carrying
+/// its already-resolved forwarding targets — so `build_active`'s later compile pass does not need
+/// to call `targets()` a second time.
+#[derive(Debug)]
+pub(crate) struct ValidatedRoute<'a> {
+    pub(crate) route: &'a Route,
+    pub(crate) targets: Vec<(&'a str, u32)>,
+}
+
+/// Validate every route's forwarding target (`upstream`/`backends`), weighted split, filter
+/// references, and native rate-limit config — PURELY, against the already-loaded filter set and
+/// upstream names, with no I/O and no registry mutation (ADR 000013 / 000017 / 000033 / 000034).
+/// Fails closed on the first invalid route, mirroring the checks `build_active` used to run
+/// inline. Directly unit-testable with hand-built `filters` / `upstream_names` — no `Host` or OCI
+/// artifact store needed.
+pub(crate) fn validate_routes<'a>(
+    routes: &'a [Route],
+    filters: &HashMap<String, Arc<LoadedFilter>>,
+    upstream_names: &HashSet<&str>,
+) -> Result<Vec<ValidatedRoute<'a>>, ControlError> {
+    let mut validated = Vec::with_capacity(routes.len());
+    for r in routes {
+        // The route's forwarding targets: the single `upstream` shorthand or weighted `backends`
+        // (ADR 000034). Both-set / neither-set is fail-closed here.
+        let targets = r.targets().map_err(|reason| ControlError::InvalidRoute {
+            path_prefix: r.matcher.path_prefix.clone(),
+            reason: reason.to_string(),
+        })?;
+        for (name, _) in &targets {
+            if !upstream_names.contains(name) {
+                return Err(ControlError::UnknownRouteUpstream {
+                    path_prefix: r.matcher.path_prefix.clone(),
+                    upstream: (*name).to_string(),
+                });
+            }
+        }
+        // Validate the weighted split (empty / all-zero / over-cap weight / oversized reduced
+        // table) before the registry reconcile, so a bad split never mutates persistent state.
+        let weights: Vec<u32> = targets.iter().map(|(_, w)| *w).collect();
+        weighted::validate_split(&weights).map_err(|reason| ControlError::InvalidRoute {
+            path_prefix: r.matcher.path_prefix.clone(),
+            reason,
+        })?;
+        for f in &r.filters {
+            if !filters.contains_key(f) {
+                return Err(ControlError::UnknownRouteFilter {
+                    path_prefix: r.matcher.path_prefix.clone(),
+                    filter: f.clone(),
+                });
+            }
+        }
+        // Reject a native rate limit that can never serve a token (ADR 000033): a zero `rate`
+        // never refills and a zero `burst` holds nothing — a config typo, fail-closed at build
+        // before the limiter arithmetic ever runs (CWE-20).
+        if let Some(rl) = &r.rate_limit {
+            if rl.rate == 0 {
+                return Err(ControlError::InvalidRouteRateLimit {
+                    path_prefix: r.matcher.path_prefix.clone(),
+                    reason: "rate must be non-zero".to_string(),
+                });
+            }
+            if rl.burst == 0 {
+                return Err(ControlError::InvalidRouteRateLimit {
+                    path_prefix: r.matcher.path_prefix.clone(),
+                    reason: "burst must be non-zero".to_string(),
+                });
+            }
+        }
+        validated.push(ValidatedRoute { route: r, targets });
+    }
+    Ok(validated)
 }
 
 /// The request attributes route matching reads (ADR 000034), borrowed so matching stays
@@ -186,6 +262,8 @@ pub fn normalize_path(target: &str) -> Option<String> {
 }
 
 /// Does the path contain a percent-encoded separator or dot (`%2e`/`%2f`/`%5c`, any hex case)?
+// `.windows(3)` guarantees each `w` has exactly 3 elements, so w[0..=2] are always in bounds.
+#[allow(clippy::indexing_slicing)]
 fn contains_encoded_separator(path: &str) -> bool {
     path.as_bytes().windows(3).any(|w| {
         w[0] == b'%'
@@ -274,7 +352,7 @@ fn query_param_matches(query: &str, name: &str, value: &str) -> bool {
 /// `path_prefix` > `method` present > more header matches > more query matches, with the earliest
 /// manifest index the final stable tie-break (Gateway-API v1.5.0 precedence, adapted). Returns the
 /// winner's index, or `None` (no route → the server responds 404).
-pub(crate) fn select(routes: &[CompiledRoute], req: &RequestParts) -> Option<usize> {
+pub(crate) fn select(routes: &[CompiledRoute], req: &RequestParts<'_>) -> Option<usize> {
     let host = normalize_host(req.authority);
     let query = req.path.split_once('?').map(|(_, q)| q).unwrap_or("");
     routes
@@ -385,6 +463,119 @@ mod tests {
             method: "GET",
             headers: &[],
         }
+    }
+
+    /// A manifest [`Route`] fixture for `validate_routes` tests — no `Host` / OCI artifact store
+    /// needed, since `validate_routes` never touches the loaded filters' contents, only their ids.
+    fn manifest_route(
+        upstream: Option<&str>,
+        backends: Vec<crate::manifest::Backend>,
+        filters: Vec<&str>,
+        rate_limit: Option<crate::manifest::RouteRateLimit>,
+    ) -> Route {
+        Route {
+            matcher: crate::manifest::RouteMatch {
+                host: None,
+                path_prefix: "/".to_string(),
+                method: None,
+                headers: Default::default(),
+                query: Default::default(),
+            },
+            filters: filters.into_iter().map(str::to_string).collect(),
+            upstream: upstream.map(str::to_string),
+            backends,
+            strip_prefix: None,
+            rate_limit,
+        }
+    }
+
+    #[test]
+    fn validate_routes_rejects_unknown_upstream() {
+        let routes = vec![manifest_route(Some("ghost"), vec![], vec![], None)];
+        let filters = HashMap::new();
+        let upstream_names: HashSet<&str> = ["real"].into_iter().collect();
+        let err = validate_routes(&routes, &filters, &upstream_names).unwrap_err();
+        assert!(matches!(
+            err,
+            ControlError::UnknownRouteUpstream { upstream, .. } if upstream == "ghost"
+        ));
+    }
+
+    #[test]
+    fn validate_routes_rejects_unknown_filter() {
+        let routes = vec![manifest_route(Some("real"), vec![], vec!["missing"], None)];
+        let filters = HashMap::new();
+        let upstream_names: HashSet<&str> = ["real"].into_iter().collect();
+        let err = validate_routes(&routes, &filters, &upstream_names).unwrap_err();
+        assert!(matches!(
+            err,
+            ControlError::UnknownRouteFilter { filter, .. } if filter == "missing"
+        ));
+    }
+
+    #[test]
+    fn validate_routes_rejects_all_zero_backend_weight() {
+        let routes = vec![manifest_route(
+            None,
+            vec![crate::manifest::Backend {
+                upstream: "real".to_string(),
+                weight: 0,
+            }],
+            vec![],
+            None,
+        )];
+        let filters = HashMap::new();
+        let upstream_names: HashSet<&str> = ["real"].into_iter().collect();
+        assert!(matches!(
+            validate_routes(&routes, &filters, &upstream_names),
+            Err(ControlError::InvalidRoute { .. })
+        ));
+    }
+
+    #[test]
+    fn validate_routes_rejects_zero_rate_or_burst() {
+        let filters = HashMap::new();
+        let upstream_names: HashSet<&str> = ["real"].into_iter().collect();
+
+        let zero_rate = vec![manifest_route(
+            Some("real"),
+            vec![],
+            vec![],
+            Some(crate::manifest::RouteRateLimit {
+                rate: 0,
+                burst: 5,
+                key: Default::default(),
+            }),
+        )];
+        assert!(matches!(
+            validate_routes(&zero_rate, &filters, &upstream_names),
+            Err(ControlError::InvalidRouteRateLimit { .. })
+        ));
+
+        let zero_burst = vec![manifest_route(
+            Some("real"),
+            vec![],
+            vec![],
+            Some(crate::manifest::RouteRateLimit {
+                rate: 5,
+                burst: 0,
+                key: Default::default(),
+            }),
+        )];
+        assert!(matches!(
+            validate_routes(&zero_burst, &filters, &upstream_names),
+            Err(ControlError::InvalidRouteRateLimit { .. })
+        ));
+    }
+
+    #[test]
+    fn validate_routes_accepts_a_valid_route_and_carries_its_resolved_targets() {
+        let routes = vec![manifest_route(Some("real"), vec![], vec![], None)];
+        let filters = HashMap::new();
+        let upstream_names: HashSet<&str> = ["real"].into_iter().collect();
+        let validated = validate_routes(&routes, &filters, &upstream_names).unwrap();
+        assert_eq!(validated.len(), 1);
+        assert_eq!(validated[0].targets, vec![("real", 1)]);
     }
 
     #[test]

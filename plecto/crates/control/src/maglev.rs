@@ -42,6 +42,10 @@ impl MaglevTable {
     /// `m` MUST be prime and `>= entries.len() >= 1`, and every weight `>= 1` — all guaranteed by
     /// the manifest's build-time validation (`Upstream::validate_lb`). Runs the weighted-frequency
     /// populate once; the result is a stable schedule reused for the life of the group.
+    // INVARIANT: `offset`/`skip`/`weights`/`target`/`next` all have length `n` (built together,
+    // just below), and every index into them is bounded by `0..n`; `entry`/`table` are bounded by
+    // `0..m`. The debug_assert!s pin this so the indexing below is checked in debug/test builds.
+    #[allow(clippy::indexing_slicing)]
     pub(crate) fn build(entries: &[(&str, u32)], m: usize) -> Self {
         let n = entries.len();
         // Per-backend permutation parameters from two independent hashes (the 128-bit halves).
@@ -56,6 +60,9 @@ impl MaglevTable {
 
         let weights: Vec<u64> = entries.iter().map(|(_, w)| *w as u64).collect();
         let max_w = weights.iter().copied().max().unwrap_or(1).max(1);
+        debug_assert_eq!(offset.len(), n);
+        debug_assert_eq!(skip.len(), n);
+        debug_assert_eq!(weights.len(), n);
 
         // `target[i]` seeded to `weight[i]` makes round 1 place every positive-weight backend (so
         // each gets >= 1 entry); thereafter backend `i` takes a turn every `max_w / weight[i]` rounds.
@@ -64,6 +71,9 @@ impl MaglevTable {
         let mut entry = vec![-1i64; m];
         let mut filled = 0usize;
         let mut round = 0u64;
+        debug_assert_eq!(target.len(), n);
+        debug_assert_eq!(next.len(), n);
+        debug_assert_eq!(entry.len(), m);
 
         'fill: while filled < m {
             round += 1;
@@ -101,12 +111,15 @@ impl MaglevTable {
     /// The instance index a request key maps to: `key_hash mod M`, then the table entry. The caller
     /// hashes the key (header bytes or peer-IP octets) so this stays allocation-free. Returns `None`
     /// only on an empty table (never built that way; guarded for data-plane no-panic).
+    // INVARIANT: slot = key_hash % m, so slot < m == self.table.len() always (checked below).
+    #[allow(clippy::indexing_slicing)]
     pub(crate) fn lookup(&self, key_hash: u64) -> Option<usize> {
         let m = self.table.len();
         if m == 0 {
             return None;
         }
         let slot = (key_hash % m as u64) as usize;
+        debug_assert!(slot < self.table.len());
         Some(self.table[slot] as usize)
     }
 }

@@ -55,6 +55,9 @@ impl ConfigSnapshot {
     /// 404). The most specific match wins (see [`route::select`]). Pure config lookup — cheap and
     /// non-blocking, so it runs on the async thread; only the returned route's chain dispatch is
     /// blocking work. Reads only borrowed request fields, so matching is allocation-free.
+    // INVARIANT: `route::select` returns an index into the very `routes` slice passed to it, so
+    // indexing `self.config.routes` with its result is always in bounds.
+    #[allow(clippy::indexing_slicing)]
     pub fn find_route(&self, request: &HttpRequest) -> Option<RouteInfo> {
         let parts = route::RequestParts {
             authority: &request.authority,
@@ -63,6 +66,7 @@ impl ConfigSnapshot {
             headers: &request.headers,
         };
         let index = route::select(&self.config.routes, &parts)?;
+        debug_assert!(index < self.config.routes.len());
         let r = &self.config.routes[index];
         Some(RouteInfo {
             index,
@@ -113,6 +117,37 @@ impl ConfigSnapshot {
     /// continues the same trace (ADR 000009 propagation).
     pub fn traceparent(&self) -> String {
         self.trace.to_traceparent()
+    }
+}
+
+impl crate::Control {
+    /// Pin the active config for one request transaction (see [`ConfigSnapshot`]). The
+    /// fast-path server takes one snapshot per request and drives both halves through it, so a
+    /// concurrent reload cannot desync the request and response sides of the same transaction.
+    pub fn snapshot(&self) -> ConfigSnapshot {
+        self.snapshot_with_trace(RequestTrace::root())
+    }
+
+    /// Like [`Control::snapshot`], but continue an inbound trace context (ADR 000009): the
+    /// fast-path server parses the request's W3C `traceparent` into a [`RequestTrace`] and
+    /// passes it here, so the chain's spans join the caller's distributed trace instead of
+    /// starting a fresh root.
+    pub fn snapshot_with_trace(&self, trace: RequestTrace) -> ConfigSnapshot {
+        ConfigSnapshot::new(self.active.load_full(), trace)
+    }
+
+    /// Drive a request through the chain. Returns whether to forward the (possibly edited)
+    /// request upstream, or to respond now (a filter short-circuited, or the chain failed
+    /// closed on a trap / deadline). Convenience for a one-shot caller; a request transaction
+    /// that also runs a response should use [`Control::snapshot`] to pin one config.
+    pub fn on_request(&self, request: HttpRequest) -> ChainOutcome {
+        self.snapshot().on_request(request)
+    }
+
+    /// Drive a response back through the chain in reverse, applying response edits. A trapped
+    /// filter yields a fail-closed 5xx. See [`Control::snapshot`] for the transaction-pinned form.
+    pub fn on_response(&self, response: HttpResponse) -> HttpResponse {
+        self.snapshot().on_response(response)
     }
 }
 

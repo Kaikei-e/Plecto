@@ -117,11 +117,16 @@ impl NativeRateLimit {
 
     /// `check` against an explicit clock — the real entry point, with `now_ms` injectable for
     /// deterministic tests (the bucket math advances purely by `now_ms`).
+    // INVARIANT: `slot_for_ip` masks its hash with `len - 1` (`IP_SLOTS` is a power of two), so the
+    // result is always `< slots.len()`.
+    #[allow(clippy::indexing_slicing)]
     fn check_at(&self, peer: IpAddr, now_ms: u64) -> RateLimitDecision {
         let cell = match &self.state {
             LimiterState::Route(cell) => cell,
             LimiterState::ClientIp { slots, hasher } => {
-                &slots[slot_for_ip(peer, hasher, slots.len())]
+                let slot = slot_for_ip(peer, hasher, slots.len());
+                debug_assert!(slot < slots.len());
+                &slots[slot]
             }
         };
         let mut guard = cell.lock();

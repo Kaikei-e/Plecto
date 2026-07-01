@@ -12,8 +12,33 @@
 //! requires a new `Control`. `reload` swaps only the filter set + chain (same `Host`, same
 //! epoch ticker), so a runaway filter stays bounded across reloads.
 
+// Hot-path discipline (bp-rust): no unwrap/expect/panic/indexing on the data plane. Exempted
+// under `cfg(test)` — this crate's own `#[cfg(test)] mod` blocks legitimately use them;
+// `tests/*.rs` integration tests are separate crates and are never subject to this attribute.
+// plecto-control is config/build-time (not per-request), but its Maglev/weighted-split hashing
+// and route matching are still touched by the fast path indirectly, so the same discipline
+// applies (added at Stage 3, after the `hash.rs`/`maglev.rs`/`weighted.rs` fixes it surfaces).
+//
+// `clippy::pedantic`/`clippy::nursery` are NOT enabled here (nor in plecto-host/plecto-server):
+// a dry run measures 400+ pre-existing hits crate-wide, almost entirely pre-existing stylistic
+// noise unrelated to this refactor's scope; scoped-allow-ing all of them would be disproportionate
+// busy-work. Left as a known, explicit gap rather than silently skipped.
+#![warn(rust_2018_idioms)]
+#![deny(unsafe_op_in_unsafe_fn)]
+#![cfg_attr(
+    not(test),
+    warn(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
+
 mod artifact;
 mod chain;
+mod control_observability;
+mod control_reload;
 mod error;
 mod hash;
 mod maglev;
@@ -219,145 +244,6 @@ impl Control {
         })
     }
 
-    /// Atomically swap to a new manifest's filter set + chain (ADR 000007: build the new set
-    /// fully, then switch in one store; the old set is drained as its `Arc` refs drop). If any
-    /// filter fails to resolve / verify / load, the swap does **not** happen and the current
-    /// set stays live — reload is all-or-nothing. The trust policy is fixed at construction.
-    pub fn reload(&self, manifest: &Manifest) -> Result<(), ControlError> {
-        self.ensure_trust_unchanged(manifest)?;
-        let active = build_active(
-            &self.host,
-            manifest,
-            self.store.as_ref(),
-            &self.base_dir,
-            &self.upstreams,
-        )?;
-        self.active.store(Arc::new(active));
-        Ok(())
-    }
-
-    /// Reject a reload whose manifest changes the `[trust]` section (f000004 #1). Trust roots
-    /// are fixed for the life of the `Host` / epoch ticker; an operator rotates them by
-    /// restarting with the new manifest, not by reloading — otherwise a trust-only edit would
-    /// flip the content hash and be reported as a successful reload while having no effect.
-    fn ensure_trust_unchanged(&self, manifest: &Manifest) -> Result<(), ControlError> {
-        if manifest.trust != self.trust {
-            return Err(ControlError::TrustChangeRequiresRestart);
-        }
-        Ok(())
-    }
-
-    /// Re-read the on-disk manifest and reload if its `config version` changed. The trigger
-    /// (SIGHUP, `serve_reloads`) is content-free, so this is where the new config is actually
-    /// read. Idempotent: an unchanged manifest (same semantic `content_hash`) is a no-op —
-    /// no rebuild, no drain. A changed one is built fully and swapped atomically; on any
-    /// build failure the running set is left untouched (fail-closed) and the error returned.
-    ///
-    /// Errors with `NoManifestPath` if this plane was not built from an on-disk manifest
-    /// (`load` / `from_manifest`); use `from_manifest_path` / `load_at` for a reloadable plane.
-    pub fn reload_from_disk(&self) -> Result<ReloadOutcome, ControlError> {
-        let path = self
-            .manifest_path
-            .as_ref()
-            .ok_or(ControlError::NoManifestPath)?;
-        let manifest = read_manifest(path)?;
-        // A [trust] change is rejected before anything else: it must never be reported as a
-        // successful reload (f000004 #1), even though it would flip the content hash below.
-        self.ensure_trust_unchanged(&manifest)?;
-        let new_hash = manifest.content_hash()?;
-        // Cheap idempotency gate: skip the rebuild + drain entirely when the config version
-        // is unchanged (a comment-only edit, or a spurious trigger).
-        if new_hash == self.active.load().hash {
-            return Ok(ReloadOutcome::Unchanged);
-        }
-        // Build the new set fully before swapping; on failure the running set is untouched.
-        let active = build_active(
-            &self.host,
-            &manifest,
-            self.store.as_ref(),
-            &self.base_dir,
-            &self.upstreams,
-        )?;
-        self.active.store(Arc::new(active));
-        Ok(ReloadOutcome::Reloaded { hash: new_hash })
-    }
-
-    /// The active config's `content_hash` (ADR 000008 `config version`): the audit identity of
-    /// what is loaded right now, and the unit a future opt-in consensus layer would agree on.
-    pub fn config_version(&self) -> String {
-        self.active.load().hash.clone()
-    }
-
-    /// A snapshot of the host-aggregated filter-execution metrics (ADR 000009): the tally the
-    /// `MetricsSink` wired at construction has accumulated. The fast path's admin `/metrics`
-    /// endpoint renders this alongside its native RED metrics.
-    pub fn filter_metrics(&self) -> MetricsSnapshot {
-        self.filter_metrics.snapshot()
-    }
-
-    /// The admin endpoint bind address (`[observability] admin_addr`), or `None` when no admin
-    /// listener is configured (the default). The fast path binds a separate listener there for
-    /// `/metrics` + liveness/readiness (ADR 000009 Stage A).
-    pub fn admin_addr(&self) -> Option<&str> {
-        self.observability.admin_addr.as_deref()
-    }
-
-    /// Whether the structured access log is enabled (`[observability] access_log`, ADR 000009).
-    pub fn access_log_enabled(&self) -> bool {
-        self.observability.access_log
-    }
-
-    /// The active TLS server config (ADR 000014), or `None` for plain HTTP/1.1. The fast-path
-    /// server reads this per accepted connection, so a reload's new certs apply to new connections
-    /// while in-flight ones keep the cert they negotiated with.
-    pub fn tls_config(&self) -> Option<Arc<rustls::ServerConfig>> {
-        self.active.load().tls.clone()
-    }
-
-    /// The active QUIC TLS config for HTTP/3 (ADR 000016): ALPN `h3`, TLS 1.3, sharing the TCP
-    /// config's SNI cert resolver. `None` whenever there is no `[[tls]]` (h3 requires TLS, so it is
-    /// only offered alongside TLS termination). The fast-path server reads this once to decide
-    /// whether to bind a QUIC listener and what to advertise via `Alt-Svc`.
-    pub fn quic_tls_config(&self) -> Option<Arc<rustls::ServerConfig>> {
-        self.active.load().quic_tls.clone()
-    }
-
-    /// A snapshot of the current upstream groups (ADR 000017), for the fast-path server's
-    /// health-check supervisor to probe. Reflects the latest reconcile, so a reload's added /
-    /// removed instances are picked up on the supervisor's next tick without restarting it.
-    pub fn upstream_groups(&self) -> Vec<Arc<UpstreamGroup>> {
-        self.upstreams.groups()
-    }
-
-    /// Pin the active config for one request transaction (see [`ConfigSnapshot`]). The
-    /// fast-path server takes one snapshot per request and drives both halves through it, so a
-    /// concurrent reload cannot desync the request and response sides of the same transaction.
-    pub fn snapshot(&self) -> ConfigSnapshot {
-        self.snapshot_with_trace(RequestTrace::root())
-    }
-
-    /// Like [`Control::snapshot`], but continue an inbound trace context (ADR 000009): the
-    /// fast-path server parses the request's W3C `traceparent` into a [`RequestTrace`] and
-    /// passes it here, so the chain's spans join the caller's distributed trace instead of
-    /// starting a fresh root.
-    pub fn snapshot_with_trace(&self, trace: RequestTrace) -> ConfigSnapshot {
-        ConfigSnapshot::new(self.active.load_full(), trace)
-    }
-
-    /// Drive a request through the chain. Returns whether to forward the (possibly edited)
-    /// request upstream, or to respond now (a filter short-circuited, or the chain failed
-    /// closed on a trap / deadline). Convenience for a one-shot caller; a request transaction
-    /// that also runs a response should use [`Control::snapshot`] to pin one config.
-    pub fn on_request(&self, request: HttpRequest) -> ChainOutcome {
-        self.snapshot().on_request(request)
-    }
-
-    /// Drive a response back through the chain in reverse, applying response edits. A trapped
-    /// filter yields a fail-closed 5xx. See [`Control::snapshot`] for the transaction-pinned form.
-    pub fn on_response(&self, response: HttpResponse) -> HttpResponse {
-        self.snapshot().on_response(response)
-    }
-
     /// The ids currently loaded (for diagnostics / tests). Order is unspecified.
     pub fn loaded_ids(&self) -> Vec<String> {
         self.active.load().filters.keys().cloned().collect()
@@ -433,60 +319,14 @@ fn build_active(
     }
 
     // Routing table (ADR 000013 / 000017). Validate every route reference (upstream name, filter
-    // ids) PURELY first — before the persistent upstream registry is mutated — so a manifest we'd
-    // reject never reconciles the registry (reload stays all-or-nothing; the running upstream
-    // health state is untouched on a failed reload).
+    // ids), the weighted split, and the native rate limit PURELY first — before the persistent
+    // upstream registry is mutated — so a manifest we'd reject never reconciles the registry
+    // (reload stays all-or-nothing; the running upstream health state is untouched on a failed
+    // reload). `validated_routes` carries each route's already-resolved forwarding targets, reused
+    // below instead of calling `targets()` again.
     let upstream_names: HashSet<&str> =
         manifest.upstreams.iter().map(|u| u.name.as_str()).collect();
-    for r in &manifest.routes {
-        // The route's forwarding targets: the single `upstream` shorthand or weighted `backends`
-        // (ADR 000034). Both-set / neither-set is fail-closed here.
-        let targets = r.targets().map_err(|reason| ControlError::InvalidRoute {
-            path_prefix: r.matcher.path_prefix.clone(),
-            reason: reason.to_string(),
-        })?;
-        for (name, _) in &targets {
-            if !upstream_names.contains(name) {
-                return Err(ControlError::UnknownRouteUpstream {
-                    path_prefix: r.matcher.path_prefix.clone(),
-                    upstream: (*name).to_string(),
-                });
-            }
-        }
-        // Validate the weighted split (empty / all-zero / over-cap weight / oversized reduced table)
-        // PURELY here, before the registry reconcile, so a bad split is rejected without mutating the
-        // persistent upstream health state (reload stays all-or-nothing).
-        let weights: Vec<u32> = targets.iter().map(|(_, w)| *w).collect();
-        weighted::validate_split(&weights).map_err(|reason| ControlError::InvalidRoute {
-            path_prefix: r.matcher.path_prefix.clone(),
-            reason,
-        })?;
-        for f in &r.filters {
-            if !filters.contains_key(f) {
-                return Err(ControlError::UnknownRouteFilter {
-                    path_prefix: r.matcher.path_prefix.clone(),
-                    filter: f.clone(),
-                });
-            }
-        }
-        // Reject a native rate limit that can never serve a token (ADR 000033). A zero `rate` never
-        // refills and a zero `burst` holds nothing — a config typo, fail-closed at build like the
-        // per-filter limiter validation, before the limiter arithmetic ever runs (CWE-20).
-        if let Some(rl) = &r.rate_limit {
-            if rl.rate == 0 {
-                return Err(ControlError::InvalidRouteRateLimit {
-                    path_prefix: r.matcher.path_prefix.clone(),
-                    reason: "rate must be non-zero".to_string(),
-                });
-            }
-            if rl.burst == 0 {
-                return Err(ControlError::InvalidRouteRateLimit {
-                    path_prefix: r.matcher.path_prefix.clone(),
-                    reason: "burst must be non-zero".to_string(),
-                });
-            }
-        }
-    }
+    let validated_routes = route::validate_routes(&manifest.routes, &filters, &upstream_names)?;
 
     // TLS termination config (ADR 000014 TCP / ADR 000016 QUIC): build the rustls ServerConfigs
     // from `[[tls]]`, sharing one SNI cert resolver. A bad cert is fail-closed here, so a failed
@@ -507,14 +347,11 @@ fn build_active(
     // instances across the reload. After it returns Ok the build is infallible, so a rejected
     // reload never leaves the registry reconciled to a manifest whose `active` was not swapped in.
     registry.reconcile(&manifest.upstreams)?;
-    let mut routes = Vec::with_capacity(manifest.routes.len());
-    for r in &manifest.routes {
-        // Resolve the route's forwarding targets (validated above) to their upstream groups, then
-        // compile the weighted split (ADR 000034). A single `upstream` becomes a one-element set.
-        let targets = r.targets().map_err(|reason| ControlError::InvalidRoute {
-            path_prefix: r.matcher.path_prefix.clone(),
-            reason: reason.to_string(),
-        })?;
+    let mut routes = Vec::with_capacity(validated_routes.len());
+    for route::ValidatedRoute { route: r, targets } in validated_routes {
+        // Resolve the route's forwarding targets (already validated above) to their upstream
+        // groups, then compile the weighted split (ADR 000034). A single `upstream` becomes a
+        // one-element set.
         let mut resolved = Vec::with_capacity(targets.len());
         for (name, weight) in targets {
             // present: the name was validated above and reconcile built a group for each manifest

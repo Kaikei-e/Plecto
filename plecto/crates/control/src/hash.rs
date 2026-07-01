@@ -26,10 +26,29 @@ fn fmix64(mut k: u64) -> u64 {
     k
 }
 
+/// Read a little-endian `u64` from `data[base..]`, tolerant of a short/out-of-range slice
+/// (zero-padded) — mirrors `plecto_host::backend::decode_i64`'s tolerant-decode idiom. The body
+/// loop below always calls this with `base + 8 <= data.len()` (guaranteed by its own bound), so in
+/// practice this always reads a full 8 bytes; the tolerance is what lets it avoid an `.unwrap()`
+/// without changing behavior.
+// `chunk.len() <= 8` always (the range end is clamped to `data.len()` and starts from `base`), so
+// `buf[..chunk.len()]` is in bounds for the 8-byte `buf`.
+#[allow(clippy::indexing_slicing)]
+fn read_u64_le(data: &[u8], base: usize) -> u64 {
+    let mut buf = [0u8; 8];
+    if let Some(chunk) = data.get(base..(base + 8).min(data.len())) {
+        buf[..chunk.len()].copy_from_slice(chunk);
+    }
+    u64::from_le_bytes(buf)
+}
+
 /// `MurmurHash3_x64_128`: hash `data` to a 128-bit value, returned as `(low, high)` 64-bit words.
 /// Reads the body little-endian so the result is identical on every platform (stable hashing). For
 /// Maglev: `low` seeds the permutation offset, `high` the skip; for a request key, `low % M` is the
 /// table slot.
+// INVARIANT: `tail = &data[nblocks*16..]` is always in bounds (`nblocks = data.len()/16`); `i` in
+// the tail loops always ranges within `0..tail.len()`.
+#[allow(clippy::indexing_slicing)]
 pub(crate) fn murmur3_x64_128(data: &[u8], seed: u64) -> (u64, u64) {
     let mut h1 = seed;
     let mut h2 = seed;
@@ -38,8 +57,8 @@ pub(crate) fn murmur3_x64_128(data: &[u8], seed: u64) -> (u64, u64) {
     // body — full 16-byte blocks
     for i in 0..nblocks {
         let base = i * 16;
-        let mut k1 = u64::from_le_bytes(data[base..base + 8].try_into().unwrap());
-        let mut k2 = u64::from_le_bytes(data[base + 8..base + 16].try_into().unwrap());
+        let mut k1 = read_u64_le(data, base);
+        let mut k2 = read_u64_le(data, base + 8);
 
         k1 = k1.wrapping_mul(C1).rotate_left(31).wrapping_mul(C2);
         h1 ^= k1;

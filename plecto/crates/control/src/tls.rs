@@ -175,6 +175,23 @@ fn tls_err_path(entry: &TlsCert, path: &str, reason: &str) -> ControlError {
     }
 }
 
+impl crate::Control {
+    /// The active TLS server config (ADR 000014), or `None` for plain HTTP/1.1. The fast-path
+    /// server reads this per accepted connection, so a reload's new certs apply to new connections
+    /// while in-flight ones keep the cert they negotiated with.
+    pub fn tls_config(&self) -> Option<Arc<ServerConfig>> {
+        self.active.load().tls.clone()
+    }
+
+    /// The active QUIC TLS config for HTTP/3 (ADR 000016): ALPN `h3`, TLS 1.3, sharing the TCP
+    /// config's SNI cert resolver. `None` whenever there is no `[[tls]]` (h3 requires TLS, so it is
+    /// only offered alongside TLS termination). The fast-path server reads this once to decide
+    /// whether to bind a QUIC listener and what to advertise via `Alt-Svc`.
+    pub fn quic_tls_config(&self) -> Option<Arc<ServerConfig>> {
+        self.active.load().quic_tls.clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
