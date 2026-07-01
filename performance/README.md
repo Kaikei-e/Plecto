@@ -319,6 +319,29 @@ requests are decided **at the edge in ~0.3 ms** and never reach the upstream: ba
 hit. (Filter faults or deadline overruns **fail closed** — 502/504 — exercised by the test suite,
 not this benchmark.)
 
+## Outbound ext_authz (ADR 000036)
+
+A filter can call an external authorization service per request over the lent, SSRF-guarded outbound
+capability (`filter-extauthz`). Its per-request cost decomposes into three parts, only the first two of
+which are Plecto's:
+
+- **WASM tax** — the same dispatch floor and (for untrusted) instantiation the
+  [cost ladder](#the-wasm-cost-ladder--isolating-each-cost) measures.
+- **The outbound gate** — the operator allowlist (an exact scheme/host/port match) plus the SSRF
+  classification of every resolved address. Structurally this is a small scan + a handful of octet
+  checks — nanoseconds, the same order as an LB pick (see [# 0](#0-micro-benchmarks-in-process-criterion)) —
+  and negligible next to the two costs around it.
+- **The network round-trip** to the authz endpoint — which is the *operator's* authz-service latency,
+  not a Plecto overhead, and dominates the total (as proxy-wasm's own guidance notes for ext_authz).
+
+Two facts keep this out of the headline load numbers for now, honestly rather than faked: the SSRF
+guard **blocks loopback by design**, so a hermetic mock authz needs a non-loopback endpoint
+(environment-specific), and the current connector opens **a new connection per call** — outbound
+connection pooling is a follow-up. A through-the-guest ext_authz *load* benchmark is therefore
+deferred (like [HTTP/3](#http3)) rather than published with an environment-dependent,
+connect-per-request number. The capability itself is verified end-to-end by the host's `outbound-http`
+test suite (allowlist deny + the DNS-rebinding SSRF block).
+
 ## Host-enforced rate limiting
 
 Plecto's rate limiter is a **host-native token bucket** (ADR 000026): the bucket spec

@@ -1,0 +1,67 @@
+# Plecto benchmark CI — an OPT-IN, noise-honest regression signal (see performance/README.md).
+#
+# Running the project's OWN benchmarks is "testing … the software project associated with the
+# repository" under GitHub's Acceptable Use, and is permitted. To respect the "no disproportionate
+# burden" clause AND the noise of shared hosted runners, this workflow runs ONLY the light,
+# deterministic, in-process criterion micro-benchmarks (seconds). The heavy k6/oha macro load-test
+# suite is a LOCAL harness (bench/perf/run-perf.sh): hosted-runner macro numbers would be noisy and
+# low-value, so it is deliberately not run here.
+#
+# This is a CORRECTNESS gate (the benches must compile and run without panicking) and an
+# INFORMATIONAL perf signal (it prints the numbers). It does NOT hard-fail on small deltas: hosted
+# VMs are noisy neighbours (~2–3% CV), so a tight threshold would false-fail (~1-in-2 at a 2% gate).
+# Read the printed numbers for direction; run locally with `--save-baseline`/`--baseline` for a real
+# comparison (performance/README.md → Reproducing).
+#
+# Actions are SHA-pinned (supply-chain stance, ADR 000006 / OWASP A08), matching ci.yml.
+
+name: Bench
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Least privilege: nothing here writes to the repo.
+permissions:
+  contents: read
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+defaults:
+  run:
+    working-directory: plecto
+
+jobs:
+  micro:
+    name: criterion micro-benchmarks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      # plecto-host pulls wasmtime 46 / cranelift (a large build); free the runner's preinstalled
+      # bloat so it fits. Best-effort, no third-party action (supply-chain stance).
+      - name: Free disk space for the wasmtime/cranelift build
+        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc || true
+      - uses: dtolnay/rust-toolchain@6190aa5fb88a88ee71c12769924bbe63a9ab152e # 1.96.0
+        with:
+          toolchain: "1.96.0" # SHA-pinned (A08): re-state the toolchain the ref no longer encodes.
+          # wasm32-unknown-unknown: plecto-host's build.rs builds the header-only guest fixtures the
+          # WASM micro-bench loads (filter-hello / filter-noop).
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: plecto
+          cache-on-failure: true
+      # `[lib] bench = false` on both crates makes `cargo bench` run ONLY the criterion targets, so
+      # `--warm-up-time` / `--measurement-time` reach them (the libtest harness would reject them).
+      # Quick settings keep this to seconds: the goal is "the benches build + run" plus a direction
+      # signal, not a publication-grade measurement.
+      - name: criterion micro-benchmarks (informational)
+        run: cargo bench -p plecto-control -p plecto-host -- --warm-up-time 1 --measurement-time 3
