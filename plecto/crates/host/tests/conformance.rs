@@ -10,7 +10,7 @@
 
 use plecto_host::test_support::{TestSigner, bound_sbom, filter_quickstart_component};
 use plecto_host::{
-    Host, HttpResponse, Isolation, LoadOptions, RequestBodyDecision, RequestTrace,
+    Host, HttpResponse, Isolation, LoadError, LoadOptions, RequestBodyDecision, RequestTrace,
     ResponseDecision, SignedArtifact, TrustPolicy,
 };
 
@@ -116,10 +116,19 @@ fn load_rejects_signature_from_untrusted_key() {
     let host = Host::new(other_key.trust_policy().unwrap()).unwrap();
     match host.load("filter-hello", &fx.artifact(), LoadOptions::untrusted()) {
         Ok(_) => panic!("a signature from an untrusted key must be rejected (fail-closed)"),
-        Err(e) => assert!(
-            e.to_string().contains("component signature"),
-            "rejection reason should name the component signature, got: {e}"
-        ),
+        Err(e) => {
+            assert!(
+                e.to_string().contains("component signature"),
+                "rejection reason should name the component signature, got: {e}"
+            );
+            assert!(
+                matches!(
+                    e.downcast_ref::<LoadError>(),
+                    Some(LoadError::UnverifiedComponentSignature)
+                ),
+                "expected LoadError::UnverifiedComponentSignature, got: {e:?}"
+            );
+        }
     }
 }
 
@@ -159,10 +168,16 @@ fn load_rejects_missing_sbom() {
     };
     match host.load("filter-hello", &artifact, LoadOptions::untrusted()) {
         Ok(_) => panic!("a missing SBOM must be rejected (fail-closed)"),
-        Err(e) => assert!(
-            e.to_string().contains("SBOM"),
-            "rejection reason should name the SBOM, got: {e}"
-        ),
+        Err(e) => {
+            assert!(
+                e.to_string().contains("SBOM"),
+                "rejection reason should name the SBOM, got: {e}"
+            );
+            assert!(
+                matches!(e.downcast_ref::<LoadError>(), Some(LoadError::MissingSbom)),
+                "expected LoadError::MissingSbom, got: {e:?}"
+            );
+        }
     }
 }
 
@@ -181,10 +196,19 @@ fn load_rejects_bad_sbom_signature() {
     };
     match host.load("filter-hello", &artifact, LoadOptions::untrusted()) {
         Ok(_) => panic!("an SBOM signature from an untrusted key must be rejected"),
-        Err(e) => assert!(
-            e.to_string().contains("SBOM signature"),
-            "rejection reason should name the SBOM signature, got: {e}"
-        ),
+        Err(e) => {
+            assert!(
+                e.to_string().contains("SBOM signature"),
+                "rejection reason should name the SBOM signature, got: {e}"
+            );
+            assert!(
+                matches!(
+                    e.downcast_ref::<LoadError>(),
+                    Some(LoadError::UnverifiedSbomSignature)
+                ),
+                "expected LoadError::UnverifiedSbomSignature, got: {e:?}"
+            );
+        }
     }
 }
 
@@ -208,10 +232,16 @@ fn load_rejects_sbom_for_other_component() {
         .load("filter-hello", &artifact, LoadOptions::untrusted())
     {
         Ok(_) => panic!("an SBOM attesting a different component must be rejected"),
-        Err(e) => assert!(
-            e.to_string().contains("does not attest this component"),
-            "rejection reason should name the binding failure, got: {e}"
-        ),
+        Err(e) => {
+            assert!(
+                e.to_string().contains("does not attest this component"),
+                "rejection reason should name the binding failure, got: {e}"
+            );
+            assert!(
+                matches!(e.downcast_ref::<LoadError>(), Some(LoadError::SbomNotBound)),
+                "expected LoadError::SbomNotBound, got: {e:?}"
+            );
+        }
     }
 }
 
@@ -237,10 +267,16 @@ fn load_rejects_empty_filter_id() {
     let fx = fixture();
     match fx.host().load("", &fx.artifact(), LoadOptions::untrusted()) {
         Ok(_) => panic!("an empty filter id must be rejected"),
-        Err(e) => assert!(
-            e.to_string().contains("filter id"),
-            "rejection should name the filter id, got: {e}"
-        ),
+        Err(e) => {
+            assert!(
+                e.to_string().contains("filter id"),
+                "rejection should name the filter id, got: {e}"
+            );
+            assert!(
+                matches!(e.downcast_ref::<LoadError>(), Some(LoadError::EmptyFilterId)),
+                "expected LoadError::EmptyFilterId, got: {e:?}"
+            );
+        }
     }
 }
 
@@ -256,10 +292,19 @@ fn load_rejects_filter_id_with_namespace_delimiter() {
         .load(&evil_id, &fx.artifact(), LoadOptions::untrusted())
     {
         Ok(_) => panic!("a filter id containing the KV namespace delimiter must be rejected"),
-        Err(e) => assert!(
-            e.to_string().contains("delimiter"),
-            "rejection should name the delimiter, got: {e}"
-        ),
+        Err(e) => {
+            assert!(
+                e.to_string().contains("delimiter"),
+                "rejection should name the delimiter, got: {e}"
+            );
+            assert!(
+                matches!(
+                    e.downcast_ref::<LoadError>(),
+                    Some(LoadError::FilterIdContainsDelimiter)
+                ),
+                "expected LoadError::FilterIdContainsDelimiter, got: {e:?}"
+            );
+        }
     }
 }
 
