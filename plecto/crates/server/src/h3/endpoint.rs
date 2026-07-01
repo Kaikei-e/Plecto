@@ -5,10 +5,12 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use quinn::crypto::rustls::QuicServerConfig;
+use tokio::sync::watch;
 
 use super::http3_err;
 use super::request::handle_h3_request;
 use crate::error::ServerError;
+use crate::listener::drained;
 use crate::{MAX_CONCURRENT_STREAMS, ServerState};
 
 /// Build the QUIC `Endpoint` for HTTP/3 from control's QUIC TLS config, bound on the same port
@@ -33,15 +35,34 @@ pub(crate) fn build_h3_endpoint(
 }
 
 /// Accept QUIC connections, set up an h3 connection on each, and drive every request stream through
-/// `handle_h3_request`. A per-connection / per-request error is logged, never fatal.
-pub(crate) async fn serve_h3(state: Arc<ServerState>, endpoint: quinn::Endpoint) {
-    while let Some(incoming) = endpoint.accept().await {
+/// `handle_h3_request`. A per-connection / per-request error is logged, never fatal. When the
+/// drain flag flips (graceful shutdown, ADR 000039) the loops stop: no new QUIC connections are
+/// accepted and each open h3 connection closes (its streams end with the transport; per-request
+/// GOAWAY draining is a follow-up — TCP clients get the full drain window, h3 clients re-dial or
+/// fall back to the TCP `Alt-Svc` origin).
+pub(crate) async fn serve_h3(
+    state: Arc<ServerState>,
+    endpoint: quinn::Endpoint,
+    mut drain: watch::Receiver<bool>,
+) {
+    loop {
         // Count a QUIC connection against the same global cap as TCP.
-        let permit = match state.conn_limit.clone().acquire_owned().await {
-            Ok(p) => p,
-            Err(_) => return, // semaphore closed → stop accepting
+        let permit = tokio::select! {
+            _ = drained(&mut drain) => return,
+            permit = state.conn_limit.clone().acquire_owned() => match permit {
+                Ok(p) => p,
+                Err(_) => return, // semaphore closed → stop accepting
+            },
+        };
+        let incoming = tokio::select! {
+            _ = drained(&mut drain) => return,
+            incoming = endpoint.accept() => match incoming {
+                Some(i) => i,
+                None => return, // endpoint closed
+            },
         };
         let state = state.clone();
+        let mut drain = drain.clone();
         tokio::spawn(async move {
             let _permit = permit; // released when this connection task ends
             let conn = match incoming.await {
@@ -66,7 +87,12 @@ pub(crate) async fn serve_h3(state: Arc<ServerState>, endpoint: quinn::Endpoint)
                 }
             };
             loop {
-                match h3conn.accept().await {
+                let accepted = tokio::select! {
+                    // shutdown: close this connection (dropping h3conn ends the QUIC connection).
+                    _ = drained(&mut drain) => break,
+                    accepted = h3conn.accept() => accepted,
+                };
+                match accepted {
                     Ok(Some(resolver)) => {
                         let state = state.clone();
                         tokio::spawn(async move {

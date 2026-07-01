@@ -163,7 +163,8 @@ async fn wait_ready(client: &Client<HttpConnector, Empty<Bytes>>, proxy: SocketA
 #[tokio::test]
 async fn graceful_shutdown_drains_inflight_and_stops_accepting() {
     let upstream = spawn_upstream(Duration::from_millis(400)).await;
-    let (proxy, shutdown, server) = spawn_proxy(control_for(upstream), Duration::from_secs(5)).await;
+    let (proxy, shutdown, server) =
+        spawn_proxy(control_for(upstream), Duration::from_secs(5)).await;
     let client = client();
     wait_ready(&client, proxy).await;
 

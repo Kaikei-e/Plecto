@@ -62,7 +62,7 @@ use tokio::sync::Semaphore;
 use crate::metrics::ServerMetrics;
 use crate::upstream_client::HyperUpstreamClient;
 
-pub use listener::{serve, serve_with_shutdown};
+pub use listener::{DEFAULT_DRAIN_DEADLINE, serve, serve_with_shutdown};
 
 /// Cap glibc's per-thread malloc arenas at process start to bound RSS on many-core hosts.
 ///
