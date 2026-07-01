@@ -17,13 +17,52 @@ publish.workspace = true
 # on wasmtime's component-model-async. Building the fixture also needs `rustup target add
 # wasm32-wasip2`. Stays out of the default build until wasm32-wasip3 reaches Tier 2.
 streaming-body = ["dep:wasmtime-wasi", "wasmtime/component-model-async"]
+# Experimental outbound HTTP capability for filters (ADR 000036): lends `wasi:http/outgoing-handler`
+# through the same deny-by-default Linker, gated per-filter by an operator allowlist + an SSRF guard
+# (IP-pinned connect) + resource bounds. OFF by default — the shipped header-only/sync world and its
+# supply chain are untouched until the M3 wasi:http convergence gate (ADR 000020). When on, it pulls
+# wasmtime-wasi-http + a minimal wasi:io slice and drives outbound-using guests on a tokio runtime
+# (pollster cannot service the blocking outbound I/O). Building the fixture needs `wasm32-wasip2`.
+outbound-http = [
+    "dep:wasmtime-wasi-http",
+    "dep:wasmtime-wasi",
+    "dep:ipnet",
+    "dep:tokio",
+    "dep:hyper",
+    "dep:http-body-util",
+    "dep:bytes",
+    "dep:rustls",
+    "dep:tokio-rustls",
+    "dep:webpki-roots",
+    "wasmtime/component-model-async",
+]
 
 [dependencies]
 wasmtime = { workspace = true }
-# Streaming-body only: a MINIMAL WASI slice (proxy interfaces — no fs/sockets/env) for the async
-# stream<u8> guest, which unlike the no-WASI header-only filters imports wasi:io. Optional, so the
-# default build never sees it.
+# Streaming-body / outbound-http only: a MINIMAL WASI slice (proxy interfaces — no fs/sockets/env) for
+# guests that, unlike the no-WASI header-only filters, import wasi:io. Optional, so the default build
+# never sees it.
 wasmtime-wasi = { version = "46.0.1", optional = true }
+# outbound-http only: the standard `wasi:http/outgoing-handler` host implementation. We take its
+# WasiHttpHooks::send_request seam but OWN the connector (allowlist + DNS + IP-pinned connect), so the
+# built-in one is only a source of types/building-blocks. Optional — absent from the default build.
+wasmtime-wasi-http = { version = "46.0.1", optional = true }
+# outbound-http only: CIDR parsing/containment for the operator's per-filter `allow_private` opt-in
+# ranges (the SSRF guard's explicit deny ranges are hand-written octet predicates, not this).
+ipnet = { workspace = true, optional = true }
+# outbound-http only: a real reactor for the blocking outbound socket I/O and the per-call
+# `tokio::time::timeout` deadline (epoch cannot interrupt a guest blocked inside a host call —
+# ADR 000006 / 000036). The default build keeps the no-reactor pollster executor.
+tokio = { version = "1", optional = true, features = ["rt", "net", "time", "io-util", "macros", "sync"] }
+# outbound-http only: the SSRF-guarded connector we own instead of wasi-http's default one — hyper
+# client + rustls (ring, matching the workspace TLS stack) + webpki roots + body-size capping. All
+# optional; the default build links none of them.
+hyper = { workspace = true, optional = true }
+http-body-util = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+tokio-rustls = { workspace = true, optional = true }
+webpki-roots = { version = "0.26", optional = true }
 # M3 Stage 1 (ADR 000021): a minimal `block_on` to drive wasmtime's now-async `call_async` /
 # `instantiate_async` from the host's still-sync public API. The guest runs to completion on a
 # fiber without suspending (epoch is trap-mode, host-API imports never block), so a no-reactor

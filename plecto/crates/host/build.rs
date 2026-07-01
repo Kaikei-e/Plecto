@@ -51,6 +51,17 @@ fn main() {
             "FILTER_STREAMING_COMPONENT",
         );
     }
+
+    // Outbound HTTP capability (ADR 000036, feature `outbound-http`, OFF by default): the
+    // ext_authz-style guest imports wasi:http/outgoing-handler, so it builds for wasm32-wasip2.
+    if std::env::var("CARGO_FEATURE_OUTBOUND_HTTP").is_ok() {
+        build_wasip2_component(
+            &cargo,
+            &filters.join("filter-extauthz"),
+            "filter_extauthz",
+            "FILTER_EXTAUTHZ_COMPONENT",
+        );
+    }
 }
 
 /// Build one guest crate for `wasm32-wasip2`, which already emits a Component Model component (the

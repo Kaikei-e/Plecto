@@ -1,0 +1,20 @@
+# filter-extauthz — an ext_authz-style `plecto:filter` that calls an external authorization endpoint
+# over the lent outbound HTTP capability (ADR 000036). Unlike the header-only filters it imports
+# `wasi:http/outgoing-handler` (via the `wasi` crate) and builds for wasm32-wasip2. It is the fixture
+# for plecto-host's feature-gated `outbound-http` runtime, NOT part of the default build. Declares its
+# own [workspace] so the native plecto/ workspace never absorbs it.
+[package]
+name = "filter-extauthz"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.58"
+# Pre-generated wasi 0.2 bindings for the outbound HTTP call (wasi:http/outgoing-handler + wasi:io).
+wasi = "0.14"
+
+[workspace]

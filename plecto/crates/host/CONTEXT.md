@@ -79,6 +79,30 @@ _Avoid_: syscall, runtime API（曖昧）
 （超ホット経路は WASM 境界を跨がない）、フィルタは「consult するか・どのキーで」を判断するだけ。
 _Avoid_: throttle, quota（別概念）
 
+**Outbound capability（outbound HTTP）**:
+フィルタが外部へ HTTP を 1 本発行する能力（ext_authz / JWKS 取得 / token introspection / OPA 問い合わせ）。
+標準形 `wasi:http/outgoing-handler` で貸し、他の host-API と同じ deny-by-default ゲート（`Linker`）を通す。
+既定では**貸さない**。貸す瞬間に Outbound allowlist ＋ SSRF guard ＋ 資源境界で囲う（ADR 000036）。
+_Avoid_: fetch, http-client（能力の貸与という含意が出ない）, egress（L4 の含意）
+
+**Outbound allowlist**:
+outbound を貸すフィルタごとに operator が宣言する送信先の許可リスト（scheme + host + port の exact match）。
+operator 所有で**フィルタは上書きできない**（host-ratelimit のバケットと同じ「操作者が限度を持つ」モデル）。
+deny-by-default——列挙外の送信先は拒否する。
+_Avoid_: whitelist（用語）, filter allowlist（フィルタ自身が持つ含意）
+
+**SSRF guard**:
+outbound の送信先を**名前解決後のアドレス**で分類し、link-local（cloud-metadata 含む）/ loopback /
+unspecified / multicast を allowlist と無関係に常時 deny する floor。private（RFC1918 / ULA）は per-filter の
+opt-in（CIDR で絞る）でのみ許可。upstream connector とは独立した専用経路に内蔵する（ADR 000036 / 000027）。
+_Avoid_: firewall, IP filter（汎用で境界の意図が出ない）
+
+**IP-pinned connect**:
+SSRF guard の要。ホスト自身が DNS 解決して全 A/AAAA を分類し、検査を通った**具体 IP に直接**接続する
+（ホスト名で再接続しない）。検査と接続の間の DNS rebinding（TOCTOU）を塞ぐ。TLS の SNI/証明書検証は
+元のホスト名で行う。
+_Avoid_: IP allowlist（allowlist はホスト名側の別段）
+
 ## 可観測性（observability）
 
 **Filter span**:

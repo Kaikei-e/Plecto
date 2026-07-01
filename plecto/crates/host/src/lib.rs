@@ -29,6 +29,14 @@ mod observe;
 mod streaming;
 #[cfg(feature = "streaming-body")]
 pub use streaming::{StreamingDecision, StreamingLimits, run_streaming_body};
+// Outbound HTTP capability for filters (ADR 000036), OFF by default. The pure allowlist + SSRF
+// policy; the wasmtime-wasi-http wiring that enforces it is added in `outbound_http` (same gate).
+#[cfg(feature = "outbound-http")]
+mod outbound;
+#[cfg(feature = "outbound-http")]
+pub use outbound::{AddrVerdict, AllowEntry, OutboundPolicy, Scheme};
+#[cfg(feature = "outbound-http")]
+mod outbound_http;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -169,10 +177,40 @@ fn default_trusted_pool_size() -> usize {
         .clamp(1, TRUSTED_POOL_DEFAULT_CEIL)
 }
 
+// --- outbound HTTP (ADR 000036) clamps. Operator- and guest-supplied timings/sizes are bounded to
+// --- these host maxima so a filter cannot claim an unboundedly long or large outbound call. ---
+/// Default TCP connect timeout for an outbound call.
+#[cfg(feature = "outbound-http")]
+const DEFAULT_OUTBOUND_CONNECT_TIMEOUT_MS: u64 = 2_000;
+/// Host ceiling on the connect timeout.
+#[cfg(feature = "outbound-http")]
+const MAX_OUTBOUND_CONNECT_TIMEOUT_MS: u64 = 10_000;
+/// Default wall-clock ceiling for the whole outbound call (connect + request + response). This is
+/// the host-side I/O deadline epoch interruption cannot provide (ADR 000006 / 000036).
+#[cfg(feature = "outbound-http")]
+const DEFAULT_OUTBOUND_TOTAL_TIMEOUT_MS: u64 = 5_000;
+/// Host ceiling on the total outbound timeout.
+#[cfg(feature = "outbound-http")]
+const MAX_OUTBOUND_TOTAL_TIMEOUT_MS: u64 = 30_000;
+/// Default cap on the response body the host buffers back to the guest.
+#[cfg(feature = "outbound-http")]
+const DEFAULT_OUTBOUND_MAX_RESPONSE_BYTES: u64 = 64 * 1024;
+/// Host ceiling on the response-body cap.
+#[cfg(feature = "outbound-http")]
+const MAX_OUTBOUND_MAX_RESPONSE_BYTES: u64 = 1 << 20;
+/// Default cap on concurrent in-flight outbound calls per filter.
+#[cfg(feature = "outbound-http")]
+const DEFAULT_OUTBOUND_MAX_CONCURRENT: u32 = 8;
+/// Host ceiling on per-filter outbound concurrency.
+#[cfg(feature = "outbound-http")]
+const MAX_OUTBOUND_MAX_CONCURRENT: u32 = 64;
+
 /// Options for `Host::load`. A struct (not a bare arg) because deny-by-default grows more
 /// load-time knobs onto it. Defaults to the safe side: `Untrusted` (fail-closed) with
 /// metering on (ADR 000006). A future declarative manifest (ADR 000007) injects these.
-#[derive(Debug, Clone, Copy)]
+///
+/// Not `Copy`: the outbound policy (ADR 000036) carries an allowlist `Vec`, so this moves/clones.
+#[derive(Debug, Clone)]
 pub struct LoadOptions {
     pub isolation: Isolation,
     /// Epoch deadline (ms) for the once-per-instance `init` export.
@@ -194,6 +232,11 @@ pub struct LoadOptions {
     /// `[filter.ratelimit]`, ADR 000026). `None` = the filter has no limiter (its `try-acquire`
     /// fails closed). Host-configured so an untrusted filter cannot override its own limit.
     pub ratelimit_bucket: Option<Bucket>,
+    /// This filter's outbound HTTP policy (manifest `[filter.outbound]`, ADR 000036): the
+    /// deny-by-default allowlist + SSRF opt-in + resource bounds enforced at the `wasi:http`
+    /// send seam. `None` = the filter is lent no outbound capability (the default).
+    #[cfg(feature = "outbound-http")]
+    pub outbound: Option<outbound::OutboundPolicy>,
 }
 
 impl Default for LoadOptions {
@@ -208,6 +251,8 @@ impl Default for LoadOptions {
             checkout_timeout_ms: DEFAULT_CHECKOUT_TIMEOUT_MS,
             max_requests_per_instance: DEFAULT_MAX_REQUESTS_PER_INSTANCE,
             ratelimit_bucket: None,
+            #[cfg(feature = "outbound-http")]
+            outbound: None,
         }
     }
 }
@@ -266,6 +311,51 @@ impl LoadOptions {
             capacity,
             refill_tokens,
             refill_interval_ms,
+        });
+        self
+    }
+
+    /// Lend this filter the outbound HTTP capability (ADR 000036) with an already-parsed
+    /// allowlist and private-range opt-in. Timings and sizes are clamped to host maxima here —
+    /// operator-supplied values cannot exceed the host ceiling, and guest-supplied request
+    /// options are clamped again at the send seam. The filter cannot supply or widen any of this.
+    #[cfg(feature = "outbound-http")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_outbound(
+        mut self,
+        allow: Vec<outbound::AllowEntry>,
+        allow_private: Vec<String>,
+        connect_timeout_ms: Option<u64>,
+        total_timeout_ms: Option<u64>,
+        max_response_bytes: Option<u64>,
+        max_concurrent: Option<u32>,
+    ) -> Self {
+        let clamp_ms = |v: Option<u64>, def: u64, max: u64| v.unwrap_or(def).clamp(1, max);
+        // Parse the operator's CIDR strings; a malformed one is dropped, leaving that range blocked
+        // (fail-closed). The manifest validates them up front, so this is belt-and-suspenders.
+        let allow_private = allow_private
+            .iter()
+            .filter_map(|c| c.parse::<ipnet::IpNet>().ok())
+            .collect();
+        self.outbound = Some(outbound::OutboundPolicy {
+            allow,
+            allow_private,
+            connect_timeout: Duration::from_millis(clamp_ms(
+                connect_timeout_ms,
+                DEFAULT_OUTBOUND_CONNECT_TIMEOUT_MS,
+                MAX_OUTBOUND_CONNECT_TIMEOUT_MS,
+            )),
+            total_timeout: Duration::from_millis(clamp_ms(
+                total_timeout_ms,
+                DEFAULT_OUTBOUND_TOTAL_TIMEOUT_MS,
+                MAX_OUTBOUND_TOTAL_TIMEOUT_MS,
+            )),
+            max_response_bytes: max_response_bytes
+                .unwrap_or(DEFAULT_OUTBOUND_MAX_RESPONSE_BYTES)
+                .clamp(1, MAX_OUTBOUND_MAX_RESPONSE_BYTES),
+            max_concurrent: max_concurrent
+                .unwrap_or(DEFAULT_OUTBOUND_MAX_CONCURRENT)
+                .clamp(1, MAX_OUTBOUND_MAX_CONCURRENT),
         });
         self
     }
@@ -570,6 +660,18 @@ pub struct HostState {
     /// Shared per-namespace accounting + caps for host-held state. Charged on every
     /// `set` / `increment` / `try_acquire` that grows the store; over-quota writes fail closed.
     quota: Arc<KvQuota>,
+    /// Outbound HTTP (ADR 000036): the minimal WASI base ctx, resource table, `wasi:http` ctx, and
+    /// the SSRF-guarded hooks. `wasi:http` is added to the Linker only for filters with an outbound
+    /// policy; for every other filter `hooks` denies every call (belt-and-suspenders, so a stray
+    /// call still fails closed).
+    #[cfg(feature = "outbound-http")]
+    wasi: wasmtime_wasi::WasiCtx,
+    #[cfg(feature = "outbound-http")]
+    http_ctx: wasmtime_wasi_http::WasiHttpCtx,
+    #[cfg(feature = "outbound-http")]
+    table: wasmtime::component::ResourceTable,
+    #[cfg(feature = "outbound-http")]
+    hooks: outbound_http::PlectoHttpHooks,
 }
 
 impl HostState {
@@ -579,6 +681,7 @@ impl HostState {
         max_memory_bytes: u64,
         ratelimit_bucket: Option<Bucket>,
         quota: Arc<KvQuota>,
+        #[cfg(feature = "outbound-http")] hooks: outbound_http::PlectoHttpHooks,
     ) -> Self {
         Self {
             kv,
@@ -591,6 +694,14 @@ impl HostState {
                 .build(),
             ratelimit_bucket,
             quota,
+            #[cfg(feature = "outbound-http")]
+            wasi: wasmtime_wasi::WasiCtxBuilder::new().build(),
+            #[cfg(feature = "outbound-http")]
+            http_ctx: wasmtime_wasi_http::WasiHttpCtx::new(),
+            #[cfg(feature = "outbound-http")]
+            table: wasmtime::component::ResourceTable::new(),
+            #[cfg(feature = "outbound-http")]
+            hooks,
         }
     }
 
@@ -613,6 +724,47 @@ impl HostState {
 }
 
 // --- host-API capability implementations (deny-by-default: only these are lent) ---
+
+// Outbound HTTP (ADR 000036): the WASI base + wasi:http projections, added to the Linker only for
+// filters with an outbound policy. They share one resource table.
+#[cfg(feature = "outbound-http")]
+impl wasmtime_wasi::WasiView for HostState {
+    fn ctx(&mut self) -> wasmtime_wasi::WasiCtxView<'_> {
+        wasmtime_wasi::WasiCtxView {
+            ctx: &mut self.wasi,
+            table: &mut self.table,
+        }
+    }
+}
+
+#[cfg(feature = "outbound-http")]
+impl wasmtime_wasi_http::p2::WasiHttpView for HostState {
+    fn http(&mut self) -> wasmtime_wasi_http::p2::WasiHttpCtxView<'_> {
+        wasmtime_wasi_http::p2::WasiHttpCtxView {
+            ctx: &mut self.http_ctx,
+            table: &mut self.table,
+            hooks: &mut self.hooks,
+        }
+    }
+}
+
+/// Add the wasi:cli interfaces the std guest's runtime imports beyond the proxy slice (environment /
+/// exit / terminal-*), each inert under the empty `WasiCtx`. Adds NO filesystem and NO sockets, so
+/// those capabilities stay denied (security audit F-002; mirrors the streaming path).
+#[cfg(feature = "outbound-http")]
+fn add_cli_runtime(linker: &mut Linker<HostState>) -> Result<()> {
+    use wasmtime_wasi::cli::{WasiCli, WasiCliView};
+    use wasmtime_wasi::p2::bindings::cli;
+    let getter = <HostState as WasiCliView>::cli;
+    cli::environment::add_to_linker::<HostState, WasiCli>(linker, getter)?;
+    cli::exit::add_to_linker::<HostState, WasiCli>(linker, getter)?;
+    cli::terminal_input::add_to_linker::<HostState, WasiCli>(linker, getter)?;
+    cli::terminal_output::add_to_linker::<HostState, WasiCli>(linker, getter)?;
+    cli::terminal_stdin::add_to_linker::<HostState, WasiCli>(linker, getter)?;
+    cli::terminal_stdout::add_to_linker::<HostState, WasiCli>(linker, getter)?;
+    cli::terminal_stderr::add_to_linker::<HostState, WasiCli>(linker, getter)?;
+    Ok(())
+}
 
 // `types` is a type-only interface (no functions); the generated `Host` trait is empty.
 impl bindings::plecto::filter::types::Host for HostState {}
@@ -793,6 +945,11 @@ pub struct Host {
     /// Where loaded filters emit their per-execution spans (ADR 000009). Default `NoopSink`
     /// (observability off); cloned into each filter at `load`, so set it before loading.
     sink: Arc<dyn TelemetrySink>,
+    /// Shared tokio runtime that drives outbound-using filters (ADR 000036): their guest calls block
+    /// on real socket I/O, which the no-reactor pollster executor cannot service. Cloned into each
+    /// outbound filter at `load`; unused by (and invisible to) filters without an outbound policy.
+    #[cfg(feature = "outbound-http")]
+    outbound_rt: Arc<tokio::runtime::Runtime>,
     /// Drives epoch deadlines for both engines; stops on drop. Held only for its lifetime.
     _epoch_ticker: EpochTicker,
 }
@@ -809,6 +966,10 @@ enum Allocation {
 fn build_engine(alloc: Allocation) -> Result<Engine> {
     let mut config = Config::new();
     config.wasm_component_model(true);
+    // Outbound HTTP (ADR 000036) lends the async `wasi:http` interfaces; enable the Component Model
+    // async ABI so they link. Off by default; a non-async guest is unaffected by the flag.
+    #[cfg(feature = "outbound-http")]
+    config.wasm_component_model_async(true);
     // epoch interruption: the low-overhead deadline mechanism for the data plane (ADR 000006;
     // epoch over fuel — lighter, no determinism requirement here). A background ticker
     // advances the epoch; each Store sets a deadline before every guest call so a runaway
@@ -853,6 +1014,17 @@ impl Host {
         let untrusted_engine = build_engine(Allocation::OnDemand)?;
         let _epoch_ticker =
             EpochTicker::spawn(vec![trusted_engine.clone(), untrusted_engine.clone()]);
+        // A MULTI-thread runtime (not current-thread): the host's public API is sync and driven from
+        // arbitrary worker threads, so `block_on` must be safe to call concurrently from several
+        // threads — a current-thread runtime serializes/contends there. Two workers suffice (outbound
+        // is I/O-bound, not CPU-bound) and bound the extra thread count (security-auditor F-001).
+        #[cfg(feature = "outbound-http")]
+        let outbound_rt = Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()?,
+        );
         Ok(Self {
             trusted_engine,
             untrusted_engine,
@@ -860,6 +1032,8 @@ impl Host {
             kv_quota: Arc::new(KvQuota::new()),
             trust,
             sink: Arc::new(NoopSink),
+            #[cfg(feature = "outbound-http")]
+            outbound_rt,
             _epoch_ticker,
         })
     }
@@ -923,8 +1097,26 @@ impl Host {
         let component = Component::from_binary(engine, component_bytes)?;
         let mut linker = Linker::<HostState>::new(engine);
         // deny-by-default: lend ONLY the plecto host-API (all five interfaces at once).
-        // No WASI is added.
+        // No WASI is added — unless this filter has an outbound policy (below).
         Filter::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s: &mut HostState| s)?;
+
+        // Outbound HTTP (ADR 000036): only when the operator lent this filter an allowlist do we add
+        // the MINIMAL WASI base (io / clocks / random / stdio — NO fs, NO sockets, NO cli) plus
+        // `wasi:http/outgoing-handler`, still deny-by-default (every call is gated by the SSRF-guarded
+        // hooks). A filter without a policy links no WASI at all, exactly as before.
+        #[cfg(feature = "outbound-http")]
+        let outbound = if let Some(policy) = opts.outbound.clone() {
+            wasmtime_wasi::p2::add_to_linker_proxy_interfaces_async(&mut linker)?;
+            // The std guest's runtime also imports the rest of wasi:cli (environment / exit /
+            // terminal-*), each inert under the empty `WasiCtx`. Still NO filesystem, NO sockets — the
+            // capability boundary that matters (mirrors the streaming path, security audit F-002).
+            add_cli_runtime(&mut linker)?;
+            wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)?;
+            Some(outbound_http::OutboundState::new(policy))
+        } else {
+            None
+        };
+
         let pre = FilterPre::new(linker.instantiate_pre(&component)?)?;
 
         let inner = LoadedInner {
@@ -940,6 +1132,10 @@ impl Host {
             max_memory_bytes: opts.max_memory_bytes,
             ratelimit_bucket: opts.ratelimit_bucket,
             kv_quota: self.kv_quota.clone(),
+            #[cfg(feature = "outbound-http")]
+            rt: outbound.is_some().then(|| self.outbound_rt.clone()),
+            #[cfg(feature = "outbound-http")]
+            outbound,
         };
 
         let trusted = match opts.isolation {
@@ -979,9 +1175,38 @@ struct LoadedInner {
     max_memory_bytes: u64,
     ratelimit_bucket: Option<Bucket>,
     kv_quota: Arc<KvQuota>,
+    /// This filter's outbound HTTP state (ADR 000036): allowlist + SSRF policy + shared concurrency
+    /// semaphore. `Some` only when the manifest lent it an allowlist.
+    #[cfg(feature = "outbound-http")]
+    outbound: Option<outbound_http::OutboundState>,
+    /// The shared tokio runtime, cloned from the `Host`, present only for outbound-using filters —
+    /// their guest calls block on real I/O the pollster executor cannot drive.
+    #[cfg(feature = "outbound-http")]
+    rt: Option<Arc<tokio::runtime::Runtime>>,
 }
 
 impl LoadedInner {
+    /// Drive a guest call to completion. A filter without outbound uses the no-reactor `pollster`
+    /// (its host-API imports never block); an outbound-using filter uses the tokio runtime so its
+    /// `wasi:http` socket I/O is serviced and bounded by `tokio::time::timeout` (ADR 000036).
+    fn drive<F: std::future::Future>(&self, fut: F) -> F::Output {
+        #[cfg(feature = "outbound-http")]
+        if let Some(rt) = &self.rt {
+            return rt.block_on(fut);
+        }
+        pollster::block_on(fut)
+    }
+
+    /// The per-Store outbound hooks: the real SSRF-guarded hooks for an outbound filter, or a
+    /// deny-all handle otherwise (belt-and-suspenders; those filters link no `wasi:http`).
+    #[cfg(feature = "outbound-http")]
+    fn outbound_hooks(&self) -> outbound_http::PlectoHttpHooks {
+        match &self.outbound {
+            Some(state) => state.hooks(),
+            None => outbound_http::PlectoHttpHooks::deny_all(),
+        }
+    }
+
     /// Instantiate a fresh instance and run `init` once, under the `init` epoch deadline and
     /// the Store memory limit (ADR 000006).
     fn instantiate_initialized(&self) -> Result<Instance> {
@@ -993,15 +1218,17 @@ impl LoadedInner {
                 self.max_memory_bytes,
                 self.ratelimit_bucket,
                 self.kv_quota.clone(),
+                #[cfg(feature = "outbound-http")]
+                self.outbound_hooks(),
             ),
         );
         store.limiter(|s| &mut s.limits);
         // `init` is heavy (Tenet 4) → the generous init budget, not the tight per-request one.
         store.set_epoch_deadline(self.init_deadline_ms);
-        // Async (ADR 000021): the guest runs on a fiber; `block_on` drives it to completion (it
-        // never suspends — epoch is trap-mode, host-API imports don't block) so this stays sync.
-        let filter = pollster::block_on(self.pre.instantiate_async(&mut store))?;
-        pollster::block_on(filter.call_init(&mut store))?;
+        // Async (ADR 000021): the guest runs on a fiber; `drive` runs it to completion — pollster for
+        // the sync host-API path, the tokio runtime when the guest may issue outbound I/O (ADR 000036).
+        let filter = self.drive(self.pre.instantiate_async(&mut store))?;
+        self.drive(filter.call_init(&mut store))?;
         Ok(Instance { store, filter })
     }
 
@@ -1257,7 +1484,7 @@ impl LoadedFilter {
         match &self.trusted {
             // trusted: check an instance out of the pool (reuse / lazily build / fail closed).
             Some(pool) => self.inner.run_pooled(pool, |filter, store| {
-                pollster::block_on(filter.call_on_request(store, req))
+                self.inner.drive(filter.call_on_request(store, req))
             }),
             // untrusted: fresh instance + init every request (the isolation trade).
             None => {
@@ -1267,7 +1494,10 @@ impl LoadedFilter {
                     .map_err(RunError::Instantiate)?;
                 inst.store
                     .set_epoch_deadline(self.inner.request_deadline_ms);
-                match pollster::block_on(inst.filter.call_on_request(&mut inst.store, req)) {
+                match self
+                    .inner
+                    .drive(inst.filter.call_on_request(&mut inst.store, req))
+                {
                     Ok(decision) => {
                         let logs = std::mem::take(&mut inst.store.data_mut().logs);
                         Ok((decision, logs))
@@ -1312,7 +1542,7 @@ impl LoadedFilter {
     ) -> std::result::Result<(RequestBodyDecision, Vec<LogLine>), RunError> {
         match &self.trusted {
             Some(pool) => self.inner.run_pooled(pool, |filter, store| {
-                pollster::block_on(filter.call_on_request_body(store, body))
+                self.inner.drive(filter.call_on_request_body(store, body))
             }),
             None => {
                 let mut inst = self
@@ -1321,7 +1551,10 @@ impl LoadedFilter {
                     .map_err(RunError::Instantiate)?;
                 inst.store
                     .set_epoch_deadline(self.inner.request_deadline_ms);
-                match pollster::block_on(inst.filter.call_on_request_body(&mut inst.store, body)) {
+                match self
+                    .inner
+                    .drive(inst.filter.call_on_request_body(&mut inst.store, body))
+                {
                     Ok(decision) => {
                         let logs = std::mem::take(&mut inst.store.data_mut().logs);
                         Ok((decision, logs))
@@ -1392,7 +1625,7 @@ impl LoadedFilter {
     ) -> std::result::Result<(ResponseDecision, Vec<LogLine>), RunError> {
         match &self.trusted {
             Some(pool) => self.inner.run_pooled(pool, |filter, store| {
-                pollster::block_on(filter.call_on_response(store, resp))
+                self.inner.drive(filter.call_on_response(store, resp))
             }),
             None => {
                 let mut inst = self
@@ -1401,7 +1634,10 @@ impl LoadedFilter {
                     .map_err(RunError::Instantiate)?;
                 inst.store
                     .set_epoch_deadline(self.inner.request_deadline_ms);
-                match pollster::block_on(inst.filter.call_on_response(&mut inst.store, resp)) {
+                match self
+                    .inner
+                    .drive(inst.filter.call_on_response(&mut inst.store, resp))
+                {
                     Ok(decision) => {
                         let logs = std::mem::take(&mut inst.store.data_mut().logs);
                         Ok((decision, logs))
@@ -1478,6 +1714,13 @@ pub mod test_support {
         std::fs::read(env!("FILTER_APIKEY_COMPONENT")).expect("read filter-apikey component")
     }
 
+    /// The compiled `filter-extauthz` component bytes — the outbound-HTTP example (an ext_authz-style
+    /// gate), built by this crate's `build.rs` when the `outbound-http` feature is on (ADR 000036).
+    #[cfg(feature = "outbound-http")]
+    pub fn filter_extauthz_component() -> Vec<u8> {
+        std::fs::read(env!("FILTER_EXTAUTHZ_COMPONENT")).expect("read filter-extauthz component")
+    }
+
     /// A minimal in-toto-style SBOM statement that binds `component`: its `subject` digest is
     /// `sha256(component)`, satisfying the load gate's SBOM↔component binding (review f000003
     /// #1). The predicate is empty (content policy is deferred). Test / dev helper — real
@@ -1508,6 +1751,8 @@ mod tests {
             DEFAULT_MAX_MEMORY_BYTES,
             None,
             Arc::new(KvQuota::new()),
+            #[cfg(feature = "outbound-http")]
+            outbound_http::PlectoHttpHooks::deny_all(),
         )
     }
 
@@ -1532,6 +1777,8 @@ mod tests {
             DEFAULT_MAX_MEMORY_BYTES,
             None,
             Arc::new(KvQuota::new()),
+            #[cfg(feature = "outbound-http")]
+            outbound_http::PlectoHttpHooks::deny_all(),
         );
         let mut b = HostState::new(
             shared.clone(),
@@ -1539,6 +1786,8 @@ mod tests {
             DEFAULT_MAX_MEMORY_BYTES,
             None,
             Arc::new(KvQuota::new()),
+            #[cfg(feature = "outbound-http")]
+            outbound_http::PlectoHttpHooks::deny_all(),
         );
 
         KvHost::set(&mut a, "count".into(), b"1".to_vec());
@@ -1566,6 +1815,8 @@ mod tests {
             DEFAULT_MAX_MEMORY_BYTES,
             None,
             Arc::new(KvQuota::new()),
+            #[cfg(feature = "outbound-http")]
+            outbound_http::PlectoHttpHooks::deny_all(),
         );
         let mut b = HostState::new(
             shared.clone(),
@@ -1573,6 +1824,8 @@ mod tests {
             DEFAULT_MAX_MEMORY_BYTES,
             None,
             Arc::new(KvQuota::new()),
+            #[cfg(feature = "outbound-http")]
+            outbound_http::PlectoHttpHooks::deny_all(),
         );
 
         assert_eq!(CounterHost::increment(&mut a, "hits".into(), 5), 5);
@@ -1615,6 +1868,8 @@ mod tests {
             DEFAULT_MAX_MEMORY_BYTES,
             Some(one_token_no_refill()),
             Arc::new(KvQuota::new()),
+            #[cfg(feature = "outbound-http")]
+            outbound_http::PlectoHttpHooks::deny_all(),
         );
         let mut b = HostState::new(
             shared.clone(),
@@ -1622,6 +1877,8 @@ mod tests {
             DEFAULT_MAX_MEMORY_BYTES,
             Some(one_token_no_refill()),
             Arc::new(KvQuota::new()),
+            #[cfg(feature = "outbound-http")]
+            outbound_http::PlectoHttpHooks::deny_all(),
         );
 
         // a drains its single-token bucket on key "k".

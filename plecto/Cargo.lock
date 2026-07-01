@@ -1958,6 +1958,7 @@ dependencies = [
  "anyhow",
  "arc-swap",
  "hex",
+ "ipnet",
  "oci-spec",
  "parking_lot",
  "plecto-host",
@@ -1978,18 +1979,27 @@ name = "plecto-host"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "hex",
+ "http-body-util",
+ "hyper",
+ "ipnet",
  "opentelemetry",
  "parking_lot",
  "pollster",
  "redb",
+ "rustls",
  "serde_json",
  "sha2 0.10.9",
  "sigstore",
  "tempfile",
+ "tokio",
+ "tokio-rustls",
  "tracing",
  "wasmtime",
  "wasmtime-wasi",
+ "wasmtime-wasi-http",
+ "webpki-roots 0.26.11",
  "wit-component",
 ]
 
@@ -3613,6 +3623,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "wasmtime-wasi-http"
+version = "46.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cb65eeb8116615c2a22f51b19672c0d5b652ca7b051086da5c7c0a9eb39f4af7"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "futures",
+ "http",
+ "http-body",
+ "http-body-util",
+ "hyper",
+ "rustls",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "wasmtime",
+ "wasmtime-wasi",
+ "wasmtime-wasi-io",
+ "webpki-roots 0.26.11",
+]
+
+[[package]]
 name = "wasmtime-wasi-io"
 version = "46.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3664,6 +3697,24 @@ checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "0.26.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
+dependencies = [
+ "webpki-roots 1.0.8",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "1.0.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf85cb06032201fa7c6f829d7db5a7e5aa45bcc0655327713065f6f0576731bf"
+dependencies = [
+ "rustls-pki-types",
 ]
 
 [[package]]

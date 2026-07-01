@@ -3,6 +3,7 @@ plecto/target
 plecto/examples/filters/filter-hello/target
 plecto/examples/filters/filter-apikey/target
 plecto/examples/filters/filter-streaming/target
+plecto/examples/filters/filter-extauthz/target
 plecto/spike/streaming-async/guest/target
 plecto/spike/streaming-async/host/target
 docs/feedback

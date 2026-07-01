@@ -54,6 +54,10 @@ opentelemetry = { version = "0.32", default-features = false, features = ["trace
 # --- chain dispatch, atomic hot-reload. ---
 # thiserror: typed domain errors in the control library layer (bp-rust).
 thiserror = "2"
+# ipnet: CIDR parsing/containment for the outbound `allow_private` opt-in ranges (ADR 000036).
+# Optional in both crates behind their `outbound-http` feature; pinned here to keep versions aligned
+# (the parsed `IpNet` crosses the control→host boundary).
+ipnet = "2"
 # serde + toml: the declarative manifest (ADR 000008 static config). TOML mirrors Cargo.
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
