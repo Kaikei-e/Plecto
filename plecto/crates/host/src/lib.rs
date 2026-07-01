@@ -80,6 +80,7 @@ pub use bindings::plecto::filter::types::{
 };
 use bindings::plecto::filter::{host_clock, host_counter, host_kv, host_log, host_ratelimit};
 use bindings::{Filter, FilterPre};
+use wasmtime::component::ComponentExportIndex;
 
 /// How a filter is instantiated and isolated (ADR 000004 / 000011). Not a "trust score":
 /// it selects the **instance lifecycle**, mirroring how Fastly/Spin model per-request vs
@@ -1008,6 +1009,16 @@ impl Host {
         Self::with_backend(trust, Arc::new(MemoryBackend::default()))
     }
 
+    /// Read-only residency metrics for the trusted (pooling) engine (wasmtime 46
+    /// `PoolingAllocatorMetrics`). A cheap, cloneable handle for perf probes / observability —
+    /// not the hot path. `unused_memory_bytes_resident()` reports bytes kept resident for
+    /// unused-but-warm pool slots (`linear_memory_keep_resident`, left at its default 0 here, so
+    /// this is expected to read ~0); `memories()` / `component_instances()` report the live count.
+    /// `None` if the trusted engine is not pooling (it always is here, so this returns `Some`).
+    pub fn pooling_allocator_metrics(&self) -> Option<wasmtime::PoolingAllocatorMetrics> {
+        self.trusted_engine.pooling_allocator_metrics()
+    }
+
     /// A host backed by a caller-supplied store (e.g. `RedbBackend` for durability).
     pub fn with_backend(trust: TrustPolicy, kv: Arc<dyn KvBackend>) -> Result<Self> {
         let trusted_engine = build_engine(Allocation::Pooling)?;
@@ -1118,6 +1129,11 @@ impl Host {
         };
 
         let pre = FilterPre::new(linker.instantiate_pre(&component)?)?;
+        // Zero-copy body bypass (ADR 000038 / ADR 000005 mechanism 2): a filter that inspects or
+        // transforms the request body ALSO exports `on-request-body` (world `filter-body`). Detect
+        // that export ONCE here; its absence tells the fast path the body never enters guest memory,
+        // so it streams straight through instead of buffering (fail-closed: presence ⇒ buffer).
+        let body_export = component.get_export_index(None, "on-request-body");
 
         let inner = LoadedInner {
             engine: engine.clone(),
@@ -1126,6 +1142,7 @@ impl Host {
             filter_id: filter_id.to_string(),
             sink: self.sink.clone(),
             pre,
+            body_export,
             isolation: opts.isolation,
             init_deadline_ms: opts.init_deadline_ms,
             request_deadline_ms: opts.request_deadline_ms,
@@ -1169,6 +1186,10 @@ struct LoadedInner {
     /// Where this filter's per-execution spans go (cloned from the `Host` at load).
     sink: Arc<dyn TelemetrySink>,
     pre: FilterPre<HostState>,
+    /// Export index of the guest's `on-request-body` hook (world `filter-body`), or `None` for a
+    /// header-only filter. `Some` is the ONLY signal that makes the fast path buffer the body
+    /// (ADR 000038 / ADR 000005 mechanism 2); absence keeps the body on the zero-copy stream path.
+    body_export: Option<ComponentExportIndex>,
     isolation: Isolation,
     init_deadline_ms: u64,
     request_deadline_ms: u64,
@@ -1195,6 +1216,27 @@ impl LoadedInner {
             return rt.block_on(fut);
         }
         pollster::block_on(fut)
+    }
+
+    /// Call the guest's optional `on-request-body` export (world `filter-body`) on an
+    /// already-instantiated instance. Because the export is OPTIONAL it is looked up by index
+    /// (`idx`, resolved once at load) rather than through the base `filter` bindgen, then called
+    /// with the buffered body borrowed (zero extra host-side copy). `post-return` is driven before
+    /// the instance can be reused (a pooled instance survives the call). The caller only reaches
+    /// here for a body-reading filter (`body_export` is `Some`).
+    fn call_body_hook(
+        &self,
+        inst: &mut Instance,
+        idx: &ComponentExportIndex,
+        body: &[u8],
+    ) -> wasmtime::Result<RequestBodyDecision> {
+        let func = inst
+            .instance
+            .get_typed_func::<(&[u8],), (RequestBodyDecision,)>(&mut inst.store, idx)?;
+        // wasmtime 46: component `post-return` is handled internally and no longer needs an explicit
+        // call, so a single `call_async` is the whole interaction.
+        let (decision,) = self.drive(func.call_async(&mut inst.store, (body,)))?;
+        Ok(decision)
     }
 
     /// The per-Store outbound hooks: the real SSRF-guarded hooks for an outbound filter, or a
@@ -1227,9 +1269,16 @@ impl LoadedInner {
         store.set_epoch_deadline(self.init_deadline_ms);
         // Async (ADR 000021): the guest runs on a fiber; `drive` runs it to completion — pollster for
         // the sync host-API path, the tokio runtime when the guest may issue outbound I/O (ADR 000036).
-        let filter = self.drive(self.pre.instantiate_async(&mut store))?;
+        // Two-step instantiate (raw instance + typed view) so the raw `Instance` survives for the
+        // optional body-hook lookup; `Filter` still drives the required init / on-request / on-response.
+        let instance = self.drive(self.pre.instance_pre().instantiate_async(&mut store))?;
+        let filter = Filter::new(&mut store, &instance)?;
         self.drive(filter.call_init(&mut store))?;
-        Ok(Instance { store, filter })
+        Ok(Instance {
+            store,
+            filter,
+            instance,
+        })
     }
 
     /// Check out a trusted instance from the pool (ADR 000012): reuse an idle one, lazily build
@@ -1301,7 +1350,7 @@ impl LoadedInner {
     fn run_pooled<T>(
         &self,
         pool: &TrustedPool,
-        call: impl FnOnce(&Filter, &mut Store<HostState>) -> wasmtime::Result<T>,
+        call: impl FnOnce(&mut Instance) -> wasmtime::Result<T>,
     ) -> std::result::Result<(T, Vec<LogLine>), RunError> {
         let mut pooled = self.checkout(pool)?;
 
@@ -1310,7 +1359,7 @@ impl LoadedInner {
             .instance
             .store
             .set_epoch_deadline(self.request_deadline_ms);
-        let result = call(&pooled.instance.filter, &mut pooled.instance.store);
+        let result = call(&mut pooled.instance);
 
         match result {
             Ok(value) => {
@@ -1355,6 +1404,9 @@ impl LoadedInner {
 struct Instance {
     store: Store<HostState>,
     filter: Filter,
+    /// The raw component instance, kept so the optional `on-request-body` export (world
+    /// `filter-body`, not part of the base `filter` bindgen) can be looked up and called by index.
+    instance: wasmtime::component::Instance,
 }
 
 /// Consecutive trusted-pool traps before the circuit-breaker opens a cooldown (review f000003
@@ -1449,6 +1501,15 @@ impl LoadedFilter {
         self.inner.isolation
     }
 
+    /// Whether this filter reads the request body — i.e. it exports `on-request-body` (world
+    /// `filter-body`). The fast path buffers the body ONLY for a route with at least one such
+    /// filter; a route of header-only filters keeps the zero-copy streaming path (ADR 000038 /
+    /// ADR 000005 mechanism 2). Detected from the component's exports at load, so it is sound
+    /// (fail-closed): a filter cannot read the body without declaring it in the contract.
+    pub fn reads_body(&self) -> bool {
+        self.inner.body_export.is_some()
+    }
+
     /// Run the request-side hook under the request's trace context (`trace`, ADR 000009). The
     /// host times the call and emits one span — parented by `trace`, carrying the outcome and
     /// the filter's host-log lines as events — to its `TelemetrySink`. Returns the typed
@@ -1483,8 +1544,9 @@ impl LoadedFilter {
     ) -> std::result::Result<(RequestDecision, Vec<LogLine>), RunError> {
         match &self.trusted {
             // trusted: check an instance out of the pool (reuse / lazily build / fail closed).
-            Some(pool) => self.inner.run_pooled(pool, |filter, store| {
-                self.inner.drive(filter.call_on_request(store, req))
+            Some(pool) => self.inner.run_pooled(pool, |inst| {
+                self.inner
+                    .drive(inst.filter.call_on_request(&mut inst.store, req))
             }),
             // untrusted: fresh instance + init every request (the isolation trade).
             None => {
@@ -1540,10 +1602,16 @@ impl LoadedFilter {
         &self,
         body: &[u8],
     ) -> std::result::Result<(RequestBodyDecision, Vec<LogLine>), RunError> {
+        // Header-only filter: no `on-request-body` export, so the body never enters guest memory.
+        // The fast path already skips buffering (`reads_body()` is false); this is the defensive
+        // floor — pass the body through unchanged without instantiating anything.
+        let Some(idx) = self.inner.body_export.as_ref() else {
+            return Ok((RequestBodyDecision::Continue(body.to_vec()), Vec::new()));
+        };
         match &self.trusted {
-            Some(pool) => self.inner.run_pooled(pool, |filter, store| {
-                self.inner.drive(filter.call_on_request_body(store, body))
-            }),
+            Some(pool) => self
+                .inner
+                .run_pooled(pool, |inst| self.inner.call_body_hook(inst, idx, body)),
             None => {
                 let mut inst = self
                     .inner
@@ -1551,10 +1619,7 @@ impl LoadedFilter {
                     .map_err(RunError::Instantiate)?;
                 inst.store
                     .set_epoch_deadline(self.inner.request_deadline_ms);
-                match self
-                    .inner
-                    .drive(inst.filter.call_on_request_body(&mut inst.store, body))
-                {
+                match self.inner.call_body_hook(&mut inst, idx, body) {
                     Ok(decision) => {
                         let logs = std::mem::take(&mut inst.store.data_mut().logs);
                         Ok((decision, logs))
@@ -1624,8 +1689,9 @@ impl LoadedFilter {
         resp: &HttpResponse,
     ) -> std::result::Result<(ResponseDecision, Vec<LogLine>), RunError> {
         match &self.trusted {
-            Some(pool) => self.inner.run_pooled(pool, |filter, store| {
-                self.inner.drive(filter.call_on_response(store, resp))
+            Some(pool) => self.inner.run_pooled(pool, |inst| {
+                self.inner
+                    .drive(inst.filter.call_on_response(&mut inst.store, resp))
             }),
             None => {
                 let mut inst = self

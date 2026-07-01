@@ -45,11 +45,10 @@ impl Guest for MyFilter {
         RequestDecision::Continue
     }
 
-    fn on_request_body(body: Vec<u8>) -> RequestBodyDecision {
-        // The host buffered the whole request body and handed it over (buffer-then-decide).
-        // Return it (possibly transformed) to continue, or synthesise a response to short-circuit.
-        RequestBodyDecision::Continue(body)
-    }
+    // This starter is header-only (world `filter`): it never reads the request body, so the host
+    // streams the body straight through (zero-copy). To inspect or transform the body, target world
+    // `filter-body` in the `generate!` above and add `fn on_request_body(body: Vec<u8>) ->
+    // RequestBodyDecision` — its presence is what makes the host buffer the body (ADR 000038).
 
     fn on_response(_resp: HttpResponse) -> ResponseDecision {
         ResponseDecision::Continue

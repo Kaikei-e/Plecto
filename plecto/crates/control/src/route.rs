@@ -35,6 +35,10 @@ pub(crate) struct CompiledRoute {
     pub(crate) query: Vec<(String, String)>,
     /// This route's inline chain (filter ids, in order).
     pub(crate) filters: Vec<String>,
+    /// Whether any filter on this route reads the request body (exports `on-request-body`, ADR
+    /// 000038). Precomputed at build from the loaded filters so per-request buffering is a single
+    /// bool check. `false` (all filters header-only) keeps the body on the zero-copy stream path.
+    pub(crate) reads_body: bool,
     /// The route's forwarding target: a weighted set of upstream groups (a single `upstream` is a
     /// one-element set). The fast path picks a group via [`WeightedBackends::pick`], then the group
     /// picks a healthy instance. `Arc`-shared so the split cursor persists across a config generation.
@@ -64,10 +68,12 @@ pub struct RouteInfo {
     pub index: usize,
     pub(crate) backends: Arc<WeightedBackends>,
     pub strip_prefix: Option<String>,
-    /// Whether this route has any filters. The fast path only buffers a request body for the
-    /// `on-request-body` hook (ADR 000025) when there is a filter to run; a filterless route keeps
-    /// the zero-copy streaming path.
+    /// Whether this route has any filters (drives the header-side chain dispatch).
     pub has_filters: bool,
+    /// Whether any filter on this route reads the request body (exports `on-request-body`, ADR
+    /// 000038). The fast path buffers the body ONLY when this is `true`; a route of header-only
+    /// filters keeps the zero-copy streaming path (the real fix for the body-tax, docs/servey).
+    pub reads_body: bool,
     /// This route's native rate limiter (ADR 000033), or `None` for unlimited. `Arc`-shared with the
     /// live config so the per-request `RouteInfo` consults the route's persistent buckets.
     pub(crate) rate_limit: Option<Arc<NativeRateLimit>>,
@@ -356,6 +362,7 @@ mod tests {
             headers: vec![],
             query: vec![],
             filters: vec![],
+            reads_body: false,
             backends: backends(upstream),
             strip_prefix: None,
             rate_limit: None,

@@ -136,6 +136,8 @@ interface host-ratelimit {
     try-acquire: func(key: string, cost: u64) -> acquire;
 }
 
+// Base contract: header-only filters implement exactly this. The ABSENCE of `on-request-body`
+// tells the host the filter never reads the body, so it streams straight through (ADR 000038).
 world filter {
     use types.{http-request, http-response, request-decision, response-decision, request-body-decision};
 
@@ -151,9 +153,22 @@ world filter {
 
     // hot path — one call per request / response
     export on-request: func(req: http-request) -> request-decision;
-    // body filter (buffer-then-decide, ADR 000025). v1: every filter exports it; the
-    // export-presence-based zero-copy bypass for header-only filters (ADR 000005 mechanism 2) is a
-    // follow-up. The host buffers the request body, calls this, and applies the decision.
+    export on-response: func(resp: http-response) -> response-decision;
+}
+
+// Body-reading contract: a filter that inspects or transforms the request body ALSO exports
+// `on-request-body` (buffer-then-decide, ADR 000025). Its presence makes the host buffer the body.
+world filter-body {
+    use types.{http-request, http-response, request-decision, response-decision, request-body-decision};
+
+    import host-log;
+    import host-clock;
+    import host-kv;
+    import host-counter;
+    import host-ratelimit;
+
+    export init: func();
+    export on-request: func(req: http-request) -> request-decision;
     export on-request-body: func(body: list<u8>) -> request-body-decision;
     export on-response: func(resp: http-response) -> response-decision;
 }

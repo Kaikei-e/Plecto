@@ -14,7 +14,7 @@
 
 wit_bindgen::generate!({
     path: "../../../plecto/wit",
-    world: "filter",
+    world: "filter-body",
 });
 
 struct FilterNoop;

@@ -11,7 +11,9 @@ use plecto_control::{
     MemoryStore, ResolvedArtifact,
 };
 use plecto_host::Header;
-use plecto_host::test_support::{TestSigner, bound_sbom, filter_hello_component};
+use plecto_host::test_support::{
+    TestSigner, bound_sbom, filter_hello_component, filter_quickstart_component,
+};
 
 fn req(headers: &[(&str, &str)]) -> HttpRequest {
     HttpRequest {
@@ -64,6 +66,93 @@ isolation = "untrusted"
 filters = [{chain_list}]
 "#
     )
+}
+
+/// Sign arbitrary component bytes into a self-consistent `ResolvedArtifact` (bytes + bound SBOM +
+/// both DER signatures) with `signer`.
+fn signed(component: Vec<u8>, signer: &TestSigner) -> ResolvedArtifact {
+    let component_signature = signer.sign(&component).unwrap();
+    let sbom = bound_sbom(&component);
+    let sbom_signature = signer.sign(&sbom).unwrap();
+    ResolvedArtifact {
+        component,
+        component_signature,
+        sbom,
+        sbom_signature,
+    }
+}
+
+/// A GET request at `path` (route matching reads the path prefix; headers are irrelevant here).
+fn req_path(path: &str) -> HttpRequest {
+    let mut r = req(&[]);
+    r.path = path.to_string();
+    r
+}
+
+#[test]
+fn route_reads_body_only_when_a_filter_exports_the_body_hook() {
+    // ADR 000038: a route buffers the request body IFF one of its filters actually reads it (exports
+    // `on-request-body`). filter-hello (world `filter-body`) does; filter-quickstart (header-only)
+    // does not. This pins the control-side aggregation and the `RouteInfo.reads_body` the fast path
+    // reads to decide whether to buffer — the seam that turns the export-presence signal into a
+    // zero-copy streaming passthrough.
+    let signer = TestSigner::new().unwrap();
+    let mut store = MemoryStore::new();
+    let body_digest = store.insert("body", signed(filter_hello_component(), &signer));
+    let hdr_digest = store.insert("hdr", signed(filter_quickstart_component(), &signer));
+    let manifest_toml = format!(
+        r#"
+[[filter]]
+id = "body"
+source = "body"
+digest = "{body_digest}"
+isolation = "untrusted"
+
+[[filter]]
+id = "hdr"
+source = "hdr"
+digest = "{hdr_digest}"
+isolation = "untrusted"
+
+[[upstream]]
+name = "be"
+addresses = ["127.0.0.1:9"]
+[upstream.health]
+path = "/"
+
+[[route]]
+filters = ["body"]
+upstream = "be"
+[route.match]
+path_prefix = "/body"
+
+[[route]]
+filters = ["hdr"]
+upstream = "be"
+[route.match]
+path_prefix = "/headers"
+"#
+    );
+    let host = Host::new(signer.trust_policy().unwrap()).unwrap();
+    let manifest = Manifest::from_toml(&manifest_toml).unwrap();
+    let control = Control::load(host, &manifest, Box::new(store)).unwrap();
+    let snap = control.snapshot();
+
+    let body_route = snap
+        .find_route(&req_path("/body/x"))
+        .expect("the /body route must match");
+    assert!(
+        body_route.reads_body,
+        "a route with a body-reading filter must set reads_body (host buffers the body)"
+    );
+
+    let hdr_route = snap
+        .find_route(&req_path("/headers/x"))
+        .expect("the /headers route must match");
+    assert!(
+        !hdr_route.reads_body,
+        "a route of only header-only filters must NOT buffer the body (zero-copy passthrough)"
+    );
 }
 
 /// A control plane with filter-hello loaded and the given chain order.

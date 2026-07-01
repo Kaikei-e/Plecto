@@ -62,8 +62,24 @@ name = "edge-bench"
 # A benchmark harness, not a learning example — it lives under bench/ (see performance/README.md).
 path = "../../../bench/harnesses/edge-bench/main.rs"
 
+# Standalone upstream for the memory matrix (mem-matrix.sh): runs the backend in its own process so
+# the proxy's RSS is measured alone (not co-mingled with the in-process upstream's buffers).
+[[example]]
+name = "upstream"
+path = "../../../bench/harnesses/upstream/main.rs"
+
+[features]
+# Marker feature for the `edge-bench` harness: swaps in jemalloc's global allocator so the memory
+# matrix can attribute hypothesis (C) — glibc arena retention — by comparing against the default
+# glibc build and `MALLOC_ARENA_MAX=1`. No effect on the lib or the default build; tikv-jemallocator
+# is a dev-dependency, never linked into a production build.
+jemalloc = []
+
 [dependencies]
 plecto-control = { path = "../control" }
+# libc: glibc `mallopt(M_ARENA_MAX)` to cap per-thread malloc arenas at startup, bounding RSS on
+# many-core hosts (docs/servey body-tax). Used only on glibc targets; a no-op elsewhere.
+libc = "0.2"
 tokio = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
@@ -90,3 +106,6 @@ plecto-host = { path = "../host" }
 tempfile = "3"
 # rcgen: generate a fresh self-signed cert for the TLS E2E (ring backend, no aws-lc-rs/cmake).
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+# tikv-jemallocator: the jemalloc build variant of the edge-bench harness (feature `jemalloc`), for
+# the memory matrix's allocator sweep. Dev-only — never in a production build.
+tikv-jemallocator = "0.6"

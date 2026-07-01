@@ -27,10 +27,6 @@ impl Guest for FilterQuickstart {
         RequestDecision::Continue
     }
 
-    fn on_request_body(body: Vec<u8>) -> RequestBodyDecision {
-        RequestBodyDecision::Continue(body)
-    }
-
     fn on_response(_resp: HttpResponse) -> ResponseDecision {
         // The one visible thing this filter does: stamp a header so `curl -i` shows a WASM filter
         // touched the response.

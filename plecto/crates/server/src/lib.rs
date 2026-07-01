@@ -14,9 +14,12 @@
 //! to tokio's blocking pool via `spawn_blocking`; the M1 trusted instance pool handles instance
 //! reuse and saturation there. Route matching is pure config lookup and stays on the async thread.
 //!
-//! **Bodies are opaque (header-only contract, ADR 000010 / §6.7).** Filters never see the body;
-//! the request body streams straight to the upstream and the response body streams straight back.
-//! The chain only edits headers / status (and may synthesise a short-circuit body of its own).
+//! **Request body: buffered ONLY when a filter reads it (ADR 000025 / 000038).** A route whose
+//! filters all target the header-only `filter` world streams the request body straight to the
+//! upstream (zero-copy); a route with a filter that exports `on-request-body` (`reads_body`) has the
+//! body buffered (bounded) and run through the `on-request-body` chain. The response body always
+//! streams straight back — filters see response headers / status only (they may synthesise a
+//! short-circuit body of their own).
 
 mod access_log;
 mod admin;
@@ -42,6 +45,43 @@ use tokio::sync::Semaphore;
 use crate::metrics::ServerMetrics;
 
 pub use listener::serve;
+
+/// Cap glibc's per-thread malloc arenas at process start to bound RSS on many-core hosts.
+///
+/// glibc defaults to `8 × ncpu` arenas on 64-bit. Under a many-threaded proxy doing bursty
+/// per-request allocations, freed memory lingers in each thread's arena instead of returning to the
+/// OS, inflating RSS (measured ~2.5× at 1 MB bodies × 50 conns — docs/servey body-tax). This is a
+/// defensive complement to the real fix (not buffering a body no filter reads); routes that
+/// legitimately buffer still allocate, and this bounds their arena fragmentation.
+///
+/// `M_ARENA_MAX` only gates creation of NEW arenas and never reclaims existing ones, so this MUST
+/// run before the runtime spawns its worker threads (call it first in `main`). Default cap **4** — a
+/// portable, contention-safe value used across multithreaded services, chosen over the value that
+/// minimised RSS on one host (1) precisely because Plecto is self-hosted on varied machines.
+/// Override with `PLECTO_MALLOC_ARENA_MAX` (`0` leaves glibc's default in place). No-op off glibc.
+pub fn cap_malloc_arenas() {
+    let max = std::env::var("PLECTO_MALLOC_ARENA_MAX")
+        .ok()
+        .and_then(|s| s.parse::<i32>().ok())
+        .unwrap_or(4);
+    apply_arena_cap(max);
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn apply_arena_cap(max: i32) {
+    if max <= 0 {
+        return; // 0 / negative: leave glibc's default (8 × ncpu) untouched.
+    }
+    // SAFETY: a plain libc call made single-threaded at startup, before any worker thread exists.
+    // Returns 1 on success / 0 on failure; a best-effort tuning knob, so a rejection is ignored
+    // rather than failing startup.
+    unsafe {
+        libc::mallopt(libc::M_ARENA_MAX, max as core::ffi::c_int);
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn apply_arena_cap(_max: i32) {}
 
 /// A boxed, `Send` error — the unified error type for the boxed request/response bodies.
 pub(crate) type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -101,4 +141,24 @@ pub(crate) fn upstream_connector() -> HttpConnector {
     let mut c = HttpConnector::new();
     c.set_nodelay(true);
     c
+}
+
+#[cfg(test)]
+mod alloc_tuning_tests {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn mallopt_arena_max_is_accepted_by_glibc() {
+        // Guards the FFI constant + linkage: glibc returns 1 when it accepts the option.
+        let rc = unsafe { libc::mallopt(libc::M_ARENA_MAX, 4) };
+        assert_eq!(
+            rc, 1,
+            "glibc mallopt(M_ARENA_MAX, 4) should return 1 on success"
+        );
+    }
+
+    #[test]
+    fn cap_is_a_noop_when_disabled() {
+        // 0 leaves glibc's default in place; must not panic (and compiles/no-ops off glibc).
+        super::apply_arena_cap(0);
+    }
 }

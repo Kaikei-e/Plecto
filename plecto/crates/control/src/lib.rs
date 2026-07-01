@@ -552,6 +552,12 @@ fn build_active(
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
+            // The route buffers the body iff at least one of its filters exports `on-request-body`
+            // (ADR 000038). Computed from the loaded filters here so the fast path only checks a bool.
+            reads_body: r
+                .filters
+                .iter()
+                .any(|id| filters.get(id).is_some_and(|f| f.reads_body())),
             filters: r.filters.clone(),
             backends: Arc::new(backends),
             strip_prefix: r.strip_prefix.clone(),

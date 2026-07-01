@@ -8,7 +8,7 @@
 //! network / filesystem / sockets) remains structural — a filter can reach nothing it was not
 //! lent, and now cannot even load unless a trusted key signed it.
 
-use plecto_host::test_support::{TestSigner, bound_sbom};
+use plecto_host::test_support::{TestSigner, bound_sbom, filter_quickstart_component};
 use plecto_host::{
     Host, HttpResponse, Isolation, LoadOptions, RequestBodyDecision, RequestTrace,
     ResponseDecision, SignedArtifact, TrustPolicy,
@@ -300,5 +300,64 @@ fn request_body_hook_short_circuits_before_upstream() {
     match decision {
         RequestBodyDecision::ShortCircuit(resp) => assert_eq!(resp.status, 403),
         RequestBodyDecision::Continue(_) => panic!("expected short-circuit 403 on the marker body"),
+    }
+}
+
+// --- ADR 000038: export-presence zero-copy bypass (the host buffers the body ONLY when a filter
+// --- exports `on-request-body`; a header-only filter's absence keeps the body off guest memory) ---
+
+#[test]
+fn body_reading_filter_reports_reads_body() {
+    // filter-hello targets world `filter-body` and exports `on-request-body`, so the host detects
+    // that export and must buffer the body for it: `reads_body()` is true.
+    let fx = fixture();
+    let filter = fx
+        .host()
+        .load("filter-hello", &fx.artifact(), LoadOptions::untrusted())
+        .unwrap();
+    assert!(
+        filter.reads_body(),
+        "a filter exporting on-request-body must report reads_body() == true"
+    );
+}
+
+#[test]
+fn header_only_filter_reports_no_body_read_and_never_inspects_it() {
+    // filter-quickstart is header-only (world `filter`, no `on-request-body` export). The host must
+    // detect the ABSENCE and report reads_body() == false, so the fast path skips buffering entirely
+    // (the real body-tax fix, ADR 000038). If the hook is nonetheless invoked (the defensive floor),
+    // the body passes through byte-for-byte — a header-only filter can never inspect or transform it,
+    // even a body that WOULD trip a body-reading filter's `deny-body` short-circuit.
+    let signer = TestSigner::new().unwrap();
+    let bytes = filter_quickstart_component();
+    let component_signature = signer.sign(&bytes).unwrap();
+    let sbom = bound_sbom(&bytes);
+    let sbom_signature = signer.sign(&sbom).unwrap();
+    let artifact = SignedArtifact {
+        component_bytes: &bytes,
+        component_signature: &component_signature,
+        sbom: &sbom,
+        sbom_signature: &sbom_signature,
+    };
+    let host = Host::new(signer.trust_policy().unwrap()).unwrap();
+    let filter = host
+        .load("filter-quickstart", &artifact, LoadOptions::untrusted())
+        .unwrap();
+
+    assert!(
+        !filter.reads_body(),
+        "a header-only filter must report reads_body() == false"
+    );
+
+    let (decision, _logs) = filter
+        .on_request_body(b"contains deny-body marker", &RequestTrace::root())
+        .unwrap();
+    match decision {
+        RequestBodyDecision::Continue(body) => {
+            assert_eq!(body, b"contains deny-body marker".to_vec());
+        }
+        RequestBodyDecision::ShortCircuit(_) => {
+            panic!("a header-only filter must not inspect or short-circuit on the body")
+        }
     }
 }

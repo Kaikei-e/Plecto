@@ -41,6 +41,11 @@ outbound-http = [
     "dep:webpki-roots",
     "wasmtime/component-model-async",
 ]
+# Marker feature for the `mem-probe` example: swaps in dhat's global allocator to report host-heap
+# peak (the lifted body copy). No effect on the lib or the default build; dhat is a dev-dependency,
+# so it is never linked into a production build. Run: `cargo run -p plecto-host --example mem-probe
+# --features dhat-heap`.
+dhat-heap = []
 
 [dependencies]
 wasmtime = { workspace = true }
@@ -98,7 +103,18 @@ tempfile = "3"
 # criterion: in-process WASM micro-benchmarks (cold load, per-request pooled vs fresh instance).
 # default-features = false drops plotters/rayon — we only need the harness + baseline comparison.
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+# dhat: host-heap profiler for the `mem-probe` example (feature `dhat-heap`). Dev-only, so it is
+# never linked into a production build of the lib.
+dhat = "0.3"
 
 [[bench]]
 name = "wasm"
 harness = false
+
+# mem-probe: Stage 1 mechanistic probe for the body-tax memory investigation
+# (docs/plans/performance_evolution_001.md). Drives the host's on-request-body hook directly (no
+# server / proxy / load generator) to isolate the host↔guest body copy (hypothesis A) from the
+# pooling allocator's residency (hypothesis B). Source under bench/ with the other harnesses.
+[[example]]
+name = "mem-probe"
+path = "../../../bench/harnesses/mem-probe/main.rs"

@@ -21,7 +21,7 @@
 
 wit_bindgen::generate!({
     path: "../../../wit",
-    world: "filter",
+    world: "filter-body",
 });
 
 use crate::plecto::filter::host_counter;

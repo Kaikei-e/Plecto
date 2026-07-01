@@ -271,12 +271,12 @@ async fn proxy_core_inner(
     // 0-based retry attempt index, for the jittered exponential backoff between attempts (ADR 000030).
     let mut attempt: u32 = 0;
 
-    // --- request-side body hook (ADR 000025): for a filtered route carrying a body, buffer it
-    // (bounded), run the chain's `on-request-body`, and forward the possibly-transformed body — or
-    // short-circuit before upstream. Header-only routes and bodyless requests skip this, keeping the
-    // zero-copy streaming path. The chain runs on the blocking pool (sync wasmtime, !Send Store),
-    // like the header chain. (v1 buffers; a header-only zero-copy bypass is a follow-up.)
-    if route.has_filters
+    // --- request-side body hook (ADR 000025): buffer the body (bounded) ONLY when a filter on the
+    // route actually reads it — i.e. exports `on-request-body` (`reads_body`, ADR 000038). A route
+    // with no body-reading filter (or a bodyless request) skips this entirely and keeps the body on
+    // the zero-copy streaming path — the real fix for the body-tax (docs/servey). The chain runs on
+    // the blocking pool (sync wasmtime, !Send Store), like the header chain.
+    if route.reads_body
         && !bodyless
         && let Some(b) = real_body.take()
     {

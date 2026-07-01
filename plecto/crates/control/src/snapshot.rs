@@ -69,6 +69,7 @@ impl ConfigSnapshot {
             backends: r.backends.clone(),
             strip_prefix: r.strip_prefix.clone(),
             has_filters: !r.filters.is_empty(),
+            reads_body: r.reads_body,
             rate_limit: r.rate_limit.clone(),
         })
     }

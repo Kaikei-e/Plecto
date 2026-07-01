@@ -136,6 +136,12 @@ interface host-ratelimit {
     try-acquire: func(key: string, cost: u64) -> acquire;
 }
 
+// The base contract: header-only filters (auth, rate-limit, header rewrite) implement exactly this.
+// It deliberately does NOT export `on-request-body`, so the host can tell — by the ABSENCE of that
+// export (ADR 000005 mechanism 2 / ADR 000038) — that this filter never reads the request body, and
+// skip buffering it entirely (zero-copy streaming passthrough). `request-body-decision` is `use`d so
+// its type is available to the host for the optional body call, even though the base world itself
+// declares no body export.
 world filter {
     use types.{http-request, http-response, request-decision, response-decision, request-body-decision};
 
@@ -151,9 +157,27 @@ world filter {
 
     // hot path — one call per request / response
     export on-request: func(req: http-request) -> request-decision;
-    // body filter (buffer-then-decide, ADR 000025). v1: every filter exports it; the
-    // export-presence-based zero-copy bypass for header-only filters (ADR 000005 mechanism 2) is a
-    // follow-up. The host buffers the request body, calls this, and applies the decision.
+    export on-response: func(resp: http-response) -> response-decision;
+}
+
+// The body-reading contract: identical to `filter` PLUS the `on-request-body` export. A filter that
+// inspects or transforms the request body targets this world; the PRESENCE of `on-request-body` is
+// the signal that makes the host buffer the body and run this hook (buffer-then-decide, ADR 000025).
+// Absence (the base `filter` world) means the body streams straight through. The deferred
+// true-streaming increment swaps the `list<u8>` for `stream<u8>`. (Spelled out rather than
+// `include filter` — WIT does not propagate an included world's type `use` into a new export's
+// scope, so the shared shape is duplicated here deliberately.)
+world filter-body {
+    use types.{http-request, http-response, request-decision, response-decision, request-body-decision};
+
+    import host-log;
+    import host-clock;
+    import host-kv;
+    import host-counter;
+    import host-ratelimit;
+
+    export init: func();
+    export on-request: func(req: http-request) -> request-decision;
     export on-request-body: func(body: list<u8>) -> request-body-decision;
     export on-response: func(resp: http-response) -> response-decision;
 }

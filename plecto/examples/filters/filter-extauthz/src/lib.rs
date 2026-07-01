@@ -107,10 +107,6 @@ impl Guest for FilterExtAuthz {
         }
     }
 
-    fn on_request_body(body: Vec<u8>) -> RequestBodyDecision {
-        RequestBodyDecision::Continue(body)
-    }
-
     fn on_response(_resp: HttpResponse) -> ResponseDecision {
         ResponseDecision::Continue
     }

@@ -11,8 +11,18 @@ use plecto_control::Control;
 use plecto_server::serve;
 use tokio::net::TcpListener;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    // Cap glibc malloc arenas BEFORE the runtime spawns worker threads (M_ARENA_MAX only gates new
+    // arenas, so it must precede them) — a manual runtime build instead of `#[tokio::main]` is what
+    // gives us that ordering. Bounds RSS on many-core hosts (docs/servey body-tax).
+    plecto_server::cap_malloc_arenas();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run())
+}
+
+async fn run() -> anyhow::Result<()> {
     // JSON structured logging for the binary (Stage A observability, ADR 000009): the access log
     // (`plecto::access`) and the host diagnostics render as machine-parseable lines. `try_init` is
     // idempotent — a failure means a global subscriber is already installed (e.g. a test harness),
