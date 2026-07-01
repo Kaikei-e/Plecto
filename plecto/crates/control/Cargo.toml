@@ -16,6 +16,11 @@ publish.workspace = true
 # them, and reload swaps the active set atomically. Single-node-first; remote registry fetch
 # (wkg) is an out-of-band operator step, not embedded here.
 
+# No libtest `#[bench]` fns in the lib; disable its bench harness so `cargo bench` runs ONLY the
+# criterion targets (which alone understand `--save-baseline` for the CI regression gate).
+[lib]
+bench = false
+
 [features]
 # Forwards to the host's outbound HTTP capability (ADR 000036). OFF by default: without it a
 # manifest that declares `[filter.outbound]` is rejected at validate (fail-closed), since the host
@@ -57,3 +62,11 @@ rustls = { workspace = true }
 tempfile = "3"
 # rcgen: a fresh self-signed cert to unit-test the TCP/QUIC ServerConfig builder (ADR 000014/000016).
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+# criterion: in-process micro-benchmarks for the fast-path hot functions (LB pick, route match,
+# path normalization). `default-features = false` drops plotters/rayon — we only need the bench
+# harness + baseline comparison (the CI regression gate uses --save-baseline / --baseline).
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "fastpath"
+harness = false
