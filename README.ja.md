@@ -127,7 +127,7 @@ native fast path は「動くプロキシ」をとうに越えて成熟してい
 | **Load balancing** | per-upstream の **round-robin**（既定）・**weighted least-request**（power-of-two-choices）・**weighted Maglev** consistent hashing（header / source-IP affinity） — [17](docs/ADR/000017.md) · [24](docs/ADR/000024.md) · [35](docs/ADR/000035.md) |
 | **Resilience** | active **＋** passive の **health check**。**outlier detection**（misbehave した instance を eject）。per-upstream の **circuit breaker**（concurrency cap）。**二段 timeout**（per-try ＋ overall）。jittered backoff ＋ retry-on-5xx の **有界 retry** — [17](docs/ADR/000017.md) · [28](docs/ADR/000028.md) · [30](docs/ADR/000030.md) · [31](docs/ADR/000031.md) · [32](docs/ADR/000032.md) |
 | **Rate limiting** | native L7 token-bucket の床（**route** 単位 / **client-IP** 単位）。加えてフィルタに貸す per-filter の `host-ratelimit` — [26](docs/ADR/000026.md) · [33](docs/ADR/000033.md) |
-| **Extension plane** | `plecto:filter` chain をヘッダ **と** body に。型付き `decision`。trusted **pooled** / untrusted **fresh**。deny-by-default の host-API（kv · counter · log · clock · rate-limit）＋ per-filter / host-wide quota — [1](docs/ADR/000001.md) · [12](docs/ADR/000012.md) · [25](docs/ADR/000025.md) · [27](docs/ADR/000027.md) |
+| **Extension plane** | `plecto:filter` chain をヘッダ **と** body に。型付き `decision`。trusted **pooled** / untrusted **fresh**。deny-by-default の host-API（kv · counter · log · clock · rate-limit）＋ per-filter / host-wide quota。**outbound HTTP**（ext_authz / JWKS / introspection）を同じゲート越しに per-filter allowlist ＋ IP ピン留め SSRF ガードで貸与（feature-gated）— [1](docs/ADR/000001.md) · [12](docs/ADR/000012.md) · [25](docs/ADR/000025.md) · [27](docs/ADR/000027.md) · [36](docs/ADR/000036.md) |
 | **Client IP** | edge モデル伝播 —— 受信した forwarding ヘッダ family を剥がし、chain 実行の前に実 peer から `X-Forwarded-For` / `X-Real-IP` を付け直す — [18](docs/ADR/000018.md) · [22](docs/ADR/000022.md) |
 | **Supply chain & ops** | OCI digest ピンのフィルタ。cosign 署名 ＋ SBOM↔component 検証。無停止 SIGHUP reload（`ArcSwap` 原子適用・all-or-nothing）。W3C トレース伝播 ＋ ホスト集計 RED メトリクス ＋ オプトイン access log — [6](docs/ADR/000006.md) · [7](docs/ADR/000007.md) · [8](docs/ADR/000008.md) · [9](docs/ADR/000009.md) |
 
@@ -217,7 +217,7 @@ cargo test --all
 
 ### デモを動かす
 
-ユースケース別の自己完結デモが `examples/<name>/` に 5 つある。どれも**本番ロードパス**（署名＋オフライン OCI レイアウト＋検証＋ロード、すべて fail-closed）を組み、小さな upstream を立て、実プロキシを serve し、起動時に貼り付け用の `curl` コマンドを表示する。
+ユースケース別の自己完結デモが `examples/<name>/` に 6 つあり、5 分の `quickstart` から gateway が実際にやることまでの学習パスを成す（地図は [`examples/README.md`](plecto/examples/README.md)）。どれも**本番ロードパス**（署名＋オフライン OCI レイアウト＋検証＋ロード、すべて fail-closed）を組み、小さな upstream を立て、実プロキシを serve し、起動時に貼り付け用の `curl` コマンドを表示する。
 
 手早く end-to-end で見るならガイド付きツアー —— デモを起動し、readiness を待ち、`curl` を流し、結果を可視化して、後片付けまで自動でやる:
 
@@ -234,13 +234,14 @@ cargo run -p plecto-server --example <name>   # Ctrl-C で停止
 
 | `<name>` | 見せるもの |
 | --- | --- |
+| `quickstart` | **5 分の hello** —— 署名済み WASM フィルタが応答に `x-plecto: hello-from-wasm` を付与。`curl -i` 一発でサンドボックス・コンポーネントがトラフィックに触れた証拠が見える。まずここから。 |
 | `wasm-auth` | **実用 WASM フィルタ** —— 署名済みの API キー認証コンポーネント（`examples/filters/filter-apikey`）。鍵が無ければ 401、認証できれば呼び出し元の identity を付与し、per-user のリクエスト数を host KV で数える。Plecto の核。 |
 | `load-balancing` | 1 つの upstream を 3 instance に分散: healthy 集合の round-robin、active health probe、unhealthy 化での eject、全滅時の 503（ADR 000017）。least-request（P2C）と Maglev consistent hashing、circuit breaking、outlier detection は同じ upstream の per-upstream opt-in knob（ADR 000028 / 000032 / 000035）。 |
 | `filter-chain` | plain HTTP で filter chain: continue / modify（ヘッダ書換）/ short-circuit 403 / host-native rate limit。 |
 | `tls-http` | 同一ポートで TLS 終端＋HTTP/1.1・HTTP/2（ALPN）・HTTP/3（QUIC）、`Alt-Svc` による h3 広告。 |
 | `hot-reload` | manifest を編集して `kill -HUP <pid>`、無停止で設定をアトミックに差し替え（壊れた編集は fail-closed）。 |
 
-初めてなら [`examples/README.md`](examples/README.md) から —— 5 分の `quickstart` から上記のリアルなユースケースまでの学習パス。あるいはまず `wasm-auth`: 貸与された host-API だけに触れるサンドボックス・コンポーネントとしてカスタムなリクエスト処理が走る様子 —— cosign 風署名＋SBOM 検証・型付き `decision`・host 保持の状態 —— が端から端まで見える。
+初めてなら [`examples/README.md`](plecto/examples/README.md) から —— 5 分の `quickstart` から上記のリアルなユースケースまでの学習パス。あるいはまず `wasm-auth`: 貸与された host-API だけに触れるサンドボックス・コンポーネントとしてカスタムなリクエスト処理が走る様子 —— cosign 風署名＋SBOM 検証・型付き `decision`・host 保持の状態 —— が端から端まで見える。
 
 ベンチマーク・ハーネス（`wasm-bench` / `edge-bench`）はデモではなく [`bench/harnesses/`](bench/) 配下にあり、[performance](performance/README.md) の数値を生む。
 
@@ -260,8 +261,8 @@ Plecto は ADR ファーストで作る。各マイルストーンは `docs/ADR/
   **着地:** ホスト伝播の W3C トレース文脈（受信 `traceparent` をプロキシ越しに継続）、フィルタ実行ごとの span（OpenTelemetry データモデル）、sync な `TelemetrySink`（in-memory + ホスト集計の RED メトリクス）。**deferred:** OTLP ネットワーク export（`wasi-otel` / SDK exporter — no-tokio 維持のため named-deferred）とオプトインの `foca`/`openraft` 設定合意。— [ADR 7](docs/ADR/000007.md) · [9](docs/ADR/000009.md)
 - **M3 — async & ボディ** 🚧 *(Stage 1 着地・Stage 2 進行中)*
   M4・M5 がほぼ片付いたので、ここが次の主戦場。**Stage 1（着地）:** [wasmtime 46](https://github.com/bytecodealliance/wasmtime/releases/tag/v46.0.0)（2026-06-22）が WASI 0.3 と Component Model async を既定で有効にし、host は guest のフックを `call_async` で wasmtime の fiber 上に走らせ、まだ sync の公開 API へ `block_on` で橋渡ししている。**Stage 2（進行中）:** **request 側の body hook が end-to-end で配線された** —— `on-request-body`（buffer-then-decide。v1 は body を buffer 済みの `list<u8>` で受ける）を契約・host・**fast path** に通し（プロキシは filter 付きルートの body を上限付きで buffer —— 16 MiB cap・超過は fail-closed 413 —— 一方 body 無しリクエストと filter 無しルートは zero-copy のまま）、conformance と E2E まで green（[ADR 25](docs/ADR/000025.md)）。さらに **実験的・feature-gated** な `stream<u8>` 増分が着地した: off-by-default の `streaming-body` feature の下で、別ワールド `plecto:filter-streaming` が async な `process-body(stream<u8>)` を host 上で駆動する（whole-body buffer 無し。server 側の配線は次の増分）—— 最小 WASI スライス越しで、`wasm32-wasip3` が Tier-2 に到達するまで default build からは外れる。プロキシ越しのヘッダ **バイト等価**（filter が触れないバイトの保存）も併せて着地。方向は [ADR 20](docs/ADR/000020.md) のとおり —— `wasi:http` へ収斂しても deny-by-default は型語彙と切り離して保つ。
-- **M6 — polyglot SDK & リファレンスフィルタ**
-  Go / JS / Python のフィルタテンプレート、リファレンスの auth / rate-limit / WAF フィルタ。フィルタに貸せる能力面は deny-by-default のまま拡張中: SSRF ガード＋per-filter allowlist 付きの outbound HTTP を設計中（[ADR 36](docs/ADR/000036.md)）、WAF は native ではなく拡張プレーンに置く（[ADR 37](docs/ADR/000037.md)）。
+- **M6 — polyglot SDK & リファレンスフィルタ** 🚧 *(outbound capability は feature-gated で着地済み)*
+  Go / JS / Python のフィルタテンプレート、リファレンスの auth / rate-limit / WAF フィルタ。フィルタに貸せる能力面は deny-by-default のまま拡張中: **outbound HTTP が off-by-default の `outbound-http` feature 裏で着地**（[ADR 36](docs/ADR/000036.md)）—— フィルタは `wasi:http/outgoing-handler` 越しに ext_authz / JWKS / token-introspection / OPA を呼べ、operator の per-filter allowlist ＋ **IP ピン留め SSRF ガード**（解決後の全アドレスを分類・DNS rebinding を封鎖）で fail-closed かつ資源境界付きに囲う。default ビルドには `wasi:http` 収斂ゲートまで載せない。WAF は native ではなく拡張プレーンに置く（[ADR 37](docs/ADR/000037.md)）。
 
 ## リポジトリ構成
 
@@ -274,13 +275,18 @@ Plecto は ADR ファーストで作る。各マイルストーンは `docs/ADR/
 │   │   ├── host/              # wasmtime 埋め込み: Linker, InstancePre, host-API（+ CONTEXT.md）
 │   │   ├── control/           # control plane: manifest, OCI load, chain, reload, TLS/QUIC（+ CONTEXT.md）
 │   │   └── server/            # fast path: HTTP/1.1·2（hyper）+ HTTP/3（quinn）, routing, LB, upstream（+ CONTEXT.md）
-│   └── examples/              # 動かせるデモ（<use-case>/）+ 例フィルタ guest（filters/）
-│       ├── <use-case>/        # デモ 5 種: cargo run -p plecto-server --example <name>
+│   └── examples/              # 動かせるデモ + 例フィルタ guest — 地図は examples/README.md（DX 入口）
+│       ├── README.md          # 学習パス（quickstart → リアルなユースケース）
+│       ├── <use-case>/        # デモ 6 種: cargo run -p plecto-server --example <name>
 │       └── filters/           # 例 plecto:filter guest（独立 workspace・build.rs が component 化）
-│           ├── filter-hello/  # conformance 用の例フィルタ（wasm32-unknown-unknown ゲスト）
+│           ├── filter-quickstart/ # 最簡スターター（応答に 1 ヘッダ付与）
 │           ├── filter-apikey/ # 実用例フィルタ: API キー認証ゲート（WASM コンポーネント）
+│           ├── filter-hello/  # host テストが読む conformance fixture（wasm32-unknown-unknown）
 │           ├── filter-template/ # 自作フィルタのコピー雛形（WIT を vendor 済み）
-│           └── filter-streaming/ # 実験的 stream<u8> body フィルタ（feature-gated・wasm32-wasip2）
+│           ├── filter-streaming/ # 実験的 stream<u8> body フィルタ（feature-gated・wasm32-wasip2）
+│           └── filter-extauthz/ # SSRF ガード付き outbound で ext_authz（feature-gated）
+├── bench/                     # ベンチ・ハーネス + runbook（k6/oha; harnesses/, filters/, perf/）
+├── performance/              # ベンチ結果の write-up（performance/README.md）
 ├── docs/ADR/                  # Architecture Decision Records（000001–000037）
 ├── CLAUDE.md                  # プロジェクト規約・設計要約
 └── CONTEXT-MAP.md             # ドメイン用語集の地図（コンテキスト分割）

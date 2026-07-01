@@ -129,7 +129,7 @@ The native fast path has matured well past "a proxy that works." A snapshot of w
 | **Load balancing** | per-upstream **round-robin** (default), **weighted least-request** (power-of-two-choices), or **weighted Maglev** consistent hashing (header / source-IP affinity) — [17](docs/ADR/000017.md) · [24](docs/ADR/000024.md) · [35](docs/ADR/000035.md) |
 | **Resilience** | active **+** passive **health checks**; **outlier detection** (eject misbehaving instances); per-upstream **circuit breaker** (concurrency cap); **two-tier timeouts** (per-try + overall); **bounded retry** with jittered backoff + retry-on-5xx — [17](docs/ADR/000017.md) · [28](docs/ADR/000028.md) · [30](docs/ADR/000030.md) · [31](docs/ADR/000031.md) · [32](docs/ADR/000032.md) |
 | **Rate limiting** | native L7 token-bucket floor per **route** / per **client-IP**; plus the per-filter `host-ratelimit` capability lent to filters — [26](docs/ADR/000026.md) · [33](docs/ADR/000033.md) |
-| **Extension plane** | `plecto:filter` chain over headers **and** a request body; typed `decision`; trusted **pooled** / untrusted **fresh** instances; deny-by-default host-API (kv · counter · log · clock · rate-limit) with per-filter + host-wide quotas — [1](docs/ADR/000001.md) · [12](docs/ADR/000012.md) · [25](docs/ADR/000025.md) · [27](docs/ADR/000027.md) |
+| **Extension plane** | `plecto:filter` chain over headers **and** a request body; typed `decision`; trusted **pooled** / untrusted **fresh** instances; deny-by-default host-API (kv · counter · log · clock · rate-limit) with per-filter + host-wide quotas; **outbound HTTP** (ext_authz / JWKS / introspection) lent through the same gate with a per-filter allowlist + IP-pinned SSRF guard (feature-gated) — [1](docs/ADR/000001.md) · [12](docs/ADR/000012.md) · [25](docs/ADR/000025.md) · [27](docs/ADR/000027.md) · [36](docs/ADR/000036.md) |
 | **Client IP** | edge-model propagation — strip the inbound forwarding-header family, re-issue `X-Forwarded-For` / `X-Real-IP` from the real peer before the chain runs — [18](docs/ADR/000018.md) · [22](docs/ADR/000022.md) |
 | **Supply chain & ops** | OCI digest-pinned filters; cosign signature + SBOM↔component verification; zero-downtime SIGHUP reload (atomic `ArcSwap`, all-or-nothing); W3C trace propagation + host-aggregated RED metrics + opt-in access log — [6](docs/ADR/000006.md) · [7](docs/ADR/000007.md) · [8](docs/ADR/000008.md) · [9](docs/ADR/000009.md) |
 
@@ -220,7 +220,7 @@ The suite proves the slice end-to-end: a request flows through the host into a r
 
 ### Run the demos
 
-Five self-contained, use-case-focused demos live under `examples/<name>/`. Each wires the **production load path** (sign + offline OCI layout + verify + load, all fail-closed), starts a tiny upstream, serves a real proxy, and prints copy-paste `curl` commands on startup.
+Six self-contained, use-case-focused demos live under `examples/<name>/`, forming a learning path from a 5-minute `quickstart` up to the real things a gateway does ([`examples/README.md`](plecto/examples/README.md) is the map). Each wires the **production load path** (sign + offline OCI layout + verify + load, all fail-closed), starts a tiny upstream, serves a real proxy, and prints copy-paste `curl` commands on startup.
 
 The quickest way to see one work end to end is the guided tour — it starts the demo, waits for it, runs the `curl` commands, visualizes the output, and cleans up:
 
@@ -237,13 +237,14 @@ cargo run -p plecto-server --example <name>   # Ctrl-C to stop
 
 | `<name>` | What it shows |
 | --- | --- |
+| `quickstart` | **The 5-minute hello** — a signed WASM filter stamps `x-plecto: hello-from-wasm` on the response, so one `curl -i` proves a sandboxed component touched your traffic. Start here. |
 | `wasm-auth` | **A real WASM filter doing real work** — a signed API-key auth component (`examples/filters/filter-apikey`) that 401s without a valid key, stamps the caller's identity, and counts per-user requests in host KV. The point of Plecto. |
 | `load-balancing` | One upstream over three instances: round-robin across the healthy set, active health probes, ejection when an instance goes unhealthy, and 503 when none are left (ADR 000017). Least-request (P2C) and Maglev consistent hashing, plus circuit breaking and outlier detection, are opt-in per-upstream knobs on the same upstream (ADR 000028 / 000032 / 000035). |
 | `filter-chain` | The filter chain over plain HTTP: continue / modify (header rewrite) / short-circuit 403 / host-native rate limit. |
 | `tls-http` | TLS termination with HTTP/1.1, HTTP/2 (ALPN) and HTTP/3 (QUIC) on one port, plus `Alt-Svc` h3 advertisement. |
 | `hot-reload` | Edit the manifest, `kill -HUP <pid>`, and watch the config swap atomically with zero downtime (a broken edit is fail-closed). |
 
-New here? Start with [`examples/README.md`](examples/README.md) — a guided path from a 5-minute `quickstart` up through the real use cases above. Or read `wasm-auth` first: it shows custom request logic running as a sandboxed component that can touch only the host-API it was lent — cosign-style signature + SBOM verification, the typed `decision`, and host-held state, end to end.
+New here? Start with [`examples/README.md`](plecto/examples/README.md) — a guided path from a 5-minute `quickstart` up through the real use cases above. Or read `wasm-auth` first: it shows custom request logic running as a sandboxed component that can touch only the host-API it was lent — cosign-style signature + SBOM verification, the typed `decision`, and host-held state, end to end.
 
 The benchmark harnesses (`wasm-bench`, `edge-bench`) are not demos — they live under [`bench/harnesses/`](bench/) and produce the numbers in [performance](performance/README.md).
 
@@ -263,8 +264,8 @@ Plecto is built ADR-first; each milestone realizes specific design decisions in 
   **Landed:** host-propagated W3C trace context (inbound `traceparent` continued through the proxy), one span per filter execution over the OpenTelemetry data model, and a sync `TelemetrySink` (in-memory + host-aggregated RED metrics). **Deferred:** OTLP network export (`wasi-otel` / SDK exporter, named-deferred to stay no-tokio) and opt-in `foca`/`openraft` config consensus. — [ADR 7](docs/ADR/000007.md) · [9](docs/ADR/000009.md)
 - **M3 — Async & bodies** 🚧 *(Stage 1 landed; Stage 2 in progress)*
   The frontier, since M4/M5 are largely done. **Stage 1 (landed):** [wasmtime 46](https://github.com/bytecodealliance/wasmtime/releases/tag/v46.0.0) (2026-06-22) made WASI 0.3 + Component Model async default-on; the host runs guest hooks via `call_async` on wasmtime fibers, bridged to its still-sync public API with `block_on`. **Stage 2 (in progress):** the request-side **body hook** is wired **end-to-end** — `on-request-body` (buffer-then-decide; body as a buffered `list<u8>` in v1) through the contract, the host, **and the fast path** (the proxy buffers a filtered route's body bounded — 16 MiB cap, fail-closed 413 — while bodyless requests and filter-less routes stay zero-copy), conformance- and E2E-green ([ADR 25](docs/ADR/000025.md)). An **experimental, feature-gated** `stream<u8>` increment has landed: behind the off-by-default `streaming-body` feature, a separate `plecto:filter-streaming` world drives an async `process-body(stream<u8>)` on the host (no whole-body buffer; server-side wiring is the next increment) over a minimal WASI slice, and stays out of the default build until `wasm32-wasip3` reaches Tier-2. Header **byte-equivalence** through the proxy (filter-untouched bytes preserved) landed alongside. [ADR 20](docs/ADR/000020.md) keeps the `wasi:http` convergence direction — deny-by-default independent of the type vocabulary.
-- **M6 — Polyglot SDKs & reference filters**
-  Go / JS / Python filter templates and reference auth / rate-limit / WAF filters. The capability surface a filter can be lent is expanding deny-by-default: outbound HTTP with an SSRF guard and a per-filter allowlist is in design ([ADR 36](docs/ADR/000036.md)), and WAF is deliberately placed in the extension plane rather than native ([ADR 37](docs/ADR/000037.md)).
+- **M6 — Polyglot SDKs & reference filters** 🚧 *(the outbound capability has landed feature-gated)*
+  Go / JS / Python filter templates and reference auth / rate-limit / WAF filters. The capability surface a filter can be lent is expanding deny-by-default: **outbound HTTP has landed behind the off-by-default `outbound-http` feature** ([ADR 36](docs/ADR/000036.md)) — a filter can make ext_authz / JWKS / token-introspection / OPA calls through `wasi:http/outgoing-handler`, gated by an operator per-filter allowlist and an **IP-pinned SSRF guard** (every resolved address classified, DNS-rebinding closed), fail-closed and resource-bounded; it stays out of the default build until the `wasi:http` convergence gate. WAF is deliberately placed in the extension plane rather than native ([ADR 37](docs/ADR/000037.md)).
 
 ## Project layout
 
@@ -277,13 +278,18 @@ Plecto is built ADR-first; each milestone realizes specific design decisions in 
 │   │   ├── host/              # wasmtime embedding: Linker, InstancePre, host-API (+ CONTEXT.md)
 │   │   ├── control/           # control plane: manifest, OCI load, chain, reload, TLS/QUIC (+ CONTEXT.md)
 │   │   └── server/            # fast path: HTTP/1.1·2 (hyper) + HTTP/3 (quinn), routing, LB, upstream (+ CONTEXT.md)
-│   └── examples/              # runnable demos (<use-case>/) + example filter guests (filters/)
-│       ├── <use-case>/        # five demos: cargo run -p plecto-server --example <name>
+│   └── examples/              # runnable demos + example filter guests — see examples/README.md (the DX map)
+│       ├── README.md          # the guided learning path (quickstart → real use cases)
+│       ├── <use-case>/        # six demos: cargo run -p plecto-server --example <name>
 │       └── filters/           # example plecto:filter guests (own workspace, componentized by build.rs)
-│           ├── filter-hello/  # conformance-fixture filter (wasm32-unknown-unknown guest)
+│           ├── filter-quickstart/ # minimal starter filter (stamps one response header)
 │           ├── filter-apikey/ # real-world example filter: API-key auth gate (WASM component)
+│           ├── filter-hello/  # conformance-fixture filter the host tests load (wasm32-unknown-unknown)
 │           ├── filter-template/ # copy-ready starting point for your own filter (vendored WIT)
-│           └── filter-streaming/ # experimental stream<u8> body filter (feature-gated, wasm32-wasip2)
+│           ├── filter-streaming/ # experimental stream<u8> body filter (feature-gated, wasm32-wasip2)
+│           └── filter-extauthz/ # ext_authz over the SSRF-guarded outbound capability (feature-gated)
+├── bench/                     # benchmark harnesses + runbook (k6/oha; harnesses/, filters/, perf/)
+├── performance/              # the benchmark write-up + results (see performance/README.md)
 ├── docs/ADR/                  # Architecture Decision Records (000001–000037)
 ├── CLAUDE.md                  # project conventions & design summary
 └── CONTEXT-MAP.md             # domain glossary map (split per context)
